@@ -1,0 +1,1 @@
+{"description":"Django framework pack.","entryPatterns":["(^|/)migrations/","(^|/)management/commands/"],"keepDecorators":["receiver","register","admin.register","login_required","permission_required"],"keepNames":["__init__","__str__","save","clean","get_absolute_url"],"notes":"Models, views and admin classes are resolved by Django via settings, URLs and app registry."}

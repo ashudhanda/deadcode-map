@@ -1,0 +1,1 @@
+{"description":"React framework pack.","entryPatterns":[],"keepDecorators":[],"keepExports":[],"notes":"React components are used via JSX imports, which the import graph already follows. Exported components are REVIEW, never SAFE, in a library."}

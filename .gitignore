@@ -1,0 +1,7 @@
+node_modules/
+deadcode-map.html
+deadcode-map.json
+.deadcode-map.json
+coverage/
+*.log
+.DS_Store

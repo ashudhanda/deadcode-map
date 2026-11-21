@@ -1,0 +1,38 @@
+{
+  "author": "deadcode-map contributors",
+  "bin": {
+    "deadcode-map": "./bin/deadcode-map.js"
+  },
+  "dependencies": {
+    "tree-sitter": "0.21.1",
+    "tree-sitter-javascript": "0.23.1",
+    "tree-sitter-python": "0.23.4",
+    "tree-sitter-typescript": "0.23.2"
+  },
+  "description": "Find dead code, prove it is dead, and see it on a map. JS/TS + Python. Confidence-graded, with --fix and --prove.",
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://github.com/ashudhanda/deadcode-map#readme",
+  "keywords": [
+    "dead-code",
+    "unused-code",
+    "static-analysis",
+    "tree-sitter",
+    "refactoring",
+    "code-quality"
+  ],
+  "license": "MIT",
+  "main": "src/index.js",
+  "name": "deadcode-map",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ashudhanda/deadcode-map"
+  },
+  "scripts": {
+    "start": "node bin/deadcode-map.js",
+    "test": "node --test test/fixtures.test.js test/cli.test.js"
+  },
+  "type": "commonjs",
+  "version": "0.1.0"
+}

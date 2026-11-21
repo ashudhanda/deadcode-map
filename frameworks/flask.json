@@ -1,0 +1,1 @@
+{"description":"Flask framework pack.","entryPatterns":[],"keepDecorators":["app.route","app.errorhandler","app.before_request","app.after_request","blueprint.route"],"keepNames":["__init__"],"notes":"Route handlers are called by Flask via decorators."}

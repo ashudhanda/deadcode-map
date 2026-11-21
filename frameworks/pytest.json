@@ -1,0 +1,1 @@
+{"description":"pytest framework pack.","entryPatterns":["(^|/)test_.*\\.py$","(.*)_test\\.py$","(^|/)conftest\\.py$"],"keepDecorators":["pytest.fixture","pytest.mark.parametrize","pytest.mark.skip"],"keepNames":[],"notes":"Test functions and fixtures are collected by pytest, not called in-repo."}

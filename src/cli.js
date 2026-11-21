@@ -1,0 +1,156 @@
+'use strict';
+
+/**
+ * deadcode-map CLI.
+ *
+ * Usage:
+ *   deadcode-map [path] [--json out.json] [--map out.html]
+ *                [--fail-on safe|review] [--min-confidence safe|review]
+ *                [--baseline] [--update-baseline] [--show-baseline]
+ *                [--fix] [--prove] [--test-command "npm test"]
+ *                [--include-review] [--top N] [--no-color]
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { scan } = require('../src/index');
+const { printTerminal, summarize, toJsonReport } = require('../src/output');
+const { writeMap } = require('../src/map');
+const { loadBaseline, saveBaseline, splitBaseline } = require('../src/baseline');
+const { applyFix } = require('../src/fix');
+const { prove } = require('../src/prove');
+const { defaultTestCommand } = require('../src/git');
+
+const VERSION = require('../package.json').version;
+
+function help() {
+  return `deadcode-map v${VERSION} — find dead code, prove it is dead, see it on a map.
+
+Usage:
+  deadcode-map [path] [options]
+
+Options:
+  --json <file>        Write the full JSON report to <file>
+  --map <file>         Write the single-file offline HTML map to <file>
+  --fail-on <level>    Exit 1 when new SAFE (default) or REVIEW dead code exists
+  --min-confidence <level>
+                       Show only findings at or above this grade (safe|review)
+  --baseline           Hide findings already recorded in .deadcode-map.json
+  --update-baseline    Write current findings to .deadcode-map.json and exit 0
+  --show-baseline      Show baseline findings too (default: hidden with --baseline)
+  --fix                Delete SAFE findings only (git-backed, one file at a time)
+  --prove              Delete SAFE findings in a scratch git worktree and run tests
+  --test-command <cmd> Test command for --prove (default: "npm test" when present)
+  --include-review     Let --fix / --prove act on REVIEW findings too (default: SAFE only)
+  --top <n>            How many findings to list in the terminal (default 10)
+  --no-color           Disable coloured output
+  --version            Print the version
+  --help               Print this help
+`;
+}
+
+function parseArgs(argv) {
+  const opts = {
+    path: '.', json: null, map: null, failOn: null, minConfidence: null,
+    baseline: false, updateBaseline: false, showBaseline: false,
+    fix: false, prove: false, testCommand: null, includeReview: false,
+    top: 10, color: true,
+  };
+  const args = argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--help' || a === '-h') { console.log(help()); process.exit(0); }
+    else if (a === '--version' || a === '-v') { console.log(VERSION); process.exit(0); }
+    else if (a === '--json') opts.json = args[++i];
+    else if (a === '--map') opts.map = args[++i];
+    else if (a === '--fail-on') opts.failOn = args[++i];
+    else if (a === '--min-confidence') opts.minConfidence = args[++i];
+    else if (a === '--baseline') opts.baseline = true;
+    else if (a === '--update-baseline') opts.updateBaseline = true;
+    else if (a === '--show-baseline') opts.showBaseline = true;
+    else if (a === '--fix') opts.fix = true;
+    else if (a === '--prove') opts.prove = true;
+    else if (a === '--test-command') opts.testCommand = args[++i];
+    else if (a === '--include-review') opts.includeReview = true;
+    else if (a === '--top') opts.top = parseInt(args[++i], 10) || 10;
+    else if (a === '--no-color') opts.color = false;
+    else if (a.startsWith('-')) { console.error(`Unknown option: ${a}\n${help()}`); process.exit(2); }
+    else opts.path = a;
+  }
+  return opts;
+}
+
+function main() {
+  const opts = parseArgs(process.argv);
+  const root = path.resolve(opts.path);
+  if (!fs.existsSync(root)) {
+    console.error(`deadcode-map: no such directory: ${root}`);
+    process.exit(2);
+  }
+
+  const { graph, findings } = scan(root);
+  let visible = findings;
+
+  // Baseline handling.
+  const baseline = opts.baseline || opts.updateBaseline ? loadBaseline(root) : null;
+  if (opts.updateBaseline) {
+    const p = saveBaseline(root, findings);
+    console.log(`Baseline written to ${p} (${findings.length} findings).`);
+    process.exit(0);
+  }
+  let baselineCount = 0;
+  if (baseline && !opts.showBaseline) {
+    const split = splitBaseline(findings, baseline);
+    baselineCount = split.baseline.length;
+    visible = split.fresh;
+  }
+
+  // Confidence filter.
+  if (opts.minConfidence === 'safe') visible = visible.filter((f) => f.grade === 'SAFE');
+  else if (opts.minConfidence === 'review') visible = visible.filter((f) => f.grade !== 'KEEP');
+
+  const summary = summarize(visible);
+  printTerminal(visible, { root, top: opts.top, color: opts.color });
+  if (baselineCount) console.log(`  (${baselineCount} findings hidden by baseline .deadcode-map.json)\n`);
+
+  if (opts.json) {
+    const report = toJsonReport(root, visible, summary, { baselineHidden: baselineCount });
+    fs.writeFileSync(opts.json, JSON.stringify(report, null, 2) + '\n', 'utf8');
+    console.log(`JSON report written to ${opts.json}`);
+  }
+
+  if (opts.map) {
+    writeMap(root, graph, visible, path.resolve(opts.map));
+    console.log(`Map written to ${opts.map} (open it by double-clicking)`);
+  }
+
+  if (opts.fix) {
+    const fixFindings = opts.includeReview ? visible : visible.filter((f) => f.grade === 'SAFE');
+    const result = applyFix(root, graph, fixFindings);
+    console.log(`--fix: removed ${result.safeCount} SAFE finding(s); ${result.deletedFiles.length} file(s) deleted.`);
+    for (const c of result.changed) console.log(`  ${c.file}: removed ${c.removed} item(s)${c.error ? ` (error: ${c.error})` : ''}`);
+    console.log('Review the diff with git before committing.');
+  }
+
+  if (opts.prove) {
+    const testCmd = opts.testCommand || defaultTestCommand(root, scan(root).discovery.pkg);
+    console.log(`--prove: running "${testCmd || '(no test command)'}" in a scratch git worktree…`);
+    const result = prove(root, graph, opts.includeReview ? visible : visible.filter((f) => f.grade === 'SAFE'), { testCommand: testCmd });
+    console.log(`--prove: ${result.status} — ${result.proven || 0} proven, ${result.breaks || 0} break${result.breaks === 1 ? 's' : ''}.`);
+    for (const r of result.results || []) console.log(`  ${r.status.padEnd(7)} ${r.cluster} — ${r.reason}`);
+    if (result.reason) console.log(`  ${result.reason}`);
+  }
+
+  // Exit code for CI.
+  if (opts.failOn) {
+    const level = opts.failOn === 'review' ? ['SAFE', 'REVIEW'] : ['SAFE'];
+    const failing = visible.filter((f) => level.includes(f.grade));
+    if (failing.length) {
+      console.error(`deadcode-map: FAIL — ${failing.length} new ${opts.failOn}-level dead-code finding(s).`);
+      process.exit(1);
+    }
+  }
+  process.exit(0);
+}
+
+main();
