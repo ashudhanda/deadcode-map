@@ -48,6 +48,18 @@ deadcode-map  /home/ashu/my-app
          code after return/throw/break/continue
 ```
 
+## Try it in the browser (no install)
+
+Paste a public GitHub repo link at **https://ashudhanda.github.io/deadcode-map/** and check
+dead code in the browser: summary counts, per-file findings, and a visual map. Your repo is
+fetched straight from GitHub in your browser — nothing is uploaded anywhere. An optional
+GitHub token raises the API rate limit from 60 to 5,000 requests/hour; it is kept only in
+memory and never stored.
+
+Honest limit: the web checker is a lightweight regex-based analyzer, not the full
+tree-sitter CLI. It covers JS/TS and Python, caps at 500 files / 5 MB, and handles public
+repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
+
 ## What counts as dead
 
 | Category | Definition |

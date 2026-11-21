@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="deadcode-map web checker — paste a public GitHub repo link and see its dead code, file by file, in your browser." />
+  <title>deadcode-map — Web Checker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>deadcode-map<span>.</span> web checker</h1>
+      <p>Paste a public GitHub repo link. See its dead code, file by file, right here.</p>
+    </header>
+
+    <div class="notice">
+      <strong>Lightweight browser analyzer.</strong> This page runs a regex-based
+      analyzer in your browser — it is not the full tree-sitter CLI, so it can
+      miss exotic syntax and it cannot run your tests (<code>--prove</code>).
+      For full accuracy, use the CLI:
+      <a href="https://github.com/ashudhanda/deadcode-map">github.com/ashudhanda/deadcode-map</a>.
+      Public repos only. Nothing is uploaded anywhere — files are fetched from
+      GitHub and analyzed in your browser.
+    </div>
+
+    <section class="card">
+      <label for="repo-url">GitHub repo URL</label>
+      <input id="repo-url" type="text" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false" />
+      <p class="hint">Example: https://github.com/ashudhanda/deadcode-map — a /tree/branch/path link works too.</p>
+
+      <label for="gh-token">GitHub token (optional)</label>
+      <input id="gh-token" type="password" placeholder="ghp_… — only for a higher rate limit" autocomplete="off" spellcheck="false" />
+      <p class="hint">Without a token, GitHub allows 60 API requests per hour. Your token is never stored — it is sent only to api.github.com, in memory, for this one check. Leave it empty to stay anonymous.</p>
+
+      <div class="row">
+        <button id="analyze-btn" type="button">Analyze repo</button>
+        <button id="try-btn" type="button" class="secondary">Try deadcode-map itself</button>
+        <span id="status" class="status" role="status"></span>
+      </div>
+    </section>
+
+    <div id="error" class="error" hidden></div>
+
+    <section id="results" hidden>
+      <h2 id="results-title">Results</h2>
+      <p id="results-meta" class="status"></p>
+
+      <div class="summary">
+        <div class="stat"><div class="num" id="stat-total">0</div><div class="lbl">Findings</div></div>
+        <div class="stat safe"><div class="num" id="stat-safe">0</div><div class="lbl">Safe</div></div>
+        <div class="stat review"><div class="num" id="stat-review">0</div><div class="lbl">Review</div></div>
+        <div class="stat keep"><div class="num" id="stat-keep">0</div><div class="lbl">Keep</div></div>
+      </div>
+
+      <div class="filters" id="filters">
+        <button type="button" data-grade="ALL" class="active">All</button>
+        <button type="button" data-grade="SAFE">SAFE — provably dead</button>
+        <button type="button" data-grade="REVIEW">REVIEW — check first</button>
+        <button type="button" data-grade="KEEP">KEEP — never delete</button>
+      </div>
+
+      <div class="card">
+        <h3>Map</h3>
+        <p class="hint">Each dot is a file. Red = has SAFE dead code, amber = REVIEW only, green = clean or kept. Click a dot to see that file.</p>
+        <div class="map-wrap" id="map"></div>
+        <p class="map-legend" id="map-legend"></p>
+      </div>
+
+      <div id="findings"></div>
+    </section>
+
+    <footer>
+      <p>deadcode-map v0.1.0 — JS / TypeScript + Python. MIT licensed.
+      <a href="https://github.com/ashudhanda/deadcode-map">GitHub</a> ·
+      <a href="https://github.com/ashudhanda/deadcode-map#readme">CLI README</a></p>
+    </footer>
+  </div>
+
+  <script src="analyzer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
