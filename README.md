@@ -33,7 +33,172 @@ deadcode-map ./my-app --fix                 # delete SAFE findings only
 deadcode-map ./my-app --prove               # prove SAFE deletions with your tests
 deadcode-map ./my-app --prove --test-command "pytest -q"
 deadcode-map ./my-app --include-fixtures    # also scan fixtures/ test-data dirs (excluded by default)
+deadcode-map mcp                            # start the MCP server on stdio (for AI tools)
 ```
+
+## Use with AI tools
+
+deadcode-map ships an MCP server (stdio) so AI coding tools can scan, explain, and safely clean up dead code in your repo. It exposes five tools — `scan_repo`, `explain_finding`, `fix_safe`, `get_map`, `status` — plus a `cleanup-dead-code` prompt and a `deadcode://map/{path}` resource serving the visual HTML map. `fix_safe` deletes SAFE findings only and refuses unless you pass `confirm: true`; it never touches REVIEW or KEEP. Requires Node.js 18+.
+
+### Claude Code (plugin)
+
+```sh
+/plugin marketplace add ashudhanda/deadcode-map
+/plugin install deadcode-map@deadcode-map
+```
+
+This installs the MCP server, the `deadcode-map` skill, and the `/deadcode-map` slash command. For local development without installing:
+
+```sh
+claude --plugin-dir ./deadcode-map
+```
+
+Or wire the MCP server by hand in `.mcp.json` (project) or `~/.claude.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json` (`~/Library/Application Support/Claude/` on macOS, `%APPDATA%/Claude/` on Windows, `~/.config/Claude/` on Linux), then restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+### Codex CLI
+
+In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.deadcode-map]
+command = "npx"
+args = ["-y", "deadcode-map", "mcp"]
+```
+
+Or add it from the command line (note: `env` does no `${VAR}` expansion in Codex — use `env_vars` to forward host variables):
+
+```sh
+codex mcp add deadcode-map -- npx -y deadcode-map mcp
+```
+
+### Cursor
+
+In `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global). Cursor requires `"type": "stdio"` on stdio entries:
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+### Windsurf
+
+Open the MCP config from inside Windsurf (Settings → MCP Servers) and add:
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+The config file lives at `~/.config/devin/mcp_config.json` (current; older installs used `~/.codeium/windsurf/mcp_config.json`).
+
+### VS Code Copilot
+
+In `~/.copilot/mcp-config.json` (global) or a workspace `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+(Deprecated: `.vscode/mcp.json` with top-level `servers` — use the format above instead.)
+
+### Gemini CLI
+
+In `~/.gemini/settings.json` or a project `.gemini/settings.json` (env vars expand as `$VAR` / `${VAR}`). Verify with `/mcp list`:
+
+```json
+{
+  "mcpServers": {
+    "deadcode-map": {
+      "command": "npx",
+      "args": ["-y", "deadcode-map", "mcp"]
+    }
+  }
+}
+```
+
+### OpenCode (v2)
+
+In `opencode.json`. Note the v2 shape: `mcp.servers`, `type: "local"`, `command` is one array, env vars go under `environment`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "deadcode-map": {
+        "type": "local",
+        "command": ["npx", "-y", "deadcode-map", "mcp"],
+        "environment": {},
+        "disabled": false
+      }
+    }
+  }
+}
+```
+
+### Generic CLI agents (no MCP)
+
+Any agent that can run shell commands can use the CLI directly — no MCP setup needed:
+
+```sh
+deadcode-map [path] --json -            # full JSON report on stdout (pure JSON, no terminal summary)
+deadcode-map [path] --json report.json  # or write it to a file
+deadcode-map [path] --map deadcode-map.html
+deadcode-map [path] --fail-on safe      # CI: exit 1 on new SAFE dead code
+deadcode-map [path] --baseline          # hide findings already in .deadcode-map.json
+deadcode-map [path] --update-baseline   # record current findings as the baseline
+deadcode-map [path] --prove             # prove SAFE deletions with your tests first
+deadcode-map [path] --fix               # delete SAFE findings only
+```
+
+Exit codes: 0 ok, 1 `--fail-on` triggered, 2 usage error / no such directory. A repo guide for agents lives in [AGENTS.md](AGENTS.md).
 
 Example output:
 
@@ -136,6 +301,7 @@ discover  →  parse (tree-sitter)  →  import/call graph  →  confidence + ev
 
 ## Roadmap
 
+- v0.1.0 (shipped): MCP server + Claude Code plugin + AI-tool configs (see "Use with AI tools").
 - v1.1: Java, private methods/fields/classes only (public Java is REVIEW-only — it cannot be proven statically).
 - Framework packs: Django, Angular, Spring, pytest (more), Vue, Svelte.
 - `--diff` / `--since` for PRs: "what did *this PR* leave dead?"

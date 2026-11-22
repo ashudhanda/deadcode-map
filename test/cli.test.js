@@ -23,6 +23,17 @@ function run(dir, args) {
   return r;
 }
 
+test('CLI: --json - writes pure JSON to stdout', () => {
+  const dir = copyFixture('js-basic');
+  const r = run(dir, ['--json', '-']);
+  assert.equal(r.status, 0, r.stderr);
+  // Stdout must be exactly one JSON document: no terminal summary mixed in.
+  const report = JSON.parse(r.stdout);
+  assert.equal(report.tool, 'deadcode-map');
+  assert.ok(report.findings.some((f) => f.grade === 'SAFE'));
+  assert.ok(!r.stdout.includes('deadcode-map  '), 'terminal summary must not leak into --json - output');
+});
+
 test('CLI: --json writes a report and --fail-on exits 1 on new SAFE', () => {
   const dir = copyFixture('js-basic');
   const jsonPath = path.join(dir, 'report.json');

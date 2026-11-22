@@ -28,9 +28,10 @@ function help() {
 
 Usage:
   deadcode-map [path] [options]
+  deadcode-map mcp              Start the MCP server on stdio (for AI tools)
 
 Options:
-  --json <file>        Write the full JSON report to <file>
+  --json <file>        Write the full JSON report to <file> (--json - writes it to stdout)
   --map <file>         Write the single-file offline HTML map to <file>
   --fail-on <level>    Exit 1 when new SAFE (default) or REVIEW dead code exists
   --min-confidence <level>
@@ -84,6 +85,16 @@ function parseArgs(argv) {
 }
 
 function main() {
+  // MCP subcommand: `deadcode-map mcp` starts the MCP server on stdio.
+  if (process.argv[2] === 'mcp') {
+    const { startMcpServer } = require('./mcp-server');
+    startMcpServer().catch((e) => {
+      console.error(`deadcode-map MCP server failed to start: ${e.message}`);
+      process.exit(1);
+    });
+    return;
+  }
+
   const opts = parseArgs(process.argv);
   const root = path.resolve(opts.path);
   if (!fs.existsSync(root)) {
@@ -113,13 +124,18 @@ function main() {
   else if (opts.minConfidence === 'review') visible = visible.filter((f) => f.grade !== 'KEEP');
 
   const summary = summarize(visible);
-  printTerminal(visible, { root, top: opts.top, color: opts.color });
-  if (baselineCount) console.log(`  (${baselineCount} findings hidden by baseline .deadcode-map.json)\n`);
+  // --json - writes the report to stdout: keep stdout pure JSON, no terminal summary.
+  if (opts.json !== '-') printTerminal(visible, { root, top: opts.top, color: opts.color });
+  if (baselineCount && opts.json !== '-') console.log(`  (${baselineCount} findings hidden by baseline .deadcode-map.json)\n`);
 
   if (opts.json) {
     const report = toJsonReport(root, visible, summary, { baselineHidden: baselineCount });
-    fs.writeFileSync(opts.json, JSON.stringify(report, null, 2) + '\n', 'utf8');
-    console.log(`JSON report written to ${opts.json}`);
+    if (opts.json === '-') {
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    } else {
+      fs.writeFileSync(opts.json, JSON.stringify(report, null, 2) + '\n', 'utf8');
+      console.log(`JSON report written to ${opts.json}`);
+    }
   }
 
   if (opts.map) {
