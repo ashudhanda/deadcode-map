@@ -71,6 +71,25 @@ test('CLI: --fix deletes SAFE items only and leaves live code alone', () => {
   assert.ok(used.includes('unusedExport'), 'REVIEW export must survive --fix');
 });
 
+test('CLI: --fix removes a dead dotted import without touching the live one or module dunders', () => {
+  const dir = copyFixture('py-imports');
+  // Put the dead and live imports on one line: the specifier-removal
+  // path (not whole-line removal) must leave `import json` intact.
+  fs.writeFileSync(path.join(dir, 'unused_imports.py'),
+    'import os.path, json\n\n\ndef alive():\n    return json.dumps({"a": 1})\n');
+  const before = fs.readFileSync(path.join(dir, 'pkg', '__init__.py'), 'utf8');
+  const r = run(dir, ['--fix']);
+  assert.equal(r.status, 0, r.stderr);
+  const fixed = fs.readFileSync(path.join(dir, 'unused_imports.py'), 'utf8');
+  assert.ok(!fixed.includes('os.path'), 'dead dotted import should be removed');
+  assert.ok(fixed.includes('import json'), 'live import on the same line must survive --fix');
+  assert.ok(fixed.includes('json.dumps'), 'live code must survive --fix');
+  const init = fs.readFileSync(path.join(dir, 'pkg', '__init__.py'), 'utf8');
+  assert.equal(init, before, '__init__.py dunders must survive --fix untouched');
+  const rescan = run(dir, ['--fail-on', 'safe']);
+  assert.equal(rescan.status, 0, `no SAFE findings should remain after --fix, got: ${rescan.stdout} ${rescan.stderr}`);
+});
+
 test('CLI: --prove proves a deletion when tests pass', () => {
   const dir = copyFixture('js-basic');
   // Make it a git repo with a passing test script.

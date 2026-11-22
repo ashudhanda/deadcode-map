@@ -129,8 +129,10 @@ function identifiers(text) {
  * Blank out strings and comments, keeping newlines, so structural scans
  * never mistake a string or a comment for code. Template literals keep
  * their ${...} expressions as code.
+ * When `collect` is given, every string literal's raw text (with quotes)
+ * is pushed into it, for the string-reference pass.
  */
-function stripJs(code) {
+function stripJs(code, collect) {
   var out = '';
   var i = 0;
   var n = code.length;
@@ -176,6 +178,7 @@ function stripJs(code) {
       out += c; i++;
     } else if (c === "'" || c === '"') {
       var q = c;
+      var start = i;
       out += ' '; i++;
       while (i < n && code[i] !== q) {
         if (code[i] === '\\') { out += '  '; i += 2; continue; }
@@ -183,7 +186,9 @@ function stripJs(code) {
         i++;
       }
       if (i < n) { out += ' '; i++; }
+      if (collect) collect.push(code.slice(start, i));
     } else if (c === '`') {
+      var startT = i;
       out += ' '; i++;
       while (i < n && code[i] !== '`') {
         if (code[i] === '\\') { out += '  '; i += 2; continue; }
@@ -203,6 +208,7 @@ function stripJs(code) {
         i++;
       }
       if (i < n) { out += ' '; i++; }
+      if (collect) collect.push(code.slice(startT, i));
     } else {
       out += c; i++;
     }
@@ -210,7 +216,7 @@ function stripJs(code) {
   return out;
 }
 
-function stripPy(code) {
+function stripPy(code, collect) {
   var lines = code.split('\n');
   var out = [];
   var inTriple = null;
@@ -221,6 +227,7 @@ function stripPy(code) {
     while (i < line.length) {
       if (inTriple) {
         var end = line.indexOf(inTriple, i);
+        if (collect) collect.push(line.slice(i, end === -1 ? line.length : end + 3));
         if (end === -1) { res += ' '.repeat(line.length - i); i = line.length; }
         else { res += ' '.repeat(end + 3 - i); i = end + 3; inTriple = null; }
         continue;
@@ -228,18 +235,21 @@ function stripPy(code) {
       var ch = line[i];
       if (ch === '#') { res += ' '.repeat(line.length - i); break; }
       if (line.slice(i, i + 3) === "'''" || line.slice(i, i + 3) === '"""') {
+        if (collect) collect.push(line.slice(i));
         inTriple = line.slice(i, i + 3);
         res += '   '; i += 3;
         continue;
       }
       if (ch === "'" || ch === '"') {
         var q = ch;
+        var start = i;
         res += ' '; i++;
         while (i < line.length && line[i] !== q) {
           if (line[i] === '\\') { res += '  '; i += 2; continue; }
           res += ' '; i++;
         }
         if (i < line.length) { res += ' '; i++; }
+        if (collect) collect.push(line.slice(start, i));
         continue;
       }
       res += ch; i++;
@@ -254,12 +264,13 @@ function stripPy(code) {
 /* ------------------------------------------------------------------ */
 
 function parseJs(rel, raw) {
-  var code = stripJs(raw);
+  var strings = [];
+  var code = stripJs(raw, strings);
   var lines = code.split('\n');
   var parsed = {
     language: 'js', definitions: [], imports: [], references: new Set(),
     calls: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
-    unreachable: [], decorators: [], dunder: new Set(),
+    unreachable: [], decorators: [], dunder: new Set(), strings: strings,
   };
 
   var braceDepth = 0;
@@ -533,12 +544,13 @@ function parseJs(rel, raw) {
 /* ------------------------------------------------------------------ */
 
 function parsePy(rel, raw) {
-  var code = stripPy(raw);
+  var strings = [];
+  var code = stripPy(raw, strings);
   var lines = code.split('\n');
   var parsed = {
     language: 'py', definitions: [], imports: [], references: new Set(),
     calls: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
-    unreachable: [], decorators: [], dunder: new Set(),
+    unreachable: [], decorators: [], dunder: new Set(), strings: strings,
   };
 
   var classStack = []; // {name, indent}
@@ -609,30 +621,70 @@ function parsePy(rel, raw) {
     if (indentOf(defLine) === 0 && !d.name.startsWith('_')) d.exported = true;
   });
 
-  // Imports.
+  // Imports. In a package __init__.py every import is a re-export: it
+  // defines the package's public namespace (pkg.utils, pkg.run), so the
+  // dead-import check must never flag it — same rule as the CLI.
+  // An import statement can span lines — a parenthesized from-import
+  // (`from x import (\n a,\n)`) or a backslash continuation
+  // (`import a, \\\n b`). The statement is accumulated until its parens
+  // balance and no trailing backslash remains, and every line it covers
+  // is recorded in importLines so the reference pass below skips it:
+  // otherwise the names on continuation lines would count as references
+  // to themselves and a dead multi-line import would be silently missed
+  // (and a trailing backslash would be recorded as a bogus import named
+  // `\`). A star import is kind 'namespace', matching the CLI — the
+  // dead-import check skips it, a wildcard is not a name.
+  var isPackageInit = baseOf(rel) === '__init__.py';
+  var importLines = {}; // 1-based line numbers covered by an import statement
+  function parenDepth(s) {
+    var d = 0;
+    for (var i = 0; i < s.length; i++) {
+      if (s[i] === '(') d++;
+      else if (s[i] === ')') d--;
+    }
+    return d;
+  }
+  function accumulateImport(ii, first) {
+    var stmt = first;
+    var covered = [ii + 1];
+    var guard = 0;
+    while ((parenDepth(stmt) > 0 || /\\\s*$/.test(stmt)) && guard < 20 && ii + 1 < lines.length) {
+      ii++; guard++;
+      stmt += '\n' + lines[ii];
+      covered.push(ii + 1);
+    }
+    covered.forEach(function (n) { importLines[n] = true; });
+    return { stmt: stmt, next: ii };
+  }
+  function fromNames(text) {
+    var names = [];
+    text.replace(/[()\\]/g, ' ').split(',').forEach(function (part) {
+      part = part.trim();
+      if (!part) return;
+      var bits = part.split(/\s+as\s+/);
+      var imported = bits[0].trim();
+      names.push({ imported: imported, local: (bits[1] || imported).trim(), kind: imported === '*' ? 'namespace' : 'named' });
+    });
+    return names;
+  }
   for (var ii = 0; ii < lines.length; ii++) {
     var il = lines[ii];
     var fm = il.match(/^\s*from\s+(\.+)?([\w.]*)\s+import\s+(.+)$/);
     if (fm) {
-      var level = fm[1] ? fm[1].length : 0;
-      var source = fm[2] || '';
-      var names = [];
-      fm[3].split(',').forEach(function (part) {
-        part = part.trim().replace(/[()]/g, '');
-        if (!part) return;
-        var bits = part.split(/\s+as\s+/);
-        names.push({ imported: bits[0].trim(), local: (bits[1] || bits[0]).trim(), kind: 'named' });
-      });
+      var acc = accumulateImport(ii, fm[3]);
+      ii = acc.next;
       parsed.imports.push({
-        source: source, names: names, sideEffect: false, reExport: false,
-        fromImport: true, relative: level > 0, level: level,
+        source: fm[2] || '', names: fromNames(acc.stmt), sideEffect: false, reExport: isPackageInit,
+        fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
       });
       continue;
     }
     var im2 = il.match(/^\s*import\s+(.+)$/);
     if (im2) {
+      var acc2 = accumulateImport(ii, im2[1]);
+      ii = acc2.next;
       var names3 = [];
-      im2[1].split(',').forEach(function (part) {
+      acc2.stmt.replace(/[()\\]/g, ' ').split(',').forEach(function (part) {
         part = part.trim();
         if (!part) return;
         var bits = part.split(/\s+as\s+/);
@@ -641,21 +693,24 @@ function parsePy(rel, raw) {
       });
       parsed.imports.push({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
-        names: names3, sideEffect: false, reExport: false, fromImport: false, relative: false, level: 0,
+        names: names3, sideEffect: false, reExport: isPackageInit, fromImport: false, relative: false, level: 0,
       });
     }
   }
 
-  // References and calls (skip import lines and declaration sites).
-  // Parity note: the CLI's tree-sitter pass records imported names as
-  // references in the importing file, so a Python import is never flagged
-  // dead by the reference check. Mirror that here.
-  parsed.imports.forEach(function (imp) {
-    (imp.names || []).forEach(function (n) { parsed.references.add(n.local); });
-  });
+  // References and calls (skip import lines — including multi-line
+  // import continuation lines, tracked in importLines — and declaration
+  // sites). An import counts as used only when its bound name is actually
+  // referenced elsewhere in the file — the import statement itself is
+  // skipped below, so it never self-references. This matches the CLI
+  // (run-2 fix): before this, every import local was added to
+  // `references` here and no unused Python import was ever flagged.
+  // Imports in __init__.py are re-exports (they define the package
+  // namespace), so they are marked reExport below and never flagged.
   for (var ri = 0; ri < lines.length; ri++) {
     var rl = lines[ri];
     var rNo = ri + 1;
+    if (importLines[rNo]) continue;
     if (/^\s*(import|from)\b/.test(rl)) continue;
     var declared = declaredOnLine[rNo] || new Set();
     identifiers(rl).forEach(function (id) {
@@ -919,13 +974,64 @@ function analyzeFiles(inputFiles, options) {
     });
   }
 
-  // Repo-wide string index.
+  // Repo-wide string index. A mention only counts when it looks like a
+  // real dynamic reference, not prose — same rule as the CLI (src/graph.js):
+  // code files are searched inside string literals only, and only when
+  // the name is the whole string or delimited by code characters
+  // ('handlers.named' counts, 'a named export is nice' does not).
+  // Prose files (.md, .txt) never execute, so they never count. Config /
+  // template files (.json, .yaml, .html, ...) keep the raw-text match.
+  var PROSE_EXTS = { '.md': true, '.txt': true };
+  var RAW_MATCH_EXTS = { '.json': true, '.yaml': true, '.yml': true, '.toml': true, '.html': true, '.vue': true, '.css': true };
+  // Boundary-aware regex for a name that may start with a non-word char
+  // (a scoped dependency: @scope/pkg). Plain \b fails before '@', so a
+  // scoped name could never match at all. For names that start and end
+  // with a word char this builds exactly \b...\b, so symbol matching is
+  // unchanged. The leading boundary may consume one char; callers that
+  // need exact positions must account for m[0].length - name.length.
+  function mentionRegExp(name, flags) {
+    var esc = escapeRegExp(name);
+    var start = /^[A-Za-z0-9_]/.test(name) ? '\\b' : '(?:^|[^A-Za-z0-9_])';
+    var end = /[A-Za-z0-9_]$/.test(name) ? '\\b' : '(?![A-Za-z0-9_])';
+    return new RegExp(start + esc + end, flags);
+  }
+  function codeLikeStringMention(literal, name) {
+    var re = mentionRegExp(name, 'g');
+    var m;
+    while ((m = re.exec(literal)) !== null) {
+      // The leading boundary may have consumed one char (scoped names
+      // like @scope/pkg); the name itself starts after it.
+      var start = m.index + (m[0].length - name.length);
+      var afterIdx = start + name.length;
+      var before = start === 0 ? '' : literal[start - 1];
+      var after = afterIdx >= literal.length ? '' : literal[afterIdx];
+      var beforeOk = before === '' || !/\s/.test(before);
+      var afterOk = after === '' || !/\s/.test(after);
+      if (beforeOk && afterOk) return true;
+    }
+    return false;
+  }
   var stringCache = {};
   function filesMentioning(name) {
     if (stringCache[name]) return stringCache[name];
-    var re = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+    var re = mentionRegExp(name);
     var hits = new Set();
     textFiles.forEach(function (f) {
+      var ext = extOf(f.rel);
+      if (PROSE_EXTS[ext]) return; // prose never executes
+      var info = files[f.rel];
+      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0)) {
+        if (info.parsed && info.parsed.strings) {
+          // String literals only — comments and sentences in docstrings
+          // do not count; see codeLikeStringMention.
+          if (info.parsed.strings.some(function (s) { return codeLikeStringMention(s, name); })) hits.add(f.rel);
+          return;
+        }
+        // Unparseable code file: fall back to a raw-text match rather
+        // than risk hiding a real reference.
+      } else if (!RAW_MATCH_EXTS[ext]) {
+        return; // unknown text extension — do not guess
+      }
       try { if (re.test(f.content)) hits.add(f.rel); } catch (_) {}
     });
     stringCache[name] = hits;
@@ -1129,12 +1235,16 @@ function analyzeFiles(inputFiles, options) {
       (imp.names || []).forEach(function (n) {
         if (n.kind === 'namespace') return;
         if (!parsed.references.has(n.local) && !parsed.calls.has(n.local)) {
+          // For a plain `import a, b` the record's source is only the
+          // first module — use the name's own module (n.full) so the
+          // reason names the real source.
+          var fromSource = imp.fromImport ? imp.source : (n.full || imp.source);
           add({
             category: 'import', file: rel, symbol: n.local, grade: isTest ? 'KEEP' : 'SAFE',
             startLine: 1, endLine: null, size: 0,
-            reason: isTest ? 'unused import in a test file (kept)' : 'imported "' + n.imported + '" from "' + imp.source + '" but never referenced in this file',
+            reason: isTest ? 'unused import in a test file (kept)' : 'imported "' + n.imported + '" from "' + fromSource + '" but never referenced in this file',
             evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
-            deleteDiff: 'remove "' + n.local + '" from import of "' + imp.source + '" in ' + rel,
+            deleteDiff: 'remove "' + n.local + '" from import of "' + fromSource + '" in ' + rel,
           });
         }
       });
@@ -1152,22 +1262,37 @@ function analyzeFiles(inputFiles, options) {
     });
   });
 
-  // Dead dependencies (JS only).
+  // Dead dependencies (JS only). A dependency is used when a real
+  // import/require names it (exact or subpath: lodash/fp, @scope/pkg/sub),
+  // when a package.json script names it, or when a code/config string
+  // names it (the strict string-reference pass — prose in a README never
+  // counts). The old check scanned every text file for the bare name, so
+  // a README mention counted as usage, and a scoped name (@scope/pkg)
+  // could never match at all (\b fails before '@').
   if (pkg && pkg.dependencies) {
     Object.keys(pkg.dependencies).forEach(function (dep) {
-      var re = new RegExp('\\b' + escapeRegExp(dep) + '\\b');
-      var found = re.test(JSON.stringify(pkg.scripts || {}));
+      var found = false;
+      Object.keys(files).forEach(function (rel) {
+        if (found) return;
+        var info = files[rel];
+        if (info.language !== 'js' || !info.parsed) return;
+        (info.parsed.imports || []).forEach(function (imp) {
+          if (imp.source && (imp.source === dep || imp.source.indexOf(dep + '/') === 0)) found = true;
+        });
+      });
+      // package.json scripts count as usage (but not the dependencies
+      // block itself — a dep must not count as used by its own entry).
+      if (!found && mentionRegExp(dep).test(JSON.stringify(pkg.scripts || {}))) found = true;
       if (!found) {
-        for (var i = 0; i < textFiles.length; i++) {
-          if (baseOf(textFiles[i].rel) === 'package.json') continue;
-          if (re.test(textFiles[i].content)) { found = true; break; }
-        }
+        filesMentioning(dep).forEach(function (f) {
+          if (baseOf(f) !== 'package.json') found = true;
+        });
       }
       if (!found) {
         add({
           category: 'dependency', file: 'package.json', symbol: dep, grade: 'REVIEW',
           startLine: 1, endLine: null, size: 0,
-          reason: 'dependency "' + dep + '" appears nowhere (no import, require, string, or script)',
+          reason: 'dependency "' + dep + '" is never imported, required, named in a script, or referenced by a code/config string',
           evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
           deleteDiff: 'npm uninstall ' + dep,
         });

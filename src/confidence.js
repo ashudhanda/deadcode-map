@@ -18,6 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { mentionRegExp } = require('./graph');
 
 function loadFrameworks(dir) {
   const packs = [];
@@ -229,7 +230,7 @@ function gradeFindings(ctx) {
         continue;
       }
       if (parsed.dunder && parsed.dunder.has(def.name)) {
-        add({ ...common, grade: 'KEEP', reason: `dunder / protocol method ${def.name}` });
+        add({ ...common, grade: 'KEEP', reason: `module dunder ${def.name} — read by the import system / packaging tooling, never auto-deleted` });
         continue;
       }
       if (keepSymbols) {
@@ -299,26 +300,33 @@ function gradeFindings(ctx) {
 
   // ---- Dead dependencies (JS only) ----
   if (discovery.pkg && discovery.pkg.dependencies) {
-    // Search every text file once for each dep name.
+    // A dependency is used when a real import/require names it (exact
+    // or subpath: lodash/fp, @scope/pkg/sub), when a package.json
+    // script names it, or when a code/config string names it (the
+    // strict string-reference pass — prose in a README never counts).
+    // The old check scanned every text file for the bare name, so a
+    // README mention counted as usage, and a scoped name (@scope/pkg)
+    // could never match at all (\b fails before '@').
+    const pkgJsons = new Set(discovery.textFiles.filter((f) => path.basename(f) === 'package.json'));
     for (const [dep] of Object.entries(discovery.pkg.dependencies)) {
-      const re = new RegExp(`\\b${dep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
       let found = false;
-      // package.json scripts count as usage.
-      const scripts = JSON.stringify(discovery.pkg.scripts || {});
-      if (re.test(scripts)) found = true;
+      for (const [, info] of graph.files) {
+        if (info.language !== 'js' || !info.parsed) continue;
+        if (info.parsed.imports.some((imp) => imp.source && (imp.source === dep || imp.source.startsWith(dep + '/')))) { found = true; break; }
+      }
+      // package.json scripts count as usage (but not the dependencies
+      // block itself — a dep must not count as used by its own entry).
+      if (!found && mentionRegExp(dep).test(JSON.stringify(discovery.pkg.scripts || {}))) found = true;
       if (!found) {
-        for (const f of discovery.textFiles) {
-          if (f.endsWith('package.json')) continue;
-          try {
-            if (re.test(fs.readFileSync(f, 'utf8'))) { found = true; break; }
-          } catch (_) {}
+        for (const f of filesMentioning(dep)) {
+          if (!pkgJsons.has(f)) { found = true; break; }
         }
       }
       if (!found) {
         add({
           category: 'dependency', file: 'package.json', symbol: dep, grade: 'REVIEW',
           startLine: 1, endLine: null, size: 0,
-          reason: `dependency "${dep}" appears nowhere (no import, require, string, or script) — the depsnap prove-unused bet`,
+          reason: `dependency "${dep}" is never imported, required, named in a script, or referenced by a code/config string — the depsnap prove-unused bet`,
           evidence: { importers: 0, callers: 0, stringRefs: [], exported: false, coveragePct: null, gitAgeDays: null, gitLastCommit: null, gitCommits: null },
           deleteDiff: `npm uninstall ${dep}`,
         });

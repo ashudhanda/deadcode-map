@@ -68,12 +68,12 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 | Dead export / function / class | Defined/exported, 0 importers/callers in the repo |
 | Dead import / variable | Imported/declared, never referenced in its scope |
 | Unreachable code | Code after `return` / `throw` / `break` / `continue`, `if (false)` branches |
-| Dead dependency (JS) | In `package.json`, the name appears nowhere — no import, require, string, or script |
+| Dead dependency (JS) | In `package.json`, never imported/required, named in a script, or referenced by a code/config string — README prose does not count |
 
 ## What is never flagged SAFE
 
 - **Entry points**: `package.json` main/bin/exports, `src/index` / `src/main`, `if __name__ == "__main__"` scripts, shebang CLI scripts, framework routes (`pages/`, `app/`), tests, stories, config, migrations.
-- **Framework magic**: route handlers (`@app.route`, Next.js `getServerSideProps`), decorators, dunder / protocol methods (`__init__`, `__str__`), `__init__.py` re-exports. Framework rules live in `frameworks/*.json` and are loaded by default.
+- **Framework magic**: route handlers (`@app.route`, Next.js `getServerSideProps`), decorators, dunder / protocol methods (`__init__`, `__str__`), module dunder variables (`__version__`, `__author__`, `__all__` — read by the import system / packaging tooling), `__init__.py` re-exports. Framework rules live in `frameworks/*.json` and are loaded by default.
 - **Dynamic use**: anything in a file that uses dynamic `import()`, `require(variable)`, `importlib`, or `getattr` is REVIEW at most — never SAFE.
 - **Public API of a published library**: exported symbols are REVIEW, never SAFE, never auto-deleted.
 - **Methods**: a method with 0 in-repo callers is REVIEW at most — it could be called via an object or a framework.
@@ -82,7 +82,7 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 ## False-positive defences (in priority order)
 
 1. A real import/call graph built from entry points — no flat name-matching.
-2. A string-reference pass: the symbol name is searched across the whole repo (code, config, templates) before flagging.
+2. A string-reference pass: the symbol name is searched across the whole repo (code, config, templates) before flagging. Only code-like mentions count — the name as a whole string (`'named'`, `{"handler": "wired"}`) or delimited by code characters (`'handlers.named'`, `'./named'`). Words inside sentences (`'a named export is nice'`, a docstring, README prose) do not count, and `.md` / `.txt` files never count.
 3. Dynamic-import / reflection detection downgrades to REVIEW.
 4. Framework rule packs as data files (`frameworks/next.json`, `frameworks/fastapi.json`, …).
 5. Confidence grading + `--min-confidence`; `--fix` / `--prove` act on SAFE only.
@@ -98,19 +98,26 @@ Fixtures live in `fixtures/` with planted dead items and known live items. Run t
 | `js-basic` (JS, CommonJS + ESM) | 9 | 4 | 0 | **0%** |
 | `py-basic` (Python, Flask + pytest) | 6 | 2 | 0 | **0%** |
 | `py-relative` (Python, relative imports) | 7 | 1 | 0 | **0%** |
+| `py-imports` (Python, dotted imports + module dunders) | 4 | 1 | 0 | **0%** |
+| `py-multiline` (Python, parenthesized + backslash imports) | 2 | 3 | 0 | **0%** |
+| `js-string` (JS, prose vs code-like string mentions) | 6 | 2 | 0 | **0%** |
+| `py-string` (Python, docstring prose vs code-like mentions) | 4 | 1 | 0 | **0%** |
+| `js-deps` (JS, dead dependencies: README prose vs real imports) | 5 | 0 | 0 | **0%** |
 | `js-framework` (Next.js `pages/`) | 1 | 0 | 0 | **0%** |
 
-Dogfood — deadcode-map run on itself (36 findings, 0.5s):
+The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above, including the dead Python import in `py-imports` — verified by `test/web-analyzer.test.js` (18 tests).
+
+Dogfood — deadcode-map run on itself (49 findings, 0.5s):
 
 | | Count |
 |---|---|
-| SAFE | 2 — both in the fixtures (a dead import, unreachable code), 0 in `src/` |
-| REVIEW | 27 — all correct: exported-but-unused, same-file-only, string-referenced |
-| KEEP | 7 — Next.js routes, Flask handlers, test functions, dunder methods |
+| SAFE | 6 — all in the fixtures (five dead imports, unreachable code), 0 in `src/` |
+| REVIEW | 33 — all correct: exported-but-unused, same-file-only, string-referenced |
+| KEEP | 10 — Next.js routes, Flask handlers, test functions, dunder methods, module dunders |
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 
-Known limitation, stated honestly: the string pass can over-match common words — a helper called `named` is mentioned as the string `'named'` in another file. Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion.
+Known limitation, stated honestly: a name that appears as a whole string or a code-delimited string still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
 
 ## How it works
 

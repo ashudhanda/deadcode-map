@@ -16,6 +16,24 @@ const { parsePy } = require('./parse-py');
 const JS_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
 const PY_EXTS = ['.py'];
 
+const WORD_CHAR = 'A-Za-z0-9_';
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Boundary-aware regex for a name that may start with a non-word char
+ * (a scoped dependency: @scope/pkg). Plain \b fails before '@', so a
+ * scoped name could never match at all. For names that start and end
+ * with a word char this builds exactly \b...\b, so symbol matching is
+ * unchanged. The leading boundary may consume one char; callers that
+ * need exact positions must account for m[0].length - name.length.
+ */
+function mentionRegExp(name, flags) {
+  const esc = escapeRegExp(name);
+  const start = new RegExp(`^[${WORD_CHAR}]`).test(name) ? '\\b' : `(?:^|[^${WORD_CHAR}])`;
+  const end = new RegExp(`[${WORD_CHAR}]$`).test(name) ? '\\b' : `(?![${WORD_CHAR}])`;
+  return new RegExp(start + esc + end, flags);
+}
+
 function resolveRelative(fromFile, source, existingFiles) {
   if (!source.startsWith('.')) return null;
   const base = path.resolve(path.dirname(fromFile), source);
@@ -209,14 +227,58 @@ function analyze(root, discovery) {
   }
 
   // --- repo-wide string index (for the string-reference pass) ---
-  // For each symbol name, the set of files whose raw text mentions it.
-  // Built lazily per name via a scan of text files (cheap enough at this scale).
+  // A mention only counts when it looks like a real dynamic reference,
+  // not prose. Code files are searched inside string literals only, and
+  // only when the name is the whole string or delimited by code
+  // characters (/, ., :, -, _, ...): 'handlers.named' and './named'
+  // count, 'a named export is nice' does not. Prose files (.md, .txt)
+  // never execute, so they never count. Config / template files
+  // (.json, .yaml, .html, ...) keep the raw-text match, because a value
+  // there can wire a handler by name ({"handler": "stringOnlyFn"}).
+  const PROSE_EXTS = new Set(['.md', '.txt']);
+  const RAW_MATCH_EXTS = new Set(['.json', '.yaml', '.yml', '.toml', '.html', '.vue', '.css']);
+
+  /** True when `name` appears in a string literal as code, not as a word in a sentence. */
+  function codeLikeStringMention(literal, name) {
+    const re = mentionRegExp(name, 'g');
+    let m;
+    while ((m = re.exec(literal)) !== null) {
+      // The leading boundary may have consumed one char (scoped names
+      // like @scope/pkg); the name itself starts after it.
+      const start = m.index + (m[0].length - name.length);
+      const end = start + name.length;
+      const before = start === 0 ? '' : literal[start - 1];
+      const after = end >= literal.length ? '' : literal[end];
+      // A quote / string edge, or a non-space character on both sides,
+      // means the name sits in code, not in a sentence.
+      const beforeOk = before === '' || !/\s/.test(before);
+      const afterOk = after === '' || !/\s/.test(after);
+      if (beforeOk && afterOk) return true;
+    }
+    return false;
+  }
+
   const textCache = new Map();
   function filesMentioning(name) {
     if (textCache.has(name)) return textCache.get(name);
-    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+    const re = mentionRegExp(name);
     const hits = new Set();
     for (const f of discovery.textFiles) {
+      const ext = path.extname(f).toLowerCase();
+      if (PROSE_EXTS.has(ext)) continue; // prose never executes
+      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext)) {
+        const info = files.get(f);
+        if (info && info.parsed) {
+          // String literals only — comments and sentences in docstrings
+          // do not count; see codeLikeStringMention.
+          if ((info.parsed.strings || []).some((s) => codeLikeStringMention(s, name))) hits.add(f);
+          continue;
+        }
+        // Unparseable code file: fall back to a raw-text match rather
+        // than risk hiding a real reference.
+      } else if (!RAW_MATCH_EXTS.has(ext)) {
+        continue; // unknown text extension — do not guess
+      }
       try {
         const content = fs.readFileSync(f, 'utf8');
         if (re.test(content)) hits.add(f);
@@ -286,4 +348,4 @@ function analyze(root, discovery) {
   };
 }
 
-module.exports = { analyze, resolveRelative };
+module.exports = { analyze, resolveRelative, mentionRegExp };

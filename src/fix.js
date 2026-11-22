@@ -39,16 +39,39 @@ function applyFix(root, graph, findings) {
       const info = graph.files.get(abs);
       if (!info || !info.parsed) continue;
       if (f.category === 'import') {
-        // Remove the specifier text if we can find it, else drop the line.
-        const imp = info.parsed.imports.find((i) => i.range.startLine === f.startLine);
+        // Find the import record that actually binds this symbol: one
+        // Python statement can hold several imports on the same line
+        // (`import os.path, json` is two records with one shared range),
+        // so matching by line alone can pick the wrong record.
+        const imp = info.parsed.imports.find((i) => i.range.startLine === f.startLine
+          && (i.names || []).some((n) => n.local === f.symbol));
         if (imp) {
           const lineText = src.slice(imp.range.startIndex, imp.range.endIndex);
-          const nameRe = new RegExp(`\\b${f.symbol}\\b\\s*,?\\s*`);
-          if (imp.names.length === 1) {
+          const entry = (imp.names || []).find((n) => n.local === f.symbol);
+          // The specifier as written: "os.path" for a dotted import
+          // (its local name is only the top-level package, not the text
+          // to delete), "y as z" for an explicit alias, and the local
+          // name itself for a JS default import (`import def from 'x'`,
+          // where `imported` is the placeholder "default").
+          let spec = entry ? entry.imported : f.symbol;
+          if (entry && entry.local !== entry.imported) {
+            const aliasForm = `${entry.imported} as ${entry.local}`;
+            spec = lineText.includes(aliasForm)
+              ? aliasForm
+              : (entry.kind === 'default' ? entry.local : entry.imported);
+          }
+          const esc = spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const sameLine = info.parsed.imports.filter((i) => i.range.startLine === f.startLine);
+          if (sameLine.length === 1 && (imp.names || []).length === 1) {
             ranges.push([imp.range.startIndex, imp.range.endIndex + 1]);
-          } else if (nameRe.test(lineText)) {
-            const m = lineText.match(nameRe);
-            ranges.push([imp.range.startIndex + m.index, imp.range.startIndex + m.index + m[0].length]);
+          } else {
+            // Remove just this specifier, taking a neighbouring comma
+            // with it so the line stays valid: trailing comma first,
+            // else the preceding comma (last specifier), else bare.
+            const m = lineText.match(new RegExp(`\\b${esc}\\b\\s*,\\s*`))
+              || lineText.match(new RegExp(`,\\s*\\b${esc}\\b`))
+              || lineText.match(new RegExp(`\\b${esc}\\b`));
+            if (m) ranges.push([imp.range.startIndex + m.index, imp.range.startIndex + m.index + m[0].length]);
           }
         }
         continue;

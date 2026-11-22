@@ -123,6 +123,11 @@ test('py-relative: relative imports resolve, live symbols are never flagged', ()
   assert.equal(byCategory(f, 'pkg/core.py', 'file'), undefined);
   assert.equal(byCategory(f, 'shared.py', 'file'), undefined);
   assert.equal(byCategory(f, 'pkg/__init__.py', 'file'), undefined);
+  // __init__.py imports are re-exports of the package namespace
+  // (`from . import utils` makes pkg.utils importable) — never dead
+  // imports, even though nothing in the file itself uses the names.
+  assert.equal(bySymbol(f, 'pkg/__init__.py', 'utils'), undefined);
+  assert.equal(bySymbol(f, 'pkg/__init__.py', 'run'), undefined);
   // deep.py is genuinely unimported: the file is SAFE, the exported
   // function is REVIEW, never SAFE.
   assert.equal(byCategory(f, 'pkg/sub/deep.py', 'file').grade, 'SAFE');
@@ -139,9 +144,119 @@ test('py-relative: SAFE false-positive rate is 0%', () => {
   }
 });
 
+test('py-imports: module dunders are KEEP, never SAFE or deleted', () => {
+  const f = findingsFor('py-imports');
+  // __version__ / __author__ are read by packaging tooling, __all__
+  // defines the public exports — all three were flagged SAFE before.
+  assert.equal(bySymbol(f, 'pkg/__init__.py', '__version__').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'pkg/__init__.py', '__author__').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'pkg/__init__.py', '__all__').grade, 'KEEP');
+  // The names listed in __all__ are live: main.py imports them.
+  assert.equal(bySymbol(f, 'pkg/__init__.py', 'helper'), undefined);
+});
+
+test('py-imports: dotted imports bind the top-level name', () => {
+  const f = findingsFor('py-imports');
+  // `import pkg.sub` binds `pkg`; used as pkg.sub.deep_fn() — the
+  // submodule and its function are live.
+  assert.equal(bySymbol(f, 'pkg/sub.py', 'deep_fn'), undefined);
+  assert.equal(byCategory(f, 'pkg/sub.py', 'file'), undefined);
+  // `import os.path` binds `os`; unused here, so the dead import is
+  // found (before, the import statement leaked its own names into the
+  // reference set and no unused Python import was ever flagged).
+  assert.equal(bySymbol(f, 'unused_imports.py', 'os').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'unused_imports.py', 'os').category, 'import');
+  // The used import on the next line is not flagged.
+  assert.equal(bySymbol(f, 'unused_imports.py', 'json'), undefined);
+  assert.equal(bySymbol(f, 'unused_imports.py', 'alive'), undefined);
+});
+
+test('py-imports: SAFE false-positive rate is 0%', () => {
+  const f = findingsFor('py-imports');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:unused_imports.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('py-multiline: multi-line imports resolve, dead ones are found (CLI parity)', () => {
+  const f = findingsFor('py-multiline');
+  assert.equal(bySymbol(f, 'multiline.py', 'defaultdict').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', 'OrderedDict').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', 'regex').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', 'Counter'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'ospath'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'json'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'build'), undefined);
+  assert.equal(byCategory(f, 'multiline.py', 'file'), undefined);
+});
+
+test('py-multiline: SAFE false-positive rate is 0% (CLI)', () => {
+  const f = findingsFor('py-multiline');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:multiline.py:defaultdict', 'import:multiline.py:OrderedDict',
+    'import:multiline.py:regex',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
 test('js-framework: Next.js route files are never flagged', () => {
   const f = findingsFor('js-framework');
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
   assert.equal(f.filter((x) => x.grade === 'REVIEW').length, 0);
   assert.ok(f.every((x) => x.grade === 'KEEP'));
+});
+
+test('js-string: prose mentions are not string references', () => {
+  const f = findingsFor('js-string');
+  // Mentioned only as words in sentences (string literals, README, .txt).
+  assert.equal(bySymbol(f, 'src/index.js', 'render').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/index.js', 'named').grade, 'SAFE');
+  // Mentioned as code: dotted string and whole string in config.json.
+  assert.equal(bySymbol(f, 'src/index.js', 'handler').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/index.js', 'wired').grade, 'REVIEW');
+  // No other SAFE findings: nothing live is flagged, no file is dead.
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('py-string: docstring prose is not a string reference', () => {
+  const f = findingsFor('py-string');
+  // Mentioned only in a docstring, a sentence string, and README prose.
+  assert.equal(bySymbol(f, 'main.py', '_load').grade, 'SAFE');
+  // Mentioned as code: dotted string and whole string in config.yaml.
+  assert.equal(bySymbol(f, 'main.py', 'sync').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'main.py', 'dump').grade, 'REVIEW');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['function:main.py:_load']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('js-deps: README-only deps are flagged, real imports are not', () => {
+  const f = findingsFor('js-deps');
+  const dep = (name) => f.find((x) => x.category === 'dependency' && x.symbol === name);
+  // Mentioned only in README / .txt prose — dead dependencies.
+  for (const name of ['left-pad', 'moment', 'unused-dep', '@dead/scope']) {
+    assert.equal(dep(name).grade, 'REVIEW', `${name} must be flagged REVIEW`);
+  }
+  // Live: subpath import, plain require, scoped require, config string,
+  // package.json script, scoped config string.
+  for (const name of ['lodash', 'express', '@scope/pkg', 'chalk', 'rimraf', '@other/plugin']) {
+    assert.equal(dep(name), undefined, `${name} must not be flagged`);
+  }
+  // Nothing in this fixture is SAFE.
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });

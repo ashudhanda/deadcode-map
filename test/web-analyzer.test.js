@@ -6,7 +6,7 @@
  * planted dead items found, SAFE false-positive rate 0%.
  *
  * Run with: node --test test/web-analyzer.test.js
- * (Kept out of `npm test` so the CLI suite stays at 15/15.)
+ * (Kept out of `npm test` so the CLI suite stays at 19/19.)
  */
 
 const test = require('node:test');
@@ -132,6 +132,69 @@ test('web py-relative: SAFE false-positive rate is 0%', () => {
   }
 });
 
+test('web py-imports: unused Python imports are flagged, live ones are not', () => {
+  const f = loadFixture('py-imports').findings;
+  // The CLI flags `import os.path` here (os is never used); the web
+  // analyzer used to miss every dead Python import because each import
+  // local was added to `references` by its own statement.
+  assert.equal(bySymbol(f, 'unused_imports.py', 'os').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'unused_imports.py', 'json'), undefined, 'json is used by alive()');
+  assert.equal(bySymbol(f, 'main.py', 'pkg'), undefined, 'pkg.sub is used');
+  assert.equal(bySymbol(f, 'main.py', 'helper'), undefined);
+  assert.equal(bySymbol(f, 'main.py', 'PUBLIC_CONST'), undefined);
+  assert.equal(bySymbol(f, 'main.py', 'alive'), undefined);
+  // __init__.py imports are re-exports, never flagged.
+  assert.equal(bySymbol(f, 'pkg/__init__.py', 'helper'), undefined);
+  assert.equal(bySymbol(f, 'pkg/__init__.py', 'PUBLIC_CONST'), undefined);
+});
+
+test('web py-imports: SAFE false-positive rate is 0%', () => {
+  const f = loadFixture('py-imports').findings;
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:unused_imports.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-multiline: multi-line imports are parsed, dead ones flagged', () => {
+  const f = loadFixture('py-multiline').findings;
+  // Parenthesized from-import: the two unused names must be found SAFE,
+  // the used one (Counter) must not be flagged. Before the fix the
+  // statement recorded no names at all, so both were silently missed.
+  assert.equal(bySymbol(f, 'multiline.py', 'defaultdict').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', 'OrderedDict').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', 'Counter'), undefined);
+  // Backslash continuation: `re as regex` is unused and must be SAFE.
+  // Before the fix the trailing backslash was recorded as a bogus import
+  // named `\` and flagged SAFE instead.
+  assert.equal(bySymbol(f, 'multiline.py', 'regex').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'multiline.py', '\\'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'json'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'ospath'), undefined);
+  assert.equal(bySymbol(f, 'multiline.py', 'build'), undefined);
+  assert.equal(byCategory(f, 'multiline.py', 'file'), undefined);
+});
+
+test('web py-multiline: SAFE false-positive rate is 0%', () => {
+  const f = loadFixture('py-multiline').findings;
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:multiline.py:defaultdict', 'import:multiline.py:OrderedDict',
+    'import:multiline.py:regex',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-multiline: star imports are not flagged as dead imports', () => {
+  const r = analyzeFiles([{ path: 'main.py', content: 'from pkg import *\n\nprint(1)\n' }]);
+  assert.equal(r.findings.filter((x) => x.category === 'import').length, 0, 'a star import is a wildcard, not a dead import');
+});
+
 test('web js-framework: Next.js route files are never flagged', () => {
   const f = loadFixture('js-framework').findings;
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
@@ -197,4 +260,43 @@ test('web js-realworld: regex literals, comments and try/catch do not create fal
   );
   assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0);
   assert.equal(bySymbol(r.findings, 'src/a.js', 'live'), undefined);
+});
+
+test('web js-string: prose mentions are not string references', () => {
+  const f = loadFixture('js-string').findings;
+  assert.equal(bySymbol(f, 'src/index.js', 'render').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/index.js', 'named').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/index.js', 'handler').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/index.js', 'wired').grade, 'REVIEW');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-string: docstring prose is not a string reference', () => {
+  const f = loadFixture('py-string').findings;
+  assert.equal(bySymbol(f, 'main.py', '_load').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'main.py', 'sync').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'main.py', 'dump').grade, 'REVIEW');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['function:main.py:_load']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web js-deps: README-only deps are flagged, real imports are not', () => {
+  const f = loadFixture('js-deps').findings;
+  const dep = (name) => f.find((x) => x.category === 'dependency' && x.symbol === name);
+  for (const name of ['left-pad', 'moment', 'unused-dep', '@dead/scope']) {
+    assert.equal(dep(name).grade, 'REVIEW', `${name} must be flagged REVIEW`);
+  }
+  for (const name of ['lodash', 'express', '@scope/pkg', 'chalk', 'rimraf', '@other/plugin']) {
+    assert.equal(dep(name), undefined, `${name} must not be flagged`);
+  }
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });

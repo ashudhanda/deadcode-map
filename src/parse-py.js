@@ -8,6 +8,7 @@
 
 const Parser = require('tree-sitter');
 const Python = require('tree-sitter-python');
+const path = require('path');
 
 let parser = null;
 function getParser() {
@@ -34,14 +35,6 @@ function text(node, src) {
 function walk(node, fn) {
   fn(node);
   for (let i = 0; i < node.namedChildCount; i++) walk(node.namedChild(i), fn);
-}
-
-function firstNamed(node, type) {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const c = node.namedChild(i);
-    if (c.type === type) return c;
-  }
-  return null;
 }
 
 function childByField(node, field) {
@@ -101,8 +94,12 @@ function parsePy(filePath, src) {
       _parentType: parentType,
       ...(extra || {}),
     });
-    if (DUNDER_KEEP.has(name)) result.dunder.add(name);
+    if (DUNDER_KEEP.has(name) || /^__\w+__$/.test(name)) result.dunder.add(name);
   };
+  // In a package __init__.py every import is a re-export: it defines the
+  // package's public namespace (pkg.utils, pkg.run), so the confidence
+  // engine must never flag it as a dead import.
+  const isPackageInit = path.basename(filePath) === '__init__.py';
 
   // --- pass 1: structure ---
   walk(root, (node) => {
@@ -112,14 +109,17 @@ function parsePy(filePath, src) {
           const c = node.namedChild(i);
           if (c.type === 'dotted_name') {
             const full = text(c, src);
-            const local = full.split('.').pop();
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false });
+            // `import a.b.c` binds the TOP-level name `a`, not `c` —
+            // code uses it as a.b.c.foo(). Recording `c` made the
+            // binding unfindable and hid genuinely unused dotted imports.
+            const local = full.split('.')[0];
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit });
           } else if (c.type === 'aliased_import') {
             const nameNode = childByField(c, 'name');
             const aliasNode = childByField(c, 'alias');
             const full = nameNode ? text(nameNode, src) : '';
-            const local = aliasNode ? text(aliasNode, src) : full.split('.').pop();
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false });
+            const local = aliasNode ? text(aliasNode, src) : full.split('.')[0];
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit });
           }
         }
         break;
@@ -153,7 +153,7 @@ function parsePy(filePath, src) {
           }
         }
         const rel = node.namedChild(0) && node.namedChild(0).type === 'relative_import';
-        result.imports.push({ names, source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true });
+        result.imports.push({ names, source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true, reExport: isPackageInit });
         break;
       }
       case 'decorated_definition': {
@@ -221,6 +221,18 @@ function parsePy(filePath, src) {
 
   // --- pass 2: references, calls, strings, dynamic ---
   const isDefinitionSite = (node) => {
+    // Identifiers inside an import statement are module paths and bound
+    // names, never references to other values. They sit under a
+    // dotted_name / aliased_import, so the immediate parent is not the
+    // import statement itself — walk up the ancestors. Without this,
+    // every imported name leaked into `references` and no unused Python
+    // import was ever flagged (the import always looked "used" by its
+    // own statement).
+    let ancestor = node.parent;
+    while (ancestor) {
+      if (ancestor.type === 'import_statement' || ancestor.type === 'import_from_statement') return true;
+      ancestor = ancestor.parent;
+    }
     const p = node.parent;
     if (!p) return false;
     if ((p.type === 'function_definition' || p.type === 'class_definition') && sameNode(childByField(p, 'name'), node)) return true;
