@@ -69,6 +69,27 @@ var PY_KEYWORDS = new Set([
 // adds `print` / `self` / `cls` to references — harmless, since no
 // definition is ever named that way.
 
+// JSX-pragma names: see the decision block in src/parse-js.js, kept
+// identical here — in a file that contains JSX, an imported binding
+// with one of these names counts as used by the JSX transform (the
+// classic runtimes call React.createElement, preact's h /
+// createElement, or the Fragment factory; the automatic runtimes call
+// jsx / jsxs / jsxDEV), even though the name never appears in the
+// source text. In a file with no JSX the same import is still
+// flaggable. memo, Component, Suspense and lazy are deliberately NOT
+// here: the transform never calls them, so an unused memo import in
+// a JSX file is still dead.
+var JSX_PRAGMA_NAMES = [
+  'React', 'createElement', 'h', 'Fragment', 'jsx', 'jsxs', 'jsxDEV',
+];
+// Longest import / re-export / require statement the web parser will
+// accumulate across lines. The 10-line bound used to cut off real
+// imports (preact's src/diff/index.js has an 18-line import, its
+// test/ts/preact.tsx a 19-line one): a truncated statement lost its
+// import edge entirely and its continuation lines leaked into the
+// references pass. 200 lines still bounds a malformed statement.
+var IMPORT_STMT_MAX_LINES = 200;
+
 var TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
 // A file literally named test.ts / test.tsx (date-fns) holds type-test
 // functions whose bodies ARE the assertions — the declarations are the
@@ -155,6 +176,15 @@ function identifiers(text) {
   var m;
   while ((m = re.exec(text)) !== null) out.push(m[0]);
   return out;
+}
+
+// Blank out // line comments and /* block comments */ in a fragment
+// of import / export / require syntax. Specifier lists never hold
+// string literals, so a `//` or `/*` there always starts a comment —
+// without this, a comment line inside a multi-line import became a
+// garbage "name" (`// the main helper\n usedFn`).
+function stripComments(text) {
+  return text.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
 // Split on a separator that sits at the top level: a separator inside
@@ -407,13 +437,25 @@ function parseJs(rel, raw) {
   var strings = [];
   var code = stripJs(raw, strings);
   var lines = code.split('\n');
+  // A file contains JSX when the stripped code (strings and comments
+  // blanked, positions preserved) has a JSX element: `<Tag ...>`,
+  // `<Tag/>`, `<Tag {...spread}>`, or a fragment `<>`. The `<` must
+  // not follow an identifier character, so a generic
+  // (`foo<string>`, `Map<K, V>`, `x as Foo<Bar>`) or a comparison
+  // (`a < b`) is not mistaken for a tag — a generic's `<` follows its
+  // type name directly. A chained comparison (`a < b > c`) still
+  // matches, which only keeps a pragma import alive: a missed SAFE,
+  // never a false one. (The CLI sets the same flag from tree-sitter
+  // jsx_element nodes; this regex is the web parser's equivalent.)
+  var hasJsx = /(?:^|[^A-Za-z0-9_$.])<>/.test(code) ||
+    /(?:^|[^A-Za-z0-9_$.])<[A-Za-z][\w.:-]*\s*(?:\/?>|\{|[A-Za-z_][\w-]*\s*(?:=|\/?>|\s))/.test(code);
   // A compatibility shim's imports ARE its public API (mirrors
   // src/parse-py.js): the names are re-exported for downstream code.
   var isCompatShimJs = /(^|\/)(_?compat)(\.(js|jsx|ts|tsx|mjs|cjs))?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
   var parsed = {
     language: 'js', definitions: [], imports: [], references: new Set(),
     calls: new Set(), constructed: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
-    unreachable: [], decorators: [], dunder: new Set(), strings: strings,
+    unreachable: [], decorators: [], dunder: new Set(), strings: strings, hasJsx: hasJsx,
   };
 
   var braceDepth = 0;
@@ -642,7 +684,7 @@ function parseJs(rel, raw) {
   function parseImportStatement(stmt) {
     var im = stmt.match(/import\s+(?:([\s\S]*?)\s+from\s+)?['"]([^'"]+)['"]/);
     if (!im) return null;
-    var spec = (im[1] || '').trim();
+    var spec = stripComments((im[1] || '').trim());
     var names = [];
     if (spec) {
       var star = spec.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
@@ -669,6 +711,24 @@ function parseJs(rel, raw) {
     }
     return { source: im[2], names: names, sideEffect: !spec, reExport: isCompatShimJs };
   }
+  // Lines that belong to an import or re-export statement, recorded
+  // while the statement is accumulated below: a multi-line import's
+  // continuation lines (`  createElement,` in `import {\n
+  // createElement,\n ... } from 'react'`) hold binding names, not
+  // uses — without this, every name on a continuation line leaked
+  // into the references pass and looked used, so no unused import
+  // split across lines was ever flagged (preact
+  // demo/suspense.jsx, demo/people/router.tsx). Only lines of a
+  // statement that parsed successfully are recorded: a malformed
+  // statement (no `from` clause within the bound) records nothing
+  // and its lines are scanned like ordinary code (fail open).
+  var importStmtLines = new Set();
+  // Multi-line require(): line number (1-based) -> binding names bound
+  // on that line by a destructuring require (`const {\n a,\n b\n} =
+  // require('./x')`). The references pass skips exactly those names;
+  // anything else on the line — a member call after the require, a
+  // default value's callee — still counts as a use.
+  var requireLineBindings = Object.create(null);
   var rawLines = raw.split('\n');
   for (var il2 = 0; il2 < rawLines.length; il2++) {
     var rawLine = rawLines[il2];
@@ -682,14 +742,35 @@ function parseJs(rel, raw) {
     var trimmedRaw = rawLine.trim();
     if (/^(\/\/|\/\*|\*)/.test(trimmedRaw)) continue; // comment line
     if (/^\s*import\s+[^\(]/.test(strippedLine)) {
+      var stmtStart = il2;
       var stmt = rawLine;
+      var stmtStripped = strippedLine;
       var guard = 0;
-      while (!/from\s+['"]/.test(stmt) && !/;\s*$/.test(stmt) && guard < 10 && il2 + 1 < rawLines.length) {
+      // Accumulate until the statement is complete. The stripped
+      // text (comments blanked, strings blanked) is the oracle for
+      // completeness: a named/default import ends with its `from`
+      // clause, a side-effect import (`import './x'`) is just the
+      // bare `import` keyword once its string is blanked, and a `;`
+      // ends the statement. ASI code has no `;`, so the loop must not
+      // run past the source string — a side-effect import with no
+      // trailing `;` used to swallow the following lines (up to the
+      // guard) and record them as import lines, which blanked the
+      // next function's references (zustand Scene.jsx: every symbol
+      // in Experience looked dead). The raw text is kept for parsing,
+      // because the stripped text has the source string blanked.
+      while (guard < IMPORT_STMT_MAX_LINES && il2 + 1 < rawLines.length) {
+        if (/from\s*;?\s*$/.test(stmtStripped)) break;
+        if (/^\s*import\s+['"]/.test(stmt) && /^\s*import\s*;?\s*$/.test(stmtStripped)) break;
+        if (/;\s*$/.test(stmtStripped)) break;
         il2++; guard++;
         stmt += '\n' + rawLines[il2];
+        stmtStripped += '\n' + (lines[il2] || '');
       }
       var imp = parseImportStatement(stmt);
-      if (imp) parsed.imports.push(imp);
+      if (imp) {
+        parsed.imports.push(imp);
+        for (var sl = stmtStart; sl <= il2; sl++) importStmtLines.add(sl + 1);
+      }
       continue;
     }
     if (/^\s*export\s+(?:\*|\{)/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
@@ -700,9 +781,10 @@ function parseJs(rel, raw) {
       // so the next statement is never swallowed (ASI code has no `;`
       // to stop on). The `export * as ns from '...'` alias form is
       // accepted too (matches the CLI).
+      var reStmtStart = il2;
       var reStmt = rawLine;
       var reGuard = 0;
-      while (reGuard < 10 && il2 + 1 < rawLines.length) {
+      while (reGuard < IMPORT_STMT_MAX_LINES && il2 + 1 < rawLines.length) {
         if (/from\s+['"]/.test(reStmt)) break;
         if (/;\s*$/.test(reStmt)) break;
         if (/^\s*export\s*\{/.test(reStmt)) {
@@ -716,9 +798,31 @@ function parseJs(rel, raw) {
         il2++; reGuard++;
         reStmt += '\n' + rawLines[il2];
       }
-      var reM = reStmt.match(/export\s+(?:\*(?:\s+as\s+[A-Za-z_$][\w$]*)?|\{[\s\S]*?\})\s+from\s+['"]([^'"]+)['"]/);
+      var reM = reStmt.match(/export\s+(?:\*(?:\s+as\s+([A-Za-z_$][\w$]*))?|\{([\s\S]*?)\})\s+from\s+['"]([^'"]+)['"]/);
       if (reM) {
-        parsed.imports.push({ source: reM[1], names: [], sideEffect: false, reExport: true });
+        // The re-exported names are the import edge's names (matches
+        // the CLI): the graph marks the target's symbols as imported
+        // by this file through them. With names: [] the edge kept
+        // the file alive but its symbols looked unimported — the old
+        // references leak (continuation lines scanned as uses) was
+        // silently doing this job instead.
+        var reNames = [];
+        if (reM[2] !== undefined) {
+          // export { A, B as C, type D } from '...' — `type` is a
+          // modifier, not a name (same rule as the import branch).
+          stripComments(reM[2]).split(',').forEach(function (part) {
+            part = part.trim().replace(/^type\s+/, '');
+            if (!part) return;
+            var bits = part.split(/\s+as\s+/);
+            reNames.push({ imported: bits[0].trim(), local: (bits[1] || bits[0]).trim(), kind: 'named' });
+          });
+        } else {
+          // export * [as ns] from '...' — a namespace re-export: the
+          // alias binds the namespace, or `*` marks every export.
+          reNames.push({ imported: '*', local: reM[1] || '*', kind: 'namespace' });
+        }
+        parsed.imports.push({ source: reM[3], names: reNames, sideEffect: false, reExport: true });
+        for (var rl = reStmtStart; rl <= il2; rl++) importStmtLines.add(rl + 1);
         continue;
       }
       // No `from` clause: a local `export { ... }`, not a re-export —
@@ -726,10 +830,67 @@ function parseJs(rel, raw) {
     }
     var reqM = rawLine.match(/(?:const|let|var)\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/);
     if (reqM && strippedLine.indexOf('require(') === -1) reqM = null; // inside a string/comment, not real code
+    var reqStmtStart = -1;
+    if (!reqM && /^\s*(?:const|let|var)\b/.test(strippedLine)) {
+      // A require() split across lines (`const {\n a,\n b\n} =
+      // require('./x')`, or `const x =\n require('./x')`): the
+      // single-line match above cannot see it, so the import edge was
+      // lost and the destructured names leaked into the references
+      // pass as uses. Accumulate until the braces and parens balance
+      // and a require( has been seen; a `;` before any require ends a
+      // different statement, so stop there instead of swallowing the
+      // next statement. Balance is counted on the stripped lines, so
+      // a brace inside a string cannot fool it.
+      reqStmtStart = il2;
+      var reqStmt = rawLine;
+      var reqStripped = strippedLine;
+      var reqGuard = 0;
+      while (reqGuard < IMPORT_STMT_MAX_LINES && il2 + 1 < rawLines.length) {
+        var reqBalBraces = 0;
+        var reqBalParens = 0;
+        for (var rb = 0; rb < reqStripped.length; rb++) {
+          if (reqStripped[rb] === '{') reqBalBraces++;
+          else if (reqStripped[rb] === '}') reqBalBraces--;
+          else if (reqStripped[rb] === '(') reqBalParens++;
+          else if (reqStripped[rb] === ')') reqBalParens--;
+        }
+        var reqSeen = /require\s*\(/.test(reqStmt);
+        if (reqSeen && reqBalBraces === 0 && reqBalParens === 0) break;
+        // Without a require yet, the statement is complete when its
+        // braces and parens balance and it does not end with a
+        // continuation (an operator, comma, or open bracket): ASI
+        // code has no `;`, so a finished `const x = foo()` must stop
+        // the scan here — otherwise every semicolon-less declaration
+        // swallowed the following lines up to the guard (and the
+        // zustand web bench went from 0.1s to 4.8s).
+        if (!reqSeen && reqBalBraces === 0 && reqBalParens === 0 && !/[=,([{+\-*/%&|^?:.]$/.test(reqStripped.trim())) break;
+        il2++; reqGuard++;
+        reqStmt += '\n' + rawLines[il2];
+        reqStripped += '\n' + (lines[il2] || '');
+      }
+      // `[^}]*` spans newlines (a negated class matches `\n`), so the
+      // same single-line pattern parses the joined statement.
+      reqM = reqStmt.match(/(?:const|let|var)\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/);
+      if (reqM) {
+        // The require( must be real code, not text inside a string:
+        // find its line and check the stripped line still has it
+        // (positions are preserved by stripping).
+        var reqIdx = reqStmt.indexOf('require(');
+        var reqLineNo = reqStmtStart + reqStmt.slice(0, reqIdx).split('\n').length - 1;
+        if ((lines[reqLineNo] || '').indexOf('require(') === -1) reqM = null;
+      }
+      if (!reqM) {
+        // Not a require after all: rewind, so the lines just scanned
+        // are visited normally by the import scan (a require on a
+        // later line still gets its bare edge below).
+        il2 = reqStmtStart;
+        reqStmtStart = -1;
+      }
+    }
     if (reqM) {
       var names2 = [];
       if (reqM[1]) {
-        reqM[1].split(',').forEach(function (part) {
+        stripComments(reqM[1]).split(',').forEach(function (part) {
           part = part.trim();
           if (!part) return;
           var bits = part.split(/\s*:\s*/);
@@ -739,6 +900,15 @@ function parseJs(rel, raw) {
         names2.push({ imported: reqM[2], local: reqM[2], kind: 'value' });
       }
       parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: isCompatShimJs });
+      if (reqStmtStart >= 0) {
+        // Record the binding names on every line of the statement so
+        // the references pass skips them (see below). A name is
+        // recorded only when the statement parsed, so a failed
+        // accumulation records nothing (fail open).
+        var reqLocals = new Set();
+        names2.forEach(function (n) { reqLocals.add(n.local); });
+        for (var rbl = reqStmtStart; rbl <= il2; rbl++) requireLineBindings[rbl + 1] = reqLocals;
+      }
     }
     // Inline / bare require('...') — require('./x').fn() or a bare
     // side-effect require('./x') — is an import edge too (matches the
@@ -784,6 +954,19 @@ function parseJs(rel, raw) {
   parsed.imports.forEach(function (imp) {
     (imp.names || []).forEach(function (n) { importLocals.add(n.local); });
   });
+  // JSX-pragma imports count as uses when the file contains JSX (see
+  // the decision block in src/parse-js.js — the same rule, kept in
+  // sync): the transform calls the pragma factory for every element,
+  // so the import is used even though its name never appears in the
+  // source text. Only imported bindings get the credit, and only in
+  // a file with JSX; in a file with no JSX the same import is still
+  // flaggable. Applied here, before the references pass, so it only
+  // affects the file-level reference set the dead-import check reads.
+  if (parsed.hasJsx) {
+    JSX_PRAGMA_NAMES.forEach(function (name) {
+      if (importLocals.has(name)) parsed.references.add(name);
+    });
+  }
   // Brace depth carried across the lines of one `module.exports = {
   // ... }` region, so the references scan below can tell a top-level
   // entry name (an export) from a nested or trailing use.
@@ -796,6 +979,10 @@ function parseJs(rel, raw) {
     if (inExportObj && !exportObjPrev) exportObjDepth = 0; // fresh region
     exportObjPrev = inExportObj;
     if (/^\s*import\b/.test(l)) continue;
+    // A line belonging to a multi-line import or re-export statement
+    // holds binding names, not uses (see importStmtLines above) — the
+    // whole line is skipped, exactly like a single-line import line.
+    if (importStmtLines.has(lineNo2)) continue;
     if (inExportObj) {
       // Depth-aware scan of an export-object line: only a top-level
       // entry name is an export — a shorthand (`A,`) or a key
@@ -849,10 +1036,13 @@ function parseJs(rel, raw) {
     // flagged). But a member call on the same line IS a use —
     // `const x = require('./util').helper()` uses `helper` — so collect
     // the line's identifiers except the bound names, instead of skipping
-    // the whole line.
-    var boundHere = null;
+    // the whole line. For a require() split across lines, the binding
+    // names per line were recorded while the statement was accumulated
+    // (requireLineBindings above); a single-line require is parsed
+    // here, as before.
+    var boundHere = requireLineBindings[lineNo2] ? new Set(requireLineBindings[lineNo2]) : null;
     if (/\brequire\s*\(/.test(l) && /^\s*(const|let|var)\b/.test(l)) {
-      boundHere = new Set();
+      if (!boundHere) boundHere = new Set();
       var bm = l.match(/^\s*(?:const|let|var)\s+\{([^}]*)\}/);
       if (bm) {
         bm[1].split(',').forEach(function (part) {

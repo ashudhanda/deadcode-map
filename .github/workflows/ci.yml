@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: CLI test suite
+        run: npm test
+      - name: Web checker test suite
+        run: node --test test/web-analyzer.test.js test/web-prototype-names.test.js
+      - name: Dogfood (this repo must scan clean)
+        run: |
+          node bin/deadcode-map.js . --json /tmp/dogfood.json --no-color
+          node -e "const r = require('/tmp/dogfood.json'); const n = r.findings.length; console.log('dogfood findings: ' + n); if (n !== 0) { console.error('dogfood failed: expected 0 findings'); process.exit(1); }"

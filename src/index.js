@@ -7,6 +7,7 @@ const path = require('path');
 const { discover } = require('./discover');
 const { analyze } = require('./graph');
 const { gradeFindings, loadFrameworks } = require('./confidence');
+const { BASELINE_FILE } = require('./baseline');
 const { gitInfo } = require('./git');
 const { parseCoverage } = require('./coverage');
 const {
@@ -130,6 +131,19 @@ function scan(root, opts) {
     discovery.textFiles = (discovery.textFiles || []).filter((f) => f !== cacheFile);
     discovery.allFiles = (discovery.allFiles || []).filter((f) => f !== cacheFile);
   }
+  // The baseline file (.deadcode-map.json) is excluded the same way,
+  // and for the same reason: it lists finding ids and symbol names, so
+  // on the run after --update-baseline its contents counted as string
+  // references and demoted SAFE findings to REVIEW — the same self-scan
+  // bug class as the --json output file (a dead file went SAFE on run
+  // 1 and REVIEW on run 2, with the baseline itself as the only
+  // "mention"). The file is still read separately by loadBaseline in
+  // the CLI; it is only excluded from the scan itself. The exclusion
+  // is by exact path at the scanned root (the only place a baseline
+  // is written), never by name elsewhere.
+  const baselineFile = path.join(discovery.root, BASELINE_FILE);
+  discovery.textFiles = (discovery.textFiles || []).filter((f) => f !== baselineFile);
+  discovery.allFiles = (discovery.allFiles || []).filter((f) => f !== baselineFile);
   // Framework packs are loaded before the analysis so their contents
   // can feed the cache config hash (a pack change forces a re-parse).
   const packs = loadFrameworks(path.join(__dirname, '..', 'frameworks'));

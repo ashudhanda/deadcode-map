@@ -16,6 +16,11 @@
   "engines": {
     "node": ">=18"
   },
+  "files": [
+    "bin",
+    "src",
+    "frameworks"
+  ],
   "homepage": "https://github.com/ashudhanda/deadcode-map#readme",
   "keywords": [
     "dead-code",

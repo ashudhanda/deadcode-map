@@ -1,11 +1,13 @@
 'use strict';
 
 /**
- * Coverage evidence tests: Cobertura XML + lcov parsing, and the grade
- * rule — coverage can only demote a would-be SAFE finding to REVIEW,
- * never promote one to SAFE. The demotion uses body lines only: a
- * `def` / `function` line executes when its module is imported, so
- * counting it would demote every function in an imported module.
+ * Coverage evidence tests: Cobertura XML + lcov parsing, merging
+ * several runs into one signal (union of covered lines per file),
+ * and the grade rule — coverage can only demote a would-be SAFE
+ * finding to REVIEW, never promote one to SAFE. The demotion uses
+ * body lines only: a `def` / `function` line executes when its module
+ * is imported, so counting it would demote every function in an
+ * imported module.
  */
 
 const test = require('node:test');
@@ -16,7 +18,7 @@ const path = require('path');
 const { spawnSync } = require('node:child_process');
 const { scan } = require('../src/index');
 const {
-  parseCoverageXml, parseLcov, parseCoverage,
+  parseCoverageXml, parseLcov, parseCoverage, mergeCoverage,
   coverageForSymbol, coverageForSymbolBody,
 } = require('../src/coverage');
 
@@ -73,6 +75,163 @@ end_of_record
 function bySymbol(findings, file, symbol) {
   return findings.find((f) => f.file.endsWith(file) && f.symbol === symbol);
 }
+
+// Cobertura for app.py where exactly the given lines are hit.
+function coberturaBodyLines(hitLines) {
+  const line = (n) => `<line number="${n}" hits="${hitLines.includes(n) ? 1 : 0}"/>`;
+  return `<?xml version="1.0" ?>
+<coverage><packages><package name=""><classes>
+<class name="app" filename="app.py" line-rate="0.5"><lines>
+${[1, 2, 5, 6, 7].map(line).join('\n')}
+</lines></class>
+</classes></package></packages></coverage>
+`;
+}
+
+// Two live modules, each with one dead private function, both
+// imported by main.py — the same shape as appDir, doubled, so each
+// run can cover a different dead symbol.
+function twoFileApp() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-cov-merge-'));
+  const mod = (live, dead) => `def ${live}():\n    return 1\n\n\ndef ${dead}():\n    x = 1\n    return x\n`;
+  write(dir, 'a.py', mod('live_a', '_dead_a'));
+  write(dir, 'b.py', mod('live_b', '_dead_b'));
+  write(dir, 'main.py', 'from a import live_a\nfrom b import live_b\n\nlive_a()\nlive_b()\n');
+  return dir;
+}
+
+function coberturaTwoFile({ aBodyHit, bBodyHit }) {
+  const cls = (name, filename, bodyHit) => `<class name="${name}" filename="${filename}" line-rate="0.5"><lines>
+<line number="1" hits="1"/>
+<line number="2" hits="1"/>
+<line number="5" hits="1"/>
+<line number="6" hits="${bodyHit ? 1 : 0}"/>
+<line number="7" hits="0"/>
+</lines></class>`;
+  return `<?xml version="1.0" ?>
+<coverage><packages><package name=""><classes>
+${cls('a', 'a.py', aBodyHit)}
+${cls('b', 'b.py', bBodyHit)}
+</classes></package></packages></coverage>
+`;
+}
+
+function lcovTwoFile({ aBodyHit, bBodyHit }) {
+  const rec = (file, bodyHit) => `SF:${file}\nDA:1,1\nDA:2,1\nDA:5,1\nDA:6,${bodyHit ? 1 : 0}\nDA:7,0\nend_of_record\n`;
+  return `TN:\n${rec('a.py', aBodyHit)}${rec('b.py', bBodyHit)}`;
+}
+
+// --- merging ---
+
+test('coverage: mergeCoverage unions covered lines and totals per file', () => {
+  // Both runs are parsed against the same root, as a real scan does —
+  // the per-file keys are absolute paths under that root.
+  const dir = appDir();
+  write(dir, 'covA.xml', coberturaBodyLines([1, 2, 5, 6]));
+  write(dir, 'covB.xml', coberturaBodyLines([1, 2, 5, 7]));
+  write(dir, 'runC.info', 'TN:\nSF:app.py\nDA:1,1\nDA:2,1\nDA:5,1\nDA:6,0\nDA:7,1\nend_of_record\n');
+  const app = path.join(dir, 'app.py');
+  const mapA = parseCoverageXml(dir, 'covA.xml');
+  const mapB = parseCoverageXml(dir, 'covB.xml');
+  const merged = mergeCoverage([mapA, mapB]);
+  const entry = merged.get(app);
+  // Run A covers body line 6, run B covers body line 7: neither alone
+  // covers the whole body, the union covers all of it.
+  assert.deepEqual([...entry.coveredLines].sort((a, b) => a - b), [1, 2, 5, 6, 7]);
+  assert.equal(entry.linesTotal, 5);
+  assert.equal(entry.linesCovered, 5);
+  assert.equal(entry.pct, 100);
+  assert.equal(entry.source, 'cobertura', 'one shared source is kept');
+  assert.deepEqual(coverageForSymbolBody(merged, app, 5, 7),
+    { pct: 100, linesTotal: 2, linesCovered: 2, source: 'cobertura' });
+  assert.equal(coverageForSymbolBody(mapA, app, 5, 7).pct, 50);
+  assert.equal(coverageForSymbolBody(mapB, app, 5, 7).pct, 50);
+  // Mixed formats merge with source 'merged'.
+  const mixed = mergeCoverage([mapA, parseLcov(dir, 'runC.info')]);
+  assert.equal(mixed.get(app).source, 'merged');
+  assert.equal(mixed.get(app).pct, 100);
+  // Merging is idempotent and skips null / empty inputs.
+  assert.equal(mergeCoverage([mapA, mapA]).get(app).pct, 80);
+  assert.equal(mergeCoverage([null, mapA]).get(app).pct, 80);
+  assert.equal(mergeCoverage([]), null);
+  assert.equal(mergeCoverage([null]), null);
+  // Hand-built maps without allLines fall back to the largest total.
+  const handA = new Map([['f.js', { linesTotal: 5, linesCovered: 1, pct: 20, coveredLines: new Set([6]), source: 'lcov' }]]);
+  const handB = new Map([['f.js', { linesTotal: 5, linesCovered: 1, pct: 20, coveredLines: new Set([7]), source: 'lcov' }]]);
+  const hand = mergeCoverage([handA, handB]).get('f.js');
+  assert.equal(hand.linesTotal, 5);
+  assert.equal(hand.linesCovered, 2);
+  assert.equal(hand.pct, 40);
+});
+
+test('coverage: merging a directory of runs demotes what neither run alone demotes', () => {
+  const dir = twoFileApp();
+  const run1 = write(dir, 'cov/coverage-unit.xml', coberturaTwoFile({ aBodyHit: true, bBodyHit: false }));
+  const run2 = write(dir, 'cov/lcov-e2e.info', lcovTwoFile({ aBodyHit: false, bBodyHit: true }));
+  // Each run alone rescues only its own file's dead symbol.
+  assert.equal(bySymbol(scan(dir, { coveragePath: run1 }).findings, 'a.py', '_dead_a').grade, 'REVIEW');
+  assert.equal(bySymbol(scan(dir, { coveragePath: run1 }).findings, 'b.py', '_dead_b').grade, 'SAFE');
+  assert.equal(bySymbol(scan(dir, { coveragePath: run2 }).findings, 'a.py', '_dead_a').grade, 'SAFE');
+  assert.equal(bySymbol(scan(dir, { coveragePath: run2 }).findings, 'b.py', '_dead_b').grade, 'REVIEW');
+  // The merged directory rescues both — and records the mixed source.
+  const merged = scan(dir, { coveragePath: 'cov' }).findings;
+  assert.equal(bySymbol(merged, 'a.py', '_dead_a').grade, 'REVIEW');
+  assert.equal(bySymbol(merged, 'b.py', '_dead_b').grade, 'REVIEW');
+  assert.equal(bySymbol(merged, 'a.py', '_dead_a').evidence.coverageSource, 'merged');
+  assert.equal(bySymbol(merged, 'b.py', '_dead_b').evidence.coverageSource, 'merged');
+});
+
+test('coverage: parseCoverage merges a list of files and skips missing/empty inputs', () => {
+  const dir = twoFileApp();
+  const run1 = write(dir, 'run1.xml', coberturaTwoFile({ aBodyHit: true, bBodyHit: false }));
+  const run2 = write(dir, 'run2.info', lcovTwoFile({ aBodyHit: false, bBodyHit: true }));
+  const merged = scan(dir, { coveragePath: [run1, run2] }).findings;
+  assert.equal(bySymbol(merged, 'a.py', '_dead_a').grade, 'REVIEW');
+  assert.equal(bySymbol(merged, 'b.py', '_dead_b').grade, 'REVIEW');
+  // A missing first input is skipped, not fatal: the result is exactly
+  // the remaining run's signal.
+  const withMissing = scan(dir, { coveragePath: [path.join(dir, 'nope.xml'), run1] }).findings;
+  assert.equal(bySymbol(withMissing, 'a.py', '_dead_a').grade, 'REVIEW');
+  assert.equal(bySymbol(withMissing, 'b.py', '_dead_b').grade, 'SAFE');
+  // Only missing inputs, or an empty list, mean no coverage at all.
+  const none = scan(dir, { coveragePath: [path.join(dir, 'nope.xml')] }).findings;
+  assert.equal(bySymbol(none, 'a.py', '_dead_a').grade, 'SAFE');
+  assert.equal(bySymbol(none, 'b.py', '_dead_b').grade, 'SAFE');
+  const empty = scan(dir, { coveragePath: [] }).findings;
+  assert.equal(bySymbol(empty, 'a.py', '_dead_a').grade, 'SAFE');
+  assert.equal(parseCoverage(dir, []), null);
+  assert.equal(parseCoverage(dir, ['missing.xml']), null);
+});
+
+test('coverage: a directory with one report behaves like that report; an empty directory is no coverage', () => {
+  const dir = appDir();
+  write(dir, 'cov/coverage.xml', coberturaXml({ deadBodyHits: true }));
+  const single = parseCoverage(dir, 'cov/coverage.xml');
+  const viaDir = parseCoverage(dir, 'cov');
+  const key = path.join(dir, 'app.py');
+  assert.deepEqual([...viaDir.get(key).coveredLines].sort((a, b) => a - b),
+    [...single.get(key).coveredLines].sort((a, b) => a - b));
+  assert.equal(viaDir.get(key).pct, single.get(key).pct);
+  assert.equal(viaDir.get(key).source, 'cobertura', 'a lone report keeps its own source, not merged');
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-cov-emptydir-'));
+  fs.mkdirSync(path.join(emptyDir, 'cov'));
+  assert.equal(parseCoverage(emptyDir, 'cov'), null);
+  assert.equal(parseCoverage(dir, 'missing-dir'), null);
+});
+
+test('coverage: a bad or empty report inside a merged directory is skipped', () => {
+  const dir = appDir();
+  write(dir, 'cov/coverage.xml', coberturaXml({ deadBodyHits: true }));
+  write(dir, 'cov/coverage-bad.xml', '<coverage><this is not valid');
+  write(dir, 'cov/lcov-empty.info', '');
+  write(dir, 'cov/notes.txt', 'not a report');
+  const cov = parseCoverage(dir, 'cov');
+  const app = cov.get(path.join(dir, 'app.py'));
+  assert.equal(app.source, 'cobertura');
+  assert.equal(app.pct, 80);
+  assert.deepEqual([...app.coveredLines].sort((a, b) => a - b), [1, 2, 5, 6]);
+  assert.equal(bySymbol(scan(dir, { coveragePath: 'cov' }).findings, 'app.py', '_dead').grade, 'REVIEW');
+});
 
 // --- parsers ---
 
@@ -229,4 +388,16 @@ test('coverage: --coverage / --no-coverage flags work end to end', () => {
   };
   assert.equal(bySymbol(run(['--coverage', covPath]), 'app.py', '_dead').grade, 'REVIEW');
   assert.equal(bySymbol(run(['--coverage', covPath, '--no-coverage']), 'app.py', '_dead').grade, 'SAFE');
+});
+
+test('coverage: --coverage <directory> merges its runs end to end', () => {
+  const dir = twoFileApp();
+  write(dir, 'cov/coverage-unit.xml', coberturaTwoFile({ aBodyHit: true, bBodyHit: false }));
+  write(dir, 'cov/lcov-e2e.info', lcovTwoFile({ aBodyHit: false, bBodyHit: true }));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-cov-cli-dir-'));
+  const r = spawnSync(process.execPath, [CLI_BIN, dir, '--json', path.join(out, 'r.json'), '--no-color', '--coverage', path.join(dir, 'cov')], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const findings = JSON.parse(fs.readFileSync(path.join(out, 'r.json'), 'utf8')).findings;
+  assert.equal(bySymbol(findings, 'a.py', '_dead_a').grade, 'REVIEW');
+  assert.equal(bySymbol(findings, 'b.py', '_dead_b').grade, 'REVIEW');
 });

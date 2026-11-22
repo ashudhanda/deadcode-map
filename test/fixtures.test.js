@@ -719,3 +719,81 @@ test('js-deps: README-only deps are flagged, real imports are not', () => {
   // Nothing in this fixture is SAFE.
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });
+
+test('js-method-conduits: a helper called only by a dead class method is dead; via a live class method it is live', () => {
+  const f = findingsFor('js-method-conduits');
+  // Live class: instantiated and its method called in the entry point,
+  // so the method is a conduit and liveHelper stays alive through it.
+  assert.equal(bySymbol(f, 'src/live.js', 'Live'), undefined);
+  assert.equal(bySymbol(f, 'src/live.js', 'doLiveWork'), undefined);
+  assert.equal(bySymbol(f, 'src/live.js', 'liveHelper'), undefined);
+  // Dead class: never constructed, imported, or referenced. Its method
+  // is still REVIEW (methods are never SAFE), but it is no longer a
+  // conduit, so the helper only it calls is SAFE — before the fix the
+  // conduit hid deadHelper entirely (no finding at all).
+  assert.equal(bySymbol(f, 'src/dead.js', 'Dead').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/dead.js', 'doDeadWork').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/dead.js', 'deadHelper').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/dead.js', 'usedFn'), undefined);
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['class:src/dead.js:Dead', 'function:src/dead.js:deadHelper']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('py-method-conduits: a helper called only by a dead class method is dead; via a live class method it is live', () => {
+  const f = findingsFor('py-method-conduits');
+  assert.equal(bySymbol(f, 'live_mod.py', 'Live'), undefined);
+  assert.equal(bySymbol(f, 'live_mod.py', 'do_live_work'), undefined);
+  assert.equal(bySymbol(f, 'live_mod.py', '_live_helper'), undefined);
+  // _Dead is module-private and never constructed: its method is
+  // REVIEW, but no longer a conduit, so _dead_helper is SAFE.
+  assert.equal(bySymbol(f, 'dead_mod.py', '_Dead').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'dead_mod.py', 'do_dead_work').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'dead_mod.py', '_dead_helper').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'dead_mod.py', 'used_fn'), undefined);
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['class:dead_mod.py:_Dead', 'function:dead_mod.py:_dead_helper']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('js-reexport-comments: trailing / inline / multi-line comments on re-export lines do not break re-export detection', () => {
+  const f = findingsFor('js-reexport-comments');
+  // Every helper reaches the entry point only through the barrel's
+  // re-exports — if a comment broke the re-export edge, each helper
+  // would come back REVIEW ("exported but never imported").
+  for (const symbol of ['helperA', 'helperB', 'helperC', 'helperD']) {
+    assert.equal(bySymbol(f, 'src/lib.ts', symbol), undefined, `${symbol} is live through a commented re-export`);
+  }
+  assert.equal(byCategory(f, 'src/lib.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/reexport.ts', 'file'), undefined);
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('js-manual-scripts: files under scripts/ and tools/ are hand-run entries, symbols included', () => {
+  const f = findingsFor('js-manual-scripts');
+  // Neither script file is a dead file, and neither script's functions
+  // are flagged: the operator invokes them by hand (argv dispatch, or
+  // by editing the script), not through the import graph.
+  assert.equal(byCategory(f, 'scripts/deploy.js', 'file'), undefined, 'scripts/deploy.js is an entry point, never a dead file');
+  assert.equal(bySymbol(f, 'scripts/deploy.js', 'deploy'), undefined);
+  assert.equal(bySymbol(f, 'scripts/deploy.js', 'rollback'), undefined);
+  assert.equal(bySymbol(f, 'scripts/deploy.js', 'migrate').grade, 'KEEP', 'migrate() is unreferenced but hand-run — KEEP, never SAFE');
+  assert.equal(byCategory(f, 'tools/audit.py', 'file'), undefined, 'tools/audit.py is an entry point, never a dead file');
+  assert.equal(bySymbol(f, 'tools/audit.py', 'audit').grade, 'KEEP', 'audit() is unreferenced but hand-run — KEEP, never SAFE');
+  // The heuristic is scoped: a genuinely dead function in ordinary
+  // source is still SAFE.
+  assert.equal(bySymbol(f, 'src/lib.js', 'deadFn').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/lib.js', 'usedFn'), undefined);
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['function:src/lib.js:deadFn']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});

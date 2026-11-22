@@ -151,6 +151,7 @@ const ENTRY_BASENAMES = new Set([
 const ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//, // framework route directories
   /(^|\/)examples\//, // example scripts are standalone entry points, run directly
+  /(^|\/)(scripts|tools)\//, // manually-run tools: invoked by hand, never imported (see isManualScriptPath)
   /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
@@ -159,6 +160,23 @@ const ENTRY_PATTERNS = [
   /webpack\.config\./, /vite\.config\./, /rollup\.config\./,
   /tailwind\.config\./, /jest\.config\./, /babel\.config\./,
 ];
+
+// Heuristic: a code file under a scripts/ or tools/ directory at any
+// depth is a manually-run tool — a seed, deploy, migration-helper, or
+// one-off script an operator invokes directly (`node scripts/seed.js`,
+// `python tools/audit.py`), not something the import graph reaches.
+// It is an entry point (never a dead file), and its symbols are kept
+// too (see confidence.js): the operator invokes its functions by name,
+// by editing the script, or through argv dispatch the static graph
+// cannot see, so an unreferenced function there cannot be proven dead.
+// This is deliberately fail-open — a genuinely dead helper inside
+// scripts/ stays hidden rather than risk flagging a tool the operator
+// runs by hand. It only ever demotes findings, never creates a SAFE.
+// Files the graph DOES reach (imported helpers under scripts/) are
+// unaffected: their symbols were already live through their importers.
+function isManualScriptPath(rel) {
+  return /(^|\/)(scripts|tools)\//.test(rel);
+}
 
 function looksLikeEntry(rel, abs, pkgEntries) {
   if (pkgEntries.has(abs)) return { entry: true, reason: 'package.json entry point' };
@@ -311,4 +329,4 @@ function discover(root, opts) {
   return { root: absRoot, allFiles, codeFiles, textFiles, pkg, pkgEntries, isLibrary, entries, fileKind };
 }
 
-module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS };
+module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS, isManualScriptPath };

@@ -117,6 +117,11 @@ function main() {
 
   const opts = parseArgs(process.argv);
   const root = path.resolve(opts.path);
+  // With --json - stdout is pure JSON: every informational message
+  // after the report (map written, --fix / --prove results) goes to
+  // stderr instead, or a consumer doing JSON.parse(stdout) breaks on
+  // the trailing "Map written to ..." line.
+  const info = opts.json === '-' ? console.error : console.log;
   if (!fs.existsSync(root)) {
     console.error(`deadcode-map: no such directory: ${root}`);
     process.exit(2);
@@ -172,24 +177,24 @@ function main() {
 
   if (opts.map) {
     writeMap(root, graph, visible, path.resolve(opts.map));
-    console.log(`Map written to ${opts.map} (open it by double-clicking)`);
+    info(`Map written to ${opts.map} (open it by double-clicking)`);
   }
 
   if (opts.fix) {
     const fixFindings = opts.includeReview ? visible : visible.filter((f) => f.grade === 'SAFE');
     const result = applyFix(root, graph, fixFindings);
-    console.log(`--fix: removed ${result.safeCount} SAFE finding(s); ${result.deletedFiles.length} file(s) deleted.`);
-    for (const c of result.changed) console.log(`  ${c.file}: removed ${c.removed} item(s)${c.error ? ` (error: ${c.error})` : ''}`);
-    console.log('Review the diff with git before committing.');
+    info(`--fix: removed ${result.safeCount} SAFE finding(s); ${result.deletedFiles.length} file(s) deleted.`);
+    for (const c of result.changed) info(`  ${c.file}: removed ${c.removed} item(s)${c.error ? ` (error: ${c.error})` : ''}`);
+    info('Review the diff with git before committing.');
   }
 
   if (opts.prove) {
     const testCmd = opts.testCommand || defaultTestCommand(root, scan(root, { includeFixtures: opts.includeFixtures }).discovery.pkg);
-    console.log(`--prove: running "${testCmd || '(no test command)'}" in a scratch git worktree…`);
+    info(`--prove: running "${testCmd || '(no test command)'}" in a scratch git worktree…`);
     const result = prove(root, graph, opts.includeReview ? visible : visible.filter((f) => f.grade === 'SAFE'), { testCommand: testCmd });
-    console.log(`--prove: ${result.status} — ${result.proven || 0} proven, ${result.breaks || 0} break${result.breaks === 1 ? 's' : ''}.`);
-    for (const r of result.results || []) console.log(`  ${r.status.padEnd(7)} ${r.cluster} — ${r.reason}`);
-    if (result.reason) console.log(`  ${result.reason}`);
+    info(`--prove: ${result.status} — ${result.proven || 0} proven, ${result.breaks || 0} break${result.breaks === 1 ? 's' : ''}.`);
+    for (const r of result.results || []) info(`  ${r.status.padEnd(7)} ${r.cluster} — ${r.reason}`);
+    if (result.reason) info(`  ${result.reason}`);
   }
 
   if (opts.cacheStats) {

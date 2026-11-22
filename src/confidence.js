@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const { mentionRegExp } = require('./graph');
 const { coverageForSymbol, coverageForSymbolBody } = require('./coverage');
+const { isManualScriptPath } = require('./discover');
 
 function loadFrameworks(dir) {
   const packs = [];
@@ -132,6 +133,7 @@ function gradeFindings(ctx) {
     const entryReason = discovery.entries.get(file) || '';
     const isTest = TEST_FILE.test(rel) || TEST_DIR.test(rel);
     const isConfig = CONFIG_FILE.test(rel);
+    const isManualScript = isManualScriptPath(rel);
     const fwReasons = frameworkKeepFile(rel, packs);
     // Library vs app, per file: a published library's exports are public
     // API (REVIEW at most); an app repo's exported-but-uncalled symbols
@@ -141,9 +143,12 @@ function gradeFindings(ctx) {
     // file. But symbols inside an entry file are graded normally — a dead
     // helper inside main.py is still dead. Only test / config / framework
     // files keep their symbols, because those symbols are resolved by the
-    // framework or test runner, not by imports.
+    // framework or test runner, not by imports. Manually-run scripts
+    // (scripts/ or tools/) keep their symbols too: their functions are
+    // invoked by the operator, not by the import graph — see
+    // isManualScriptPath in discover.js.
     const keepFile = isEntry || isTest || isConfig || fwReasons.length > 0;
-    const keepSymbols = isTest || isConfig || fwReasons.length > 0;
+    const keepSymbols = isTest || isConfig || isManualScript || fwReasons.length > 0;
     // In a later cascade pass, a file already graded SAFE-dead keeps its
     // iteration-1 findings; re-grading its symbols would only add noise
     // inside an already-dead file.
@@ -281,26 +286,6 @@ function gradeFindings(ctx) {
         if (!defUses.has(d.name)) defUses.set(d.name, new Set());
         for (const u of d.uses || []) defUses.get(d.name).add(u);
       }
-      // A method is a conduit too: the tool deliberately never proves
-      // a method dead (methods are REVIEW at most — objects, tests and
-      // frameworks call them through dispatch the static graph cannot
-      // see), so a method's callees must not be provable dead through
-      // it either. Without this, every helper called only from methods
-      // of a live class looked dead: Click's _normalize_opt (called
-      // from Parser methods), FastAPI's _dependency_semaphores (read in
-      // a method), Flask's _got_registered_once, axios's normalizeDate
-      // (called from a VitePress transform method) all went SAFE.
-      // The cost is false negatives: a helper used only by methods of
-      // a dead class stays hidden. That is the safe direction, and a
-      // future step can narrow it by tracking the enclosing class
-      // (a method is a conduit only when its class is live).
-      const keepDef = (d) => keepSymbols
-        || d.kind === 'method'
-        || frameworkKeepSymbol(rel, d.name, d.decorators, packs).length > 0
-        || d.frameworkField || d.ambient || overloadedNames.has(d.name)
-        || (parsed.dunder && parsed.dunder.has(d.name))
-        || (d.kind === 'method' && d.name.startsWith('__'))
-        || (d.exported && (kind === 'library' || kind === 'unknown' || (reExportedFiles && reExportedFiles.has(file))));
       // Live roots: top-level code (runs on import) and live
       // cross-file uses. A kept definition is a CONDUIT, not a live
       // root: it still gets its own KEEP / REVIEW finding, but the
@@ -317,8 +302,57 @@ function gradeFindings(ctx) {
         const liveCallers = [...u.calledIn].filter((f) => f !== file && !deadFiles.has(f));
         if (liveImporters.length > 0 || liveCallers.length > 0) liveRoots.add(name);
       }
-      const keepNames = new Set();
-      for (const d of parsed.definitions) if (keepDef(d)) keepNames.add(d.name);
+      // A method is a conduit too: the tool deliberately never proves
+      // a method dead (methods are REVIEW at most — objects, tests and
+      // frameworks call them through dispatch the static graph cannot
+      // see), so a method's callees must not be provable dead through
+      // it either. Without this, every helper called only from methods
+      // of a live class looked dead: Click's _normalize_opt (called
+      // from Parser methods), FastAPI's _dependency_semaphores (read in
+      // a method), Flask's _got_registered_once, axios's normalizeDate
+      // (called from a VitePress transform method) all went SAFE.
+      // Narrowed (batch 4): a method is a conduit only when its
+      // enclosing class is live. A method of a dead class — a class
+      // nothing ever constructs, imports, or references — never runs,
+      // so the helper it alone calls is dead too, and a dead method
+      // forwarding to another method no longer rescues that target
+      // either. The enclosing class is found by range containment (a
+      // method's range sits inside its class's range), so this works
+      // for JS and Python alike with no parser change. When no
+      // enclosing class can be found (an object-literal method, a
+      // class expression the parser did not record), the method stays
+      // a conduit: fail-open, never a new SAFE. Class liveness comes
+      // from the live roots and the kept (non-method) definitions, so
+      // the computation is not circular: a class is live when live
+      // code references it, when it is itself kept (framework /
+      // exported public API), or when a kept definition reaches it (a
+      // framework handler that instantiates it really runs). The
+      // cost of the old rule was false negatives — helpers used only
+      // by methods of a dead class stayed hidden. That is now fixed
+      // for the known-class case; the unknown-class case keeps the
+      // safe direction.
+      const classDefs = parsed.definitions.filter((d) => d.kind === 'class');
+      const enclosingClassName = (def) => {
+        let best = null;
+        for (const c of classDefs) {
+          if (c.range.startIndex <= def.range.startIndex && def.range.endIndex <= c.range.endIndex) {
+            if (!best || (c.range.endIndex - c.range.startIndex) < (best.range.endIndex - best.range.startIndex)) best = c;
+          }
+        }
+        return best ? best.name : null;
+      };
+      // Kept for a reason other than "is a method": framework dispatch,
+      // a model field, declaration merging, an overload group, a dunder,
+      // or exported public API. Methods are added by keepDef below,
+      // once their enclosing class is known to be live.
+      const baseKeepDef = (d) => keepSymbols
+        || frameworkKeepSymbol(rel, d.name, d.decorators, packs).length > 0
+        || d.frameworkField || d.ambient || overloadedNames.has(d.name)
+        || (parsed.dunder && parsed.dunder.has(d.name))
+        || (d.kind === 'method' && d.name.startsWith('__'))
+        || (d.exported && (kind === 'library' || kind === 'unknown' || (reExportedFiles && reExportedFiles.has(file))));
+      const baseKeepNames = new Set();
+      for (const d of parsed.definitions) if (baseKeepDef(d)) baseKeepNames.add(d.name);
       const bfs = (seeds) => {
         const seen = new Set();
         const queue = [...seeds];
@@ -331,6 +365,15 @@ function gradeFindings(ctx) {
         return seen;
       };
       const live = bfs(liveRoots);
+      const viaBaseKept = bfs(baseKeepNames);
+      const liveClassNames = new Set();
+      for (const d of classDefs) {
+        if (live.has(d.name) || baseKeepNames.has(d.name) || viaBaseKept.has(d.name)) liveClassNames.add(d.name);
+      }
+      const keepDef = (d) => baseKeepDef(d)
+        || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d))));
+      const keepNames = new Set();
+      for (const d of parsed.definitions) if (keepDef(d)) keepNames.add(d.name);
       const viaKept = bfs(keepNames);
       sameFileLive = new Set([...live, ...viaKept]);
       for (const name of keepNames) if (!live.has(name)) sameFileLive.delete(name);
@@ -451,7 +494,7 @@ function gradeFindings(ctx) {
         continue;
       }
       if (keepSymbols) {
-        add({ ...common, grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : fwReasons[0] || 'framework / entry file' });
+        add({ ...common, grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : fwReasons[0] || 'framework / entry file' });
         continue;
       }
       // Class-attribute rules (FP-6). These sit AFTER the dunder and

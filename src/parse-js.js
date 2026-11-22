@@ -103,6 +103,51 @@ function parseJsTs(filePath, src, ext) {
   const tree = parseSource(parser, src);
   const root = tree.rootNode;
 
+  // --- JSX-pragma decision (kept identical in src/parse-js.js and
+  // docs/analyzer.js — the CLI tree-sitter parser and the web regex
+  // parser must agree, or the web checker and the CLI disagree about
+  // the same file).
+  //
+  // Rule: in a file that contains JSX, an imported name that is a
+  // known JSX-pragma binding counts as used, even though its name
+  // never appears in the source text. In a file with no JSX, the same
+  // import is flaggable as usual.
+  //
+  // Why: the classic JSX transform calls the pragma factory for every
+  // element — React.createElement, preact's h / createElement, the
+  // fragment factory Fragment — and the automatic runtime calls
+  // jsx / jsxs / jsxDEV. The factory is chosen at build level
+  // (tsconfig "jsx" / "jsxFactory" / "jsxFragmentFactory", a babel
+  // preset, or a per-file @jsx comment), which a per-file parser
+  // cannot see: nothing in one file says whether its JSX compiles to
+  // h() calls (pragma import required in scope) or to jsx-runtime
+  // calls (no pragma import needed). Treating a pragma binding as
+  // transform-used whenever the file has JSX is the only
+  // false-positive-safe rule — deleting a pragma import the classic
+  // transform needs breaks the build, while keeping a genuinely dead
+  // one in an automatic-runtime project only misses a finding, never
+  // a wrong delete. That matches this project's rule that SAFE false
+  // positives must stay at 0%.
+  //
+  // What counts as a pragma name: React (React.createElement),
+  // createElement (preact / jsxFactory), h (preact classic pragma),
+  // Fragment (jsxFragmentFactory, <>...</> fragments), jsx, jsxs,
+  // jsxDEV (automatic runtimes). What does NOT count: memo,
+  // Component, Suspense, lazy — a higher-order component, a base
+  // class and lazy-loading helpers are never called by the transform,
+  // so an unused memo import is still flaggable in a JSX file.
+  //
+  // Only imported bindings get the credit: the name is added to the
+  // file's references only when it is actually an import local. A
+  // top-level local definition cannot share the name (an import
+  // binding and a top-level definition of the same name is a
+  // redeclaration), but a nested local of the same name shares the
+  // file-level reference set and would look used — a missed finding,
+  // never a false SAFE.
+  const JSX_PRAGMA_NAMES = new Set([
+    'React', 'createElement', 'h', 'Fragment', 'jsx', 'jsxs', 'jsxDEV',
+  ]);
+
   const result = {
     language: 'js',
     imports: [],
@@ -610,6 +655,22 @@ function parseJsTs(filePath, src, ext) {
   }
   for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
   result.topLevelUses = [...topLevelUses].sort();
+
+  // JSX-pragma imports count as uses when the file contains JSX (see
+  // the decision block above): the transform calls the pragma factory
+  // for every element, so the import is used even though its name
+  // never appears in the source text. Applied here, after the
+  // reference passes, so it only affects the file-level reference set
+  // the dead-import check reads — never the per-definition scopes.
+  if (result.hasJsx) {
+    const importLocals = new Set();
+    for (const imp of result.imports) {
+      for (const n of imp.names || []) importLocals.add(n.local);
+    }
+    for (const name of JSX_PRAGMA_NAMES) {
+      if (importLocals.has(name)) result.references.add(name);
+    }
+  }
 
   return result;
 }

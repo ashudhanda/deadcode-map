@@ -209,3 +209,50 @@ test('CLI: a user file sharing the --json output name is still scanned', () => {
   assert.equal(bySymbol(f2, 'deadTwo')?.grade, 'REVIEW');
   assert.equal(f2.length, f1.length, 'finding counts must be identical across runs');
 });
+
+test('CLI: --json - with --map writes pure JSON to stdout', () => {
+  const dir = copyFixture('js-basic');
+  const mapPath = path.join(dir, 'deadcode-map.html');
+  // Before the fix the "Map written to ..." line landed on stdout
+  // after the JSON document, so JSON.parse(stdout) threw.
+  const r = run(dir, ['--json', '-', '--map', mapPath, '--no-cache']);
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.equal(report.tool, 'deadcode-map');
+  assert.ok(report.findings.some((f) => f.grade === 'SAFE'));
+  assert.ok(!r.stdout.includes('Map written to'), 'the map confirmation must not leak into --json - output');
+  assert.ok(r.stderr.includes('Map written to'), 'the map confirmation goes to stderr instead');
+  assert.ok(fs.existsSync(mapPath), 'the map file must still be written');
+  // Argument order must not matter.
+  const r2 = run(dir, ['--map', mapPath, '--json', '-', '--no-cache']);
+  assert.equal(r2.status, 0, r2.stderr);
+  JSON.parse(r2.stdout);
+  assert.ok(!r2.stdout.includes('Map written to'));
+});
+
+test('CLI: --update-baseline does not change the next scan (baseline file is not scanned)', () => {
+  const dir = copyFixture('js-basic');
+  const base = run(dir, ['--json', '-', '--no-cache']);
+  assert.equal(base.status, 0, base.stderr);
+  const baseFindings = JSON.parse(base.stdout).findings
+    .map((f) => `${f.category}:${f.file}:${f.symbol || ''}:${f.grade}`).sort();
+  assert.ok(baseFindings.length > 0, 'fixture must have findings');
+  const up = run(dir, ['--update-baseline', '--no-cache']);
+  assert.equal(up.status, 0, up.stderr);
+  assert.ok(fs.existsSync(path.join(dir, '.deadcode-map.json')), 'baseline must be written');
+  // Before the fix the baseline file itself counted as a string
+  // reference: a SAFE dead file came back REVIEW on the next run, with
+  // the baseline as its only "mention".
+  const r2 = run(dir, ['--json', '-', '--no-cache']);
+  assert.equal(r2.status, 0, r2.stderr);
+  const nextFindings = JSON.parse(r2.stdout).findings
+    .map((f) => `${f.category}:${f.file}:${f.symbol || ''}:${f.grade}`).sort();
+  assert.deepEqual(nextFindings, baseFindings, 'findings must be identical with the baseline file on disk');
+  // --baseline still hides them (the file is read as a baseline, just
+  // never scanned as a source of string references).
+  const r3 = run(dir, ['--baseline', '--json', '-', '--no-cache']);
+  assert.equal(r3.status, 0, r3.stderr);
+  const hidden = JSON.parse(r3.stdout);
+  assert.equal(hidden.findings.length, 0, 'baseline findings must be hidden with --baseline');
+  assert.equal(hidden.meta.baselineHidden, baseFindings.length);
+});

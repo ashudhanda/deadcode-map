@@ -1111,3 +1111,232 @@ test('web module-exports multiline: a nested value is still a live use', () => {
   assert.equal(bySymbol(f, 'src/nested.js', 'B'), undefined);
   assert.equal(bySymbol(f, 'src/nested.js', 'A').grade, 'REVIEW');
 });
+
+// --- Batch 4: multi-line imports + JSX-pragma rule ---
+// (Pre-act demo/suspense.jsx and demo/people/router.tsx: every name on
+// a multi-line import's continuation lines leaked into the references
+// pass and looked used, so no unused import split across lines was
+// ever flagged; and the JSX pragma imports createElement / Fragment /
+// h were flagged SAFE by the CLI even though the JSX transform calls
+// them. Both are fixed: continuation lines are bindings, not uses,
+// and pragma bindings count as used in a JSX file.)
+
+const { parseJs } = require('../docs/analyzer');
+
+test('web multi-line import: continuation-line names are bindings, not uses', () => {
+  const p = parseJs('src/a.js', [
+    'import {',
+    '  usedFn,',
+    '  deadFn',
+    "} from './lib.js';",
+    'usedFn();',
+    '',
+  ].join('\n'));
+  assert.deepEqual(p.imports[0].names.map((n) => n.local), ['usedFn', 'deadFn']);
+  assert.equal(p.references.has('usedFn'), true);
+  assert.equal(p.references.has('deadFn'), false);
+});
+
+test('web multi-line import: an unused name on a continuation line is SAFE', () => {
+  const files = [
+    { path: 'src/index.js', content: "import { run } from './a.js';\nrun();\n" },
+    { path: 'src/a.js', content: [
+      'import {',
+      '  usedFn,',
+      '  deadFn',
+      "} from './lib.js';",
+      'export function run() { usedFn(); }',
+      '',
+    ].join('\n') },
+    { path: 'src/lib.js', content: 'export function usedFn() { return 1; }\nexport function deadFn() { return 2; }\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/a.js', 'deadFn').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/a.js', 'usedFn'), undefined);
+});
+
+test('web multi-line import: a 13-name import spanning 15 lines still parses', () => {
+  const names = [];
+  for (let i = 0; i < 12; i++) names.push('n' + i);
+  const lines = ['import {'];
+  names.forEach((n) => lines.push('  ' + n + ','));
+  lines.push('  deadLast');
+  lines.push("} from './lib.js';");
+  lines.push('export function run() { ' + names.map((n) => n + '()').join(' ') + ' }');
+  const p = parseJs('src/a.js', lines.join('\n'));
+  // The old 10-line accumulation bound cut this statement off before
+  // its `from` clause, so the import edge vanished entirely.
+  assert.equal(p.imports.length, 1);
+  assert.equal(p.imports[0].names.length, 13);
+  assert.equal(p.references.has('deadLast'), false);
+  names.forEach((n) => assert.equal(p.references.has(n), true, n + ' must be referenced'));
+});
+
+test('web multi-line require: destructured names are flaggable', () => {
+  const files = [
+    { path: 'src/index.js', content: "require('./a.js');\n" },
+    { path: 'src/a.js', content: [
+      'const {',
+      '  usedHelper,',
+      '  deadHelper',
+      "} = require('./util.js');",
+      'usedHelper();',
+      '',
+    ].join('\n') },
+    { path: 'src/util.js', content: 'exports.usedHelper = () => 1;\nexports.deadHelper = () => 2;\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/a.js', 'deadHelper').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/a.js', 'usedHelper'), undefined);
+});
+
+test('web multi-line require: a member call after the require still counts as a use', () => {
+  const p = parseJs('src/a.js', [
+    'const {',
+    '  a',
+    "} = require('./util.js').helper();",
+    'a();',
+    '',
+  ].join('\n'));
+  assert.equal(p.imports.length, 1);
+  assert.equal(p.imports[0].source, './util.js');
+  assert.deepEqual(p.imports[0].names.map((n) => n.local), ['a']);
+  // `helper` is a real use (the member call), not a binding: only `a`
+  // is bound on these lines, so it must still be recorded.
+  assert.equal(p.references.has('helper'), true);
+  assert.equal(p.calls.has('helper'), true);
+  assert.equal(p.references.has('a'), true);
+});
+
+test('web multi-line require: a require split before its argument still parses', () => {
+  const p = parseJs('src/a.js', [
+    'const x =',
+    "  require('./util.js');",
+    'x();',
+    '',
+  ].join('\n'));
+  assert.equal(p.imports.length, 1);
+  assert.equal(p.imports[0].source, './util.js');
+  assert.deepEqual(p.imports[0].names.map((n) => n.local), ['x']);
+});
+
+test('web multi-line re-export: the edge is recorded and the names do not leak', () => {
+  const p = parseJs('src/re.js', [
+    'export {',
+    '  A,',
+    '  B',
+    "} from './x.js';",
+    'function A() { return 1; }',
+    '',
+  ].join('\n'));
+  assert.equal(p.imports.length, 1);
+  assert.equal(p.imports[0].reExport, true);
+  assert.equal(p.imports[0].source, './x.js');
+  // The re-exported names ride on the edge (matches the CLI): the
+  // graph marks the target's symbols as imported through them.
+  assert.deepEqual(p.imports[0].names.map((n) => n.imported), ['A', 'B']);
+  // A and B name the source module's exports, not locals: the
+  // continuation lines must not make the local A look used.
+  assert.equal(p.references.has('A'), false);
+  assert.equal(p.references.has('B'), false);
+});
+
+test('web JSX pragma: createElement and Fragment count as used in a JSX file, memo does not', () => {
+  const files = [
+    { path: 'src/index.jsx', content: "import { run } from './app.jsx';\nrun();\n" },
+    { path: 'src/app.jsx', content: [
+      'import {',
+      '  createElement,',
+      '  memo,',
+      '  Fragment',
+      "} from 'react';",
+      'export function run() { return <><div>hi</div></>; }',
+      '',
+    ].join('\n') },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/app.jsx', 'createElement'), undefined);
+  assert.equal(bySymbol(f, 'src/app.jsx', 'Fragment'), undefined);
+  // memo is a higher-order component, never called by the transform.
+  assert.equal(bySymbol(f, 'src/app.jsx', 'memo').grade, 'SAFE');
+});
+
+test('web JSX pragma: h and React count as used with JSX, flaggable without it', () => {
+  const withJsx = [
+    { path: 'src/index.jsx', content: "import { run } from './app.jsx';\nrun();\n" },
+    { path: 'src/app.jsx', content: "import { h } from 'preact';\nimport React from 'react';\nexport function run() { return <div>hi</div>; }\n" },
+  ];
+  const f1 = analyzeFiles(withJsx).findings;
+  assert.equal(bySymbol(f1, 'src/app.jsx', 'h'), undefined);
+  assert.equal(bySymbol(f1, 'src/app.jsx', 'React'), undefined);
+  const noJsx = [
+    { path: 'src/index.js', content: "import { run } from './app.js';\nrun();\n" },
+    { path: 'src/app.js', content: "import { h } from 'preact';\nimport React from 'react';\nexport function run() { return 1; }\n" },
+  ];
+  const f2 = analyzeFiles(noJsx).findings;
+  assert.equal(bySymbol(f2, 'src/app.js', 'h').grade, 'SAFE');
+  assert.equal(bySymbol(f2, 'src/app.js', 'React').grade, 'SAFE');
+});
+
+test('web JSX pragma: automatic-runtime jsx counts as used in a JSX file', () => {
+  const files = [
+    { path: 'src/index.jsx', content: "import { run } from './app.jsx';\nrun();\n" },
+    { path: 'src/app.jsx', content: "import { jsx } from 'react/jsx-runtime';\nexport function run() { return <div>hi</div>; }\n" },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/app.jsx', 'jsx'), undefined);
+});
+
+test('web JSX detection: a spread-only element counts as JSX', () => {
+  const p = parseJs('src/a.jsx', "import { h } from 'preact';\nexport function run(props) { return <div {...props}>hi</div>; }\n");
+  assert.equal(p.hasJsx, true);
+  assert.equal(p.references.has('h'), true);
+});
+
+test('web JSX detection: generics and comparisons are not JSX', () => {
+  const p = parseJs('src/a.ts', [
+    "import { h } from 'preact';",
+    'function id<T>(x: T): T { return x; }',
+    "const y = id<string>('s');",
+    'const ok = 1 < 2;',
+    'export function run() { return y; }',
+    '',
+  ].join('\n'));
+  assert.equal(p.hasJsx, false);
+  // No JSX, so the pragma import stays flaggable.
+  assert.equal(p.references.has('h'), false);
+});
+
+test('web multi-line import: an ASI side-effect import swallows no following lines', () => {
+  // Regression: `import './x'` with no trailing `;` used to accumulate
+  // the following lines (up to the guard) and record them as import
+  // lines, so every symbol in the next function looked dead (zustand
+  // Scene.jsx: Experience, Canvas, scaleN and group all went SAFE).
+  const p = parseJs('src/a.jsx', [
+    "import './setup';",
+    "import './other'",
+    'function Experience() {',
+    '  const scaleN = 1;',
+    '  return <div>{scaleN}</div>;',
+    '}',
+    'export function run() { return Experience(); }',
+    '',
+  ].join('\n'));
+  assert.equal(p.imports.length, 2);
+  assert.equal(p.references.has('scaleN'), true);
+  assert.equal(p.references.has('Experience'), true);
+});
+
+test('web multi-line import: a comment inside the specifier list is not a name', () => {
+  const p = parseJs('src/a.js', [
+    'import {',
+    '  // the main helper',
+    '  usedFn,',
+    '  deadFn',
+    "} from './lib.js';",
+    'usedFn();',
+    '',
+  ].join('\n'));
+  assert.deepEqual(p.imports[0].names.map((n) => n.local), ['usedFn', 'deadFn']);
+  assert.equal(p.references.has('deadFn'), false);
+});
