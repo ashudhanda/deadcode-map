@@ -117,6 +117,72 @@ function annotationSimpleName(node, src) {
   return raw.split('.').pop();
 }
 
+// Simple name of a type named in a {@code} tag: the last segment of
+// a dotted name, with any #member part stripped. `#method()` (a member
+// of the current class) names no type and is ignored, as are targets
+// that are not plain identifiers after stripping (quoted strings,
+// `<a href=...>` links). Generics and call parens are stripped, so
+// `{@code List<String>}` names `List`. Only a capitalized name counts:
+// {@code} holds arbitrary code (variable names, keywords, literals
+// such as `{@code context}` or `{@code null}`), and only a capitalized
+// name can be a type resolving through an import — a lowercase token
+// must never count as a use of a same-named variable.
+function javadocSimpleName(raw) {
+  if (!raw || raw.startsWith('#') || raw.startsWith('<') || raw.startsWith('"')) return null;
+  let target = raw.split('#')[0];
+  target = target.replace(/[<(\[].*$/, '');
+  target = target.replace(/^@/, '');
+  target = target.replace(/[^A-Za-z0-9_$]+$/, '');
+  if (!target) return null;
+  const simple = target.split('.').pop();
+  return /^[A-Z][A-Za-z0-9_$]*$/.test(simple) ? simple : null;
+}
+
+// Types named by a {@link} / {@linkplain} / {@value} / @see target
+// (or by an @throws / @exception tag): the type before any #member —
+// every uppercase-initial segment of its dotted name, so a nested
+// type such as TestInstance.Lifecycle names both types, while package
+// segments (lowercase by convention) are ignored — and every type in
+// the member's parameter list, so
+// {@link JsonReader#setStrictness(Strictness)} names Strictness and
+// @see TestReporter#publishFile(Path, MediaType) names Path and
+// MediaType. A leading # (a member of the current class) names no
+// type itself, but its parameter list still can.
+function javadocTagNames(target, add) {
+  if (!target) return;
+  const hash = target.indexOf('#');
+  const before = hash === -1 ? target : target.slice(0, hash);
+  const clean = before.replace(/[<(\[].*$/, '').replace(/^@/, '').replace(/[^A-Za-z0-9_$]+$/, '');
+  if (clean) {
+    for (const part of clean.split('.')) {
+      if (/^[A-Z]/.test(part) && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(part)) add(part);
+    }
+  }
+  const paren = target.indexOf('(');
+  if (paren !== -1) {
+    const inside = target.slice(paren + 1).split(')')[0];
+    for (const m of inside.matchAll(/[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*/g)) {
+      const simple = m[0].split('.').pop();
+      if (/^[A-Z]/.test(simple)) add(simple);
+    }
+  }
+}
+
+// First token of a Javadoc tag's content, where whitespace inside
+// parentheses does not split: a method signature may contain spaces
+// after commas, as in {@link Foo#bar(String, int)}.
+function javadocTagTarget(content) {
+  const text = content.trimStart();
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(') depth++;
+    else if (c === ')') depth = Math.max(0, depth - 1);
+    else if ((c === ' ' || c === '\t' || c === '\n' || c === '\r') && depth === 0) return text.slice(0, i);
+  }
+  return text;
+}
+
 // Modifiers live in a `modifiers` child; annotations may sit inside it
 // or directly on the declaration. Both placements are collected.
 function modifiersOf(node, src) {
@@ -194,6 +260,29 @@ function parseJava(filePath, src) {
     result.topLevelUsesArity = [];
     return result;
   }
+
+  // --- pass 0b: Javadoc references (FJ-1). ---
+  // Types named in /** ... */ comments — {@link X}, {@linkplain X},
+  // {@code X}, {@value X}, @see X and @throws / @exception X — resolve
+  // through the file's imports, so an import used only there is live:
+  // removing it breaks Javadoc compilation (javadoc fails on an
+  // unresolvable {@link} target, and links @throws / @value types too).
+  // Only names inside those tags count: plain prose words in a
+  // comment are not references. A doc mention is a reference for the
+  // import check only — it is NOT an occurrence, so it never lands in
+  // a definition's uses or in topLevelUses, where it would wrongly
+  // make a same-named definition a live root.
+  const addDocRef = (name) => { if (name) result.references.add(name); };
+  walk(root, (node) => {
+    if (node.type !== 'block_comment') return;
+    const comment = text(node, src);
+    if (!comment.startsWith('/**')) return;
+    for (const m of comment.matchAll(/\{@link(?:plain)?\s+([^}]+)\}/g)) javadocTagNames(javadocTagTarget(m[1]), addDocRef);
+    for (const m of comment.matchAll(/\{@value\s+([^}]+)\}/g)) javadocTagNames(javadocTagTarget(m[1]), addDocRef);
+    for (const m of comment.matchAll(/\{@code\s+([^\s}]+)/g)) addDocRef(javadocSimpleName(m[1]));
+    for (const m of comment.matchAll(/@see\s+([^\n]+)/g)) javadocTagNames(javadocTagTarget(m[1]), addDocRef);
+    for (const m of comment.matchAll(/@(?:throws|exception)\s+([^\s}]+)/g)) javadocTagNames(m[1], addDocRef);
+  });
 
   const occurrences = []; // { name, startIndex } — general channel (reads + calls)
   const arityOccurrences = []; // { key, startIndex } — "name/arity" / "name/*"
@@ -523,13 +612,28 @@ function parseJava(filePath, src) {
 
   // --- pass 2 (actual): single recursive walk, class stack + scopes ---
   const isDefinitionSite = (node) => {
-    // Identifiers inside an import or package statement are module
-    // paths and bound names, never references — without this, every
-    // imported name leaked into `references` and no unused Java import
-    // was ever flagged.
+    // Identifiers inside an import statement are module paths and
+    // bound names, never references — without this, every imported
+    // name leaked into `references` and no unused Java import was
+    // ever flagged. A package statement's NAME is a path too — but
+    // only the name: annotations on the package declaration
+    // (package-info.java `@NullMarked`) are real uses of the imported
+    // annotation type, so they must not be swallowed with it. The
+    // child of the declaration on the path from this node tells which
+    // part it belongs to: the package name is a scoped_identifier /
+    // identifier, an annotation is a marker_annotation / annotation.
     let ancestor = node.parent;
     while (ancestor) {
-      if (ancestor.type === 'import_declaration' || ancestor.type === 'package_declaration') return true;
+      if (ancestor.type === 'import_declaration') return true;
+      if (ancestor.type === 'package_declaration') {
+        // Node wrappers are not stable across calls in this binding
+        // (see sameNode), so the walk stops on position equality,
+        // never on wrapper identity.
+        let child = node;
+        let a = node.parent;
+        while (a && !sameNode(a, ancestor)) { child = a; a = a.parent; }
+        return child.type === 'scoped_identifier' || child.type === 'identifier';
+      }
       ancestor = ancestor.parent;
     }
     const p = node.parent;

@@ -168,7 +168,7 @@ function scan(root, opts) {
   const coverage = opts && opts.noCoverage ? null : parseCoverage(root, opts && opts.coveragePath);
   const findings = gradeFindings({
     root: discovery.root, discovery, graph, git, coverage, packs,
-    isLibrary: discovery.isLibrary,
+    isLibrary: discovery.isLibrary, javaSafe: Boolean(opts && opts.javaSafe),
   });
   return {
     root: discovery.root,

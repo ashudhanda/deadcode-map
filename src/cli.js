@@ -43,6 +43,10 @@ Options:
   --prove              Delete SAFE findings in a scratch git worktree and run tests
   --test-command <cmd> Test command for --prove (default: "npm test" when present)
   --include-review     Let --fix / --prove act on REVIEW findings too (default: SAFE only)
+  --java-safe          Opt in to SAFE grades for Java (default off: Java SAFE is
+                       disabled until the Java call graph is repaired — see README;
+                       without it Java findings are REVIEW at most, so --fix
+                       never deletes Java code)
   --include-fixtures   Scan fixture/test-data directories too (fixtures/, __fixtures__/ —
                        excluded by default, at any depth)
   --top <n>            How many findings to list in the terminal (default 10)
@@ -70,7 +74,7 @@ function parseArgs(argv) {
     path: '.', json: null, map: null, failOn: null, minConfidence: null,
     baseline: false, updateBaseline: false, showBaseline: false,
     fix: false, prove: false, testCommand: null, includeReview: false,
-    includeFixtures: false, top: 10, color: true,
+    includeFixtures: false, top: 10, color: true, javaSafe: false,
     cache: false, noCache: false, cacheStats: false,
     coveragePath: null, noCoverage: false,
   };
@@ -90,6 +94,7 @@ function parseArgs(argv) {
     else if (a === '--prove') opts.prove = true;
     else if (a === '--test-command') opts.testCommand = args[++i];
     else if (a === '--include-review') opts.includeReview = true;
+    else if (a === '--java-safe') opts.javaSafe = true;
     else if (a === '--include-fixtures') opts.includeFixtures = true;
     else if (a === '--top') opts.top = parseInt(args[++i], 10) || 10;
     else if (a === '--cache') opts.cache = true;
@@ -139,7 +144,7 @@ function main() {
   const excludeFiles = [opts.json, opts.map]
     .filter((p) => p && p !== '-')
     .map((p) => path.resolve(p));
-  const { graph, findings, cache } = scan(root, { includeFixtures: opts.includeFixtures, excludeFiles, ...cacheOpts, ...coverageOpts });
+  const { graph, findings, cache } = scan(root, { includeFixtures: opts.includeFixtures, excludeFiles, javaSafe: opts.javaSafe, ...cacheOpts, ...coverageOpts });
   let visible = findings;
 
   // Baseline handling.

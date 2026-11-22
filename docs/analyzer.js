@@ -990,13 +990,26 @@ function parseJs(rel, raw) {
       }
       parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: isCompatShimJs });
       if (reqStmtStart >= 0) {
-        // Record the binding names on every line of the statement so
-        // the references pass skips them (see below). A name is
-        // recorded only when the statement parsed, so a failed
-        // accumulation records nothing (fail open).
+        // Record the binding names only on the lines the require
+        // binding itself spans, so the references pass skips them
+        // (see below). A name is recorded only when the statement
+        // parsed, so a failed accumulation records nothing (fail
+        // open). The old code marked every line of the accumulated
+        // statement: a `const f = () => {` line opens a brace, so
+        // the accumulator swallowed the whole function body, found
+        // the require nested inside it, and marked the body's lines
+        // as binding lines — the require's real uses on later lines
+        // (`nodeSass.renderSync(...)`) were skipped as "import
+        // binding, not a use" and the import looked dead (vuejs/vue
+        // stylePreprocessors.ts: nodeSass / nodeLess / nodeStylus).
+        // The binding names only ever occur inside the match text
+        // (`const { a, b } = require('./x')` spans its declaration
+        // lines exactly), so the match span is the right range.
         var reqLocals = new Set();
         names2.forEach(function (n) { reqLocals.add(n.local); });
-        for (var rbl = reqStmtStart; rbl <= il2; rbl++) requireLineBindings[rbl + 1] = reqLocals;
+        var matchStartLine = reqStmtStart + reqStmt.slice(0, reqM.index).split('\n').length - 1;
+        var matchEndLine = reqStmtStart + reqStmt.slice(0, reqM.index + reqM[0].length).split('\n').length - 1;
+        for (var rbl = matchStartLine; rbl <= matchEndLine; rbl++) requireLineBindings[rbl + 1] = reqLocals;
       }
     }
     // Inline / bare require('...') — require('./x').fn() or a bare
@@ -1213,9 +1226,22 @@ function parseJs(rel, raw) {
         (chainM[2].match(/[A-Za-z_$][\w$]*/g) || []).forEach(function (n) { decChain.add(n); });
       }
     }
+    // A declaration line names its binding once: `var Monitoring =
+    // Monitoring || (function () {...})` reads the pre-existing
+    // global of the same name on its right-hand side, and that read
+    // is a real use — the CLI's tree-sitter parse counts it (the
+    // declaration site is one node, the read is another), while the
+    // old skip dropped every occurrence of the name on the line, so
+    // the global looked unreferenced (vuejs/vue dbmon monitor.js).
+    // Skip only the first occurrence of each declared name per line;
+    // later occurrences are uses.
+    var skippedDecl = new Set();
     identifiers(l).forEach(function (id) {
       if (JS_KEYWORDS.has(id) && !keywordUseNames.has(id)) return;
-      if (declared.has(id)) return; // declaration site, not a use
+      if (declared.has(id)) {
+        if (skippedDecl.has(id)) { /* later occurrence: a real use, fall through */ }
+        else { skippedDecl.add(id); return; } // declaration site, not a use
+      }
       if (boundHere && boundHere.has(id)) return; // import binding, not a use
       if (skipExportsIds && skipExportsIds.has(id)) return; // the `module.exports` tokens themselves
       if (decChain.has(id)) return;

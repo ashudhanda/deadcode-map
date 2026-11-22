@@ -114,7 +114,7 @@ test('java: --fix output parses cleanly (static verification, runs without javac
     const parsed = parseJava(file, fs.readFileSync(file, 'utf8'));
     assert.equal(parsed.hasErrors, false, `${path.relative(dir, file)} must parse before --fix`);
   }
-  const before = scan(dir);
+  const before = scan(dir, { javaSafe: true });
   const safe = before.findings.filter((x) => x.grade === 'SAFE');
   assert.equal(safe.length, 16, `the fixture exact SAFE set must be 16 before --fix, got ${safe.length}`);
   const result = applyFix(dir, before.graph, safe);
@@ -124,7 +124,7 @@ test('java: --fix output parses cleanly (static verification, runs without javac
     assert.equal(parsed.hasErrors, false,
       `${path.relative(dir, file)} must still parse with zero ERROR/MISSING nodes after --fix`);
   }
-  const after = scan(dir);
+  const after = scan(dir, { javaSafe: true });
   assert.equal(after.findings.filter((x) => x.grade === 'SAFE').length, 0,
     're-scan after --fix must find 0 SAFE');
 });
@@ -142,7 +142,7 @@ test('java: javac compiles fixtures before and after --fix', {
   // the annotation types and UserRepo the fixtures reference without
   // defining) must compile.
   compileMainSources(compileCopyWithStubs(path.join(dir, MAIN_JAVA)), 'before --fix');
-  const before = scan(dir);
+  const before = scan(dir, { javaSafe: true });
   const safe = before.findings.filter((x) => x.grade === 'SAFE');
   assert.equal(safe.length, 16, `the fixture exact SAFE set must be 16 before --fix, got ${safe.length}`);
   const result = applyFix(dir, before.graph, safe);
@@ -150,7 +150,7 @@ test('java: javac compiles fixtures before and after --fix', {
   // After --fix: the same sources must still compile — a fix that
   // broke the build is a failed fix, whatever the re-scan says.
   compileMainSources(compileCopyWithStubs(path.join(dir, MAIN_JAVA)), 'after --fix');
-  const after = scan(dir);
+  const after = scan(dir, { javaSafe: true });
   assert.equal(after.findings.filter((x) => x.grade === 'SAFE').length, 0,
     're-scan after --fix must find 0 SAFE');
 });

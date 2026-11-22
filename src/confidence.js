@@ -82,6 +82,19 @@ function gradeFindings(ctx) {
   const { root, discovery, graph, git, coverage, packs, isLibrary } = ctx;
   const { files, importers, reachable, filesMentioning, symbolUsage, reExportedFiles } = graph;
 
+  // Java SAFE is OFF by default (batch 9): measured precision on real
+  // Java repos is 0.3% (google/gson 0/64, junit-team/junit5 1/589),
+  // because the Java call graph has no cross-file resolution and its
+  // same-file live roots are empty — so --fix would delete live code.
+  // Opt in with ctx.javaSafe (--java-safe on the CLI) only while
+  // measuring, until precision is re-measured above 90% and the
+  // default is flipped back. Every Java SAFE below goes through
+  // javaGrade, so the gate cannot be bypassed by a new call site.
+  const javaSafeEnabled = Boolean(ctx.javaSafe);
+  const javaGrade = (language, grade) => (language === 'java' && grade === 'SAFE' && !javaSafeEnabled ? 'REVIEW' : grade);
+  const JAVA_SAFE_GATE = 'Java SAFE is disabled by default (batch 9: 0.3% precision on real repos) — review before deleting';
+  const javaSafeReason = (reason) => (javaSafeEnabled ? reason : `${reason}. ${JAVA_SAFE_GATE}`);
+
   const findingsById = new Map();
   const add = (f) => {
     f.id = `${f.category}:${f.file}:${f.symbol || ''}:${f.startLine || 0}`;
@@ -482,6 +495,9 @@ function gradeFindings(ctx) {
     // for a private method / constructor. See the assignment below.
     let javaLiveScopeNames = null;
     let javaArityIsLive = null;
+    // Java assumed-live roots (non-private methods, classes) that
+    // live code actually uses — see the assignment below.
+    let javaUsedByLive = null;
     if (scopes) {
       const defsByName = new Map(); // name -> definitions with that name
       for (const d of parsed.definitions) {
@@ -508,6 +524,44 @@ function gradeFindings(ctx) {
       }
       const liveRootDefs = new Set();
       for (const name of liveRootNames) for (const d of defsByName.get(name) || []) liveRootDefs.add(d);
+      // Java: seed the live roots with the file's own non-private
+      // methods. Java has no import resolution (graph.js never
+      // resolves a fully-qualified class-name import to a file edge),
+      // so usageMap carries no cross-file Java callers and the roots
+      // above are ~only topLevelUses — usually empty. A non-private
+      // method is reachable from outside this file (the tool already
+      // grades it REVIEW as such), so its callees are live: the BFS
+      // below propagates liveness transitively through same-file
+      // calls, and the arity-aware javaArityIsLive() stays the
+      // decider for private methods. Without this, every helper
+      // called only from a non-private method of a package-private
+      // class looked dead (FJ-7 / FJ-9): the method-conduit rule
+      // only fires when the enclosing class is live, and a
+      // package-private class never is. The parser records only
+      // 'private' / 'public' / 'package' — a protected method has no
+      // public modifier, so it lands in 'package', and every
+      // non-'private' value is a live root here. Constructors count
+      // too: a non-private constructor really runs from outside.
+      // Seeded per DEFINITION, not per name: a private overload
+      // sharing a public method's name must not become a root — its
+      // liveness is decided by the arity check, and a dead private
+      // overload must not rescue its own callees.
+      if (parsed.language === 'java') {
+        for (const d of parsed.definitions) {
+          if (d.kind === 'method' && d.visibility !== 'private') liveRootDefs.add(d);
+          // A class's field initializers and static blocks run when
+          // the class loads, and the tool never proves a class dead
+          // (whole dead classes are out of scope) — so the class
+          // definition is a live root too, and the helpers its
+          // initializers call, and the constants they read, are live
+          // through it (FJ-7 / FJ-9: a method ref in a static
+          // converter registry, a predicate built in a field
+          // initializer, a constant read only in another constant's
+          // initializer). The class itself keeps its REVIEW finding
+          // unless live code uses it — see javaUsedByLive below.
+          if (d.kind === 'class') liveRootDefs.add(d);
+        }
+      }
       // A method is a conduit too: the tool deliberately never proves
       // a method dead (methods are REVIEW at most — objects, tests and
       // frameworks call them through dispatch the static graph cannot
@@ -620,6 +674,32 @@ function gradeFindings(ctx) {
       }
       sameFileLiveDefs = new Set([...liveDefs, ...viaKeptDefs]);
       for (const d of keepDefs) if (!liveDefs.has(d)) sameFileLiveDefs.delete(d);
+      // Java assumed-live roots (a non-private method, a class
+      // definition) are live by assumption, not by use — but a root
+      // that live code actually uses is used, not merely assumed:
+      // it keeps the old no-finding behaviour instead of gaining a
+      // REVIEW finding. javaUsedByLive is the defs some OTHER live
+      // def uses by name (a def never counts as used by itself, so
+      // a self-recursive public method still gets its REVIEW).
+      // Without this, every public method a live method calls and
+      // every class live code constructs would newly show up as
+      // REVIEW on real repos (352 new REVIEWs on junit5).
+      if (parsed.language === 'java') {
+        javaUsedByLive = new Set();
+        for (const e of [...liveDefs, ...viaKeptDefs]) {
+          for (const used of defUses.get(e) || []) {
+            // 'constructor' is one shared name for every constructor
+            // in the file: a this() chain and a `new` construction
+            // are indistinguishable by name, so it cannot tell a
+            // chained-to constructor from a constructed one — and
+            // the contract is that public constructors stay REVIEW.
+            // (A constructed CLASS is still marked used: `new Foo()`
+            // records the class name 'Foo' as a use too.)
+            if (used === 'constructor') continue;
+            for (const d of defsByName.get(used) || []) if (d !== e) javaUsedByLive.add(d);
+          }
+        }
+      }
       // Java: a private method is live only when live code calls it
       // with a matching (name, arity). The name-based sameFileLive
       // cannot tell format/1 from format/2, so private methods get
@@ -629,8 +709,10 @@ function gradeFindings(ctx) {
       // A method reference has no visible arity and counts for every
       // overload of the name; a varargs method matches any call with
       // arity >= its fixed arity; a call from the candidate itself
-      // (pure recursion, or a dead overload's self-call) never rescues
-      // it — the candidate's own (name, arity) key is excluded.
+      // (pure recursion) never rescues it — the exclusion is by
+      // definition identity (see the loop below), not by (name,
+      // arity) key, so a call between two distinct overloads that
+      // share a name and an arity still counts.
       // Constructors match by (name, arity, class): `new Foo()` and
       // `this()` carry the class, `super()` carries none and matches
       // nothing in this file.
@@ -643,12 +725,16 @@ function gradeFindings(ctx) {
           const calls = new Set(parsed.topLevelUsesArity || []);
           for (const d of parsed.definitions) {
             if (!javaLiveScopeNames.has(d.name)) continue;
-            if (d.kind === 'method') {
-              const dKey = d.isConstructor
-                ? `constructor/${d.arity}@${d.className || 'super'}`
-                : `${d.name}/${d.arity}`;
-              if (dKey === key) continue;
-            }
+            // The candidate's OWN calls never rescue it (pure
+            // recursion stays dead) — but the exclusion is by
+            // definition identity, not by (name, arity) key: two
+            // distinct overloads can share a name and an arity, and
+            // a call between them is a genuine cross-overload call,
+            // not a self-call. The old key-based exclusion swallowed
+            // those calls (FJ-7: every same-name / same-arity
+            // overload chain in junit5 looked dead — the public
+            // overload calling the private one with the same arity).
+            if (d === def) continue;
             for (const u of d.usesArity || []) calls.add(u);
           }
           if (def.isConstructor) {
@@ -708,7 +794,22 @@ function gradeFindings(ctx) {
       // (Private fields keep the name-based flag: their reads are
       // already read-only occurrences, so it is exact for them.)
       const javaPrivateMethod = parsed.language === 'java' && def.kind === 'method' && def.visibility === 'private';
-      const sameFileUseEffective = javaPrivateMethod ? false : sameFileUse;
+      // A Java assumed-live root (a non-private method, a class
+      // definition) is live by assumption, not by use: a same-file
+      // call to one must not suppress its own REVIEW finding
+      // ("reachable from outside this file" / "whole dead classes
+      // are out of scope") — the root is the method itself, not
+      // evidence that it is used. (Same reason private methods use
+      // the arity channel instead of the name-based flag.) But a
+      // root that live code actually uses — see javaUsedByLive
+      // above — is used, and keeps the old no-finding behaviour.
+      // Without this, seeding the roots above would silently delete
+      // every public-method and class REVIEW finding.
+      const javaAssumedLive = parsed.language === 'java'
+        && (def.kind === 'class' || (def.kind === 'method' && def.visibility !== 'private'));
+      const sameFileUseEffective = javaPrivateMethod
+        ? false
+        : (javaAssumedLive && javaUsedByLive ? javaUsedByLive.has(def) : sameFileUse);
       // Same-file use is real use: a symbol called or referenced in its
       // own file is alive, full stop. It used to be flagged REVIEW as
       // "unexport-to-local", but that turned every module's own helpers
@@ -920,7 +1021,7 @@ function gradeFindings(ctx) {
             add({ ...common, grade: 'REVIEW', reason: 'local variable assigned but never read — deleting the declaration would leave the assignments behind' });
             continue;
           }
-          add(withCascade({ ...common, grade: 'SAFE', reason: 'unused local variable — never read or written' }));
+          add(withCascade({ ...common, grade: javaGrade('java', 'SAFE'), reason: javaSafeReason('unused local variable — never read or written') }));
           continue;
         }
         if (def.kind === 'class') {
@@ -975,7 +1076,7 @@ function gradeFindings(ctx) {
             add({ ...common, grade: 'REVIEW', reason: 'private field written but never read — deleting the declaration would leave the assignments behind' });
             continue;
           }
-          add(withCascade({ ...common, grade: 'SAFE', reason: 'private field, never read or written, 0 string mentions' }));
+          add(withCascade({ ...common, grade: javaGrade('java', 'SAFE'), reason: javaSafeReason('private field, never read or written, 0 string mentions') }));
           continue;
         }
         // Private method / constructor: arity-aware liveness.
@@ -984,7 +1085,7 @@ function gradeFindings(ctx) {
           continue;
         }
         if (javaArityIsLive(def)) continue; // called from live code: no finding
-        add(withCascade({ ...common, grade: 'SAFE', reason: def.isConstructor ? 'private constructor, never called with this arity, 0 string mentions' : 'private method, no live callers by (name, arity), 0 string mentions' }));
+        add(withCascade({ ...common, grade: javaGrade('java', 'SAFE'), reason: javaSafeReason(def.isConstructor ? 'private constructor, never called with this arity, 0 string mentions' : 'private method, no live callers by (name, arity), 0 string mentions') }));
         continue;
       }
       if (stringElsewhere.length > 0) {
@@ -1080,12 +1181,14 @@ function gradeFindings(ctx) {
           // `try: import numpy` flag, `try: from PIL import Image`); the
           // import IS the use. REVIEW, never SAFE — a leftover optional
           // import in a try block looks identical, so a human checks.
-          const grade = isTestFile ? 'KEEP' : imp.inTryExcept ? 'REVIEW' : 'SAFE';
+          // Java imports are REVIEW while the Java SAFE gate is off.
+          const javaImportGated = parsed.language === 'java' && !javaSafeEnabled;
+          const grade = isTestFile ? 'KEEP' : (imp.inTryExcept || javaImportGated) ? 'REVIEW' : 'SAFE';
           add({
             category: 'import', file: rel, symbol: n.local, grade,
             startLine: imp.range.startLine, endLine: imp.range.endLine,
             size: imp.range.endIndex - imp.range.startIndex,
-            reason: isTestFile ? 'unused import in a test file (kept)' : imp.inTryExcept ? `imported "${n.imported}" from "${imp.source}" inside try/except but never referenced — the import itself may be the availability probe` : `imported "${n.imported}" from "${imp.source}" but never referenced in this file`,
+            reason: isTestFile ? 'unused import in a test file (kept)' : imp.inTryExcept ? `imported "${n.imported}" from "${imp.source}" inside try/except but never referenced — the import itself may be the availability probe` : javaImportGated ? `imported "${n.imported}" from "${imp.source}" but never referenced in this file. ${JAVA_SAFE_GATE}` : `imported "${n.imported}" from "${imp.source}" but never referenced in this file`,
             evidence: { importers: 0, callers: 0, stringRefs: [], exported: false, coveragePct: null, ...evidenceBase },
             deleteDiff: `remove "${n.local}" from import of "${imp.source}" in ${rel}`,
           });
@@ -1099,10 +1202,10 @@ function gradeFindings(ctx) {
     // alive), never a SAFE delete.
     for (const u of parsed.unreachable || []) {
       add({
-        category: 'unreachable', file: rel, symbol: null, grade: isTest ? 'KEEP' : 'SAFE',
+        category: 'unreachable', file: rel, symbol: null, grade: isTest ? 'KEEP' : javaGrade(parsed.language, 'SAFE'),
         startLine: u.line, endLine: u.line,
         size: u.snippet ? u.snippet.length : 0,
-        reason: isTest ? 'unreachable code in a test file (kept)' : u.reason,
+        reason: isTest ? 'unreachable code in a test file (kept)' : (parsed.language === 'java' && !javaSafeEnabled ? `${u.reason}. ${JAVA_SAFE_GATE}` : u.reason),
         evidence: { importers: 0, callers: 0, stringRefs: [], exported: false, coveragePct: null, ...evidenceBase },
         deleteDiff: u.snippet || '',
       });

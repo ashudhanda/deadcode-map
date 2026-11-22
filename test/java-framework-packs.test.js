@@ -113,7 +113,7 @@ public class Plain {
 }
 `,
   });
-  const f = scan(dir).findings;
+  const f = scan(dir, { javaSafe: true }).findings;
   assert.equal(bySymbol(f, 'Advice.java', 'deadInAdvice').grade, 'REVIEW', '@ControllerAdvice member must be REVIEW');
   assert.equal(bySymbol(f, 'Advice.java', 'deadFieldInAdvice').grade, 'REVIEW', '@ControllerAdvice field must be REVIEW');
   assert.equal(bySymbol(f, 'Advice.java', 'deadInProps').grade, 'REVIEW', '@ConfigurationProperties member must be REVIEW');
@@ -169,7 +169,7 @@ public class Handlers {
 }
 `,
   });
-  const f = scan(dir).findings;
+  const f = scan(dir, { javaSafe: true }).findings;
   // A Spring-annotated class member is kept: the @RestController
   // class's private members are REVIEW, never SAFE.
   assert.equal(bySymbol(f, 'Api.java', 'deadInController').grade, 'REVIEW');

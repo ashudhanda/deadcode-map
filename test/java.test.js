@@ -4,6 +4,11 @@
  * Java fixture tests: the FP rate on SAFE is the claim that matters.
  * Every live symbol in the Java fixture must NOT be flagged SAFE;
  * every planted dead item must be found at SAFE or REVIEW.
+ *
+ * These tests run with javaSafe: true — they measure the Java grading
+ * engine itself. By default Java SAFE is OFF (batch 9 gate: 0.3%
+ * precision on real repos), so a plain scan reports Java findings at
+ * REVIEW at most; see the 'java: SAFE is off by default' test below.
  */
 
 const test = require('node:test');
@@ -22,7 +27,7 @@ const MODERN = 'src/main/java/com/example/Modern.java';
 const TEST_FILE = 'src/test/java/com/example/BasicServiceTest.java';
 
 function findingsFor(dir) {
-  return scan(path.join(ROOT, 'fixtures', dir), { includeFixtures: true }).findings;
+  return scan(path.join(ROOT, 'fixtures', dir), { includeFixtures: true, javaSafe: true }).findings;
 }
 
 function bySymbol(findings, file, symbol) {
@@ -217,7 +222,7 @@ public class Ann {
   }
 }
 `);
-  const f = scan(dir).findings;
+  const f = scan(dir, { javaSafe: true }).findings;
   // The import is used by the annotation: deleting it would break
   // compilation, so it must not be flagged at all. (Before the fix
   // the annotation name was excluded from references and this import
@@ -227,10 +232,41 @@ public class Ann {
   assert.equal(bySymbol(f, 'Ann.java', 'deadPlain').grade, 'SAFE');
 });
 
+test('java: SAFE is off by default — Java findings are REVIEW at most, so --fix deletes no Java code', () => {
+  // The gate (batch 9): real-repo Java precision is 0.3%, so a plain
+  // scan must never produce a Java SAFE that --fix could delete.
+  const f = scan(path.join(ROOT, 'fixtures', 'java-basic'), { includeFixtures: true }).findings;
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0,
+    `default scan must find 0 SAFE on the Java fixture, got: ${JSON.stringify(f.filter((x) => x.grade === 'SAFE').map((x) => `${x.file}:${x.symbol || ''}`))}`);
+  // The planted dead items are still reported — at REVIEW, with the
+  // gate named in the reason — so nothing is hidden, only the
+  // auto-delete verdict is withheld.
+  for (const symbol of ['deadMethod', 'privateStaticDead', 'documentedDead']) {
+    const found = bySymbol(f, BASIC, symbol);
+    assert.equal(found.grade, 'REVIEW', `${symbol} must be REVIEW by default`);
+    assert.match(found.reason, /Java SAFE is disabled by default/, `${symbol} must name the gate in its reason`);
+  }
+  assert.equal(bySymbol(f, BASIC, 'Map').grade, 'REVIEW', 'an unused Java import must be REVIEW by default');
+  assert.equal(bySymbol(f, BASIC, 'unusedLocal').grade, 'REVIEW', 'an unused Java local must be REVIEW by default');
+  assert.equal(byCategory(f, BASIC, 'unreachable').grade, 'REVIEW', 'unreachable Java code must be REVIEW by default');
+  // And --fix on the default scan deletes nothing: the fixture is
+  // byte-identical afterwards.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-java-gate-fix-'));
+  fs.cpSync(path.join(ROOT, 'fixtures', 'java-basic'), dir, { recursive: true });
+  const before = scan(dir, { includeFixtures: true });
+  const result = applyFix(dir, before.graph, before.findings.filter((x) => x.grade === 'SAFE'));
+  assert.equal(result.safeCount, 0, '--fix on a default scan must delete 0 Java findings');
+  assert.equal(fs.readFileSync(path.join(dir, BASIC), 'utf8'),
+    fs.readFileSync(path.join(ROOT, 'fixtures', 'java-basic', BASIC), 'utf8'),
+    'the fixture must be unchanged after --fix on a default scan');
+});
+
 test('java-basic: --fix deletes dead methods with their Javadoc, dead fields and unused imports', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-java-fix-'));
   fs.cpSync(path.join(ROOT, 'fixtures', 'java-basic'), dir, { recursive: true });
-  const before = scan(dir);
+  // --fix mechanics are tested with the Java SAFE gate opted in; the
+  // default-off gate has its own test above.
+  const before = scan(dir, { javaSafe: true });
   const safe = before.findings.filter((x) => x.grade === 'SAFE');
   assert.ok(safe.length > 0, 'fixture must have SAFE findings to fix');
   const result = applyFix(dir, before.graph, safe);
@@ -264,7 +300,7 @@ test('java-basic: --fix deletes dead methods with their Javadoc, dead fields and
     const parsed = parseJava(path.join(dir, rel), fs.readFileSync(path.join(dir, rel), 'utf8'));
     assert.equal(parsed.hasErrors, false, `${rel} must still parse after --fix`);
   }
-  const after = scan(dir);
+  const after = scan(dir, { javaSafe: true });
   assert.equal(after.findings.filter((x) => x.grade === 'SAFE').length, 0,
     `re-scan after --fix must find 0 SAFE, got: ${JSON.stringify(after.findings.filter((x) => x.grade === 'SAFE').map((x) => `${x.file}:${x.symbol || ''}`))}`);
 });

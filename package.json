@@ -41,7 +41,7 @@
   "scripts": {
     "mcp": "node bin/deadcode-map-mcp.js",
     "start": "node bin/deadcode-map.js",
-    "test": "node --test test/fixtures.test.js test/java.test.js test/java-framework-packs.test.js test/java-javac.test.js test/cli.test.js test/mcp.test.js test/cache.test.js test/coverage.test.js test/large-files.test.js"
+    "test": "node --test test/fixtures.test.js test/java.test.js test/java-framework-packs.test.js test/java-javac.test.js test/java-batch9-fj1-fj8.test.js test/java-batch9-fj7.test.js test/cli.test.js test/mcp.test.js test/cache.test.js test/coverage.test.js test/large-files.test.js test/web-analyzer.test.js test/web-prototype-names.test.js test/web-batch9-vue.test.js"
   },
   "type": "commonjs",
   "version": "0.1.0"

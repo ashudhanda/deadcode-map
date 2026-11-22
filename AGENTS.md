@@ -5,7 +5,9 @@ Guide for CLI agents (human or AI) working in this repo.
 ## What this repo is
 
 deadcode-map finds dead code, proves it is dead, and shows it on a map.
-JS / TypeScript, Python, and Java (private-only SAFE). Every finding is graded `SAFE` / `REVIEW` / `KEEP`
+JS / TypeScript, Python, and Java (private-only SAFE, off by default —
+opt in with `--java-safe` while measuring; see README "Java scope").
+Every finding is graded `SAFE` / `REVIEW` / `KEEP`
 and carries its evidence (importers, callers, string mentions, git age, coverage).
 `--fix` / `--prove` act on SAFE only. The map is a single self-contained HTML file.
 
