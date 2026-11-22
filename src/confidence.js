@@ -528,15 +528,17 @@ function gradeFindings(ctx) {
       // enclosing class can be found (an object-literal method, a
       // class expression the parser did not record), the method stays
       // a conduit: fail-open, never a new SAFE. Class liveness comes
-      // from the live roots and the kept (non-method) definitions, so
-      // the computation is not circular: a class is live when live
-      // code references it, when it is itself kept (framework /
-      // exported public API), or when a kept definition reaches it (a
-      // framework handler that instantiates it really runs). The
-      // cost of the old rule was false negatives — helpers used only
-      // by methods of a dead class stayed hidden. That is now fixed
-      // for the known-class case; the unknown-class case keeps the
-      // safe direction.
+      // from the live roots, the kept (non-method) definitions, and —
+      // by the fixpoint below — the classes kept-method conduits
+      // reach: a class is live when live code references it, when it
+      // is itself kept (framework / exported public API), when a kept
+      // definition reaches it (a framework handler that instantiates
+      // it really runs), or when a method of a live class reaches it
+      // (that method really runs, so the class it builds really
+      // exists). The cost of the old rule was false negatives —
+      // helpers used only by methods of a dead class stayed hidden.
+      // That is now fixed for the known-class case; the unknown-class
+      // case keeps the safe direction.
       const classDefs = parsed.definitions.filter((d) => d.kind === 'class');
       const enclosingClassName = (def) => {
         let best = null;
@@ -593,9 +595,29 @@ function gradeFindings(ctx) {
           // conduit status here. Public / protected / package-private
           // methods of a live class stay conduits, as before.
           && !(parsed.language === 'java' && d.visibility === 'private' && !(d.annotations || []).length));
-      const keepDefs = new Set();
-      for (const d of parsed.definitions) if (keepDef(d)) keepDefs.add(d);
-      const viaKeptDefs = bfsDefs(keepDefs);
+      // Fixpoint (batch 8): a class reached only through a kept
+      // method's callees is live too — its methods are conduits, and
+      // the names they use are reachable. Without this, a nested class
+      // built by a factory a live class's method calls (Django's
+      // postgis `postgis_adapters` returning `PostGISTextDumper` /
+      // `PostGISBinaryDumper`, whose `BaseDumper.get_key` / `upgrade`
+      // reference `GeometryType` / `GeographyType` / `RasterType`)
+      // never counted as live, so the names its methods use looked
+      // dead. The loop only grows liveClassNames, bounded by the
+      // number of classes in the file, so it always terminates; each
+      // round can only add liveness, never a new SAFE.
+      let keepDefs = new Set();
+      let viaKeptDefs = new Set();
+      for (;;) {
+        keepDefs = new Set();
+        for (const d of parsed.definitions) if (keepDef(d)) keepDefs.add(d);
+        viaKeptDefs = bfsDefs(keepDefs);
+        let grew = false;
+        for (const d of viaKeptDefs) {
+          if (d.kind === 'class' && !liveClassNames.has(d.name)) { liveClassNames.add(d.name); grew = true; }
+        }
+        if (!grew) break;
+      }
       sameFileLiveDefs = new Set([...liveDefs, ...viaKeptDefs]);
       for (const d of keepDefs) if (!liveDefs.has(d)) sameFileLiveDefs.delete(d);
       // Java: a private method is live only when live code calls it
@@ -1027,7 +1049,25 @@ function gradeFindings(ctx) {
     // (`from x import y` then a later `def y()`) looks the same and is
     // missed instead — a false negative, never a false SAFE.
     const topLevelDefNames = new Set();
-    for (const d of parsed.definitions) if (!d.local) topLevelDefNames.add(d.name);
+    const srcLines = (info.src || '').split('\n');
+    for (const d of parsed.definitions) {
+      if (d.local) continue;
+      // A `const foo = require('./foo')` binding is the import itself,
+      // not a second definition of the name: the definition sits on the
+      // require line, so it must not shield the import. A genuine
+      // shadowing definition (`def replace` under `else:` in Django's
+      // utils/copy.py) sits on its own line. Only variable definitions
+      // are excluded: a require binding is always a variable
+      // declarator, while a function definition whose line merely
+      // mentions require (a parameter named `require`) is still a
+      // shadowing definition. (Same exclusion as the web analyzer,
+      // docs/analyzer.js, which does not gate on kind.)
+      if (d.kind === 'variable') {
+        const defLine = srcLines[d.startLine - 1] || '';
+        if (/require\s*\(/.test(defLine) || /^\s*import\b/.test(defLine)) continue;
+      }
+      topLevelDefNames.add(d.name);
+    }
     for (const imp of parsed.imports) {
       if (imp.sideEffect || imp.reExport) continue;
       for (const n of imp.names || []) {

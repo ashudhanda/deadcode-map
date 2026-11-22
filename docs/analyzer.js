@@ -18,6 +18,12 @@
  *   reference such as utils.helper_fn() from a file that imports utils).
  * - Python top-level public names are importable, so they are "exported"
  *   (REVIEW at worst); underscore-prefixed names are private (SAFE-able).
+ * - Classic-script globals: in a classic (non-module) JS file, a
+ *   bare-name call resolves to the single repo-wide top-level
+ *   definition of that name (Django admin JS).
+ * - `__unittest` is a KEEP module attribute (unittest traceback
+ *   trimming), and an import shadowed by a same-file top-level
+ *   definition is a conditional definition, never a dead import.
  *
  * No browser-only APIs in this file: it runs in Node and in the browser.
  * UMD wrapper: module.exports in Node, window.DeadcodeMap in the browser.
@@ -482,6 +488,19 @@ function parseJs(rel, raw) {
   // jsx_element nodes; this regex is the web parser's equivalent.)
   var hasJsx = /(?:^|[^A-Za-z0-9_$.])<>/.test(code) ||
     /(?:^|[^A-Za-z0-9_$.])<[A-Za-z][\w.:-]*\s*(?:\/?>|\{|[A-Za-z_][\w-]*\s*(?:=|\/?>|\s))/.test(code);
+  // A file uses module syntax when the stripped code (strings and
+  // comments blanked, so a string that merely mentions `import` does
+  // not count) has an import / export statement, a require() call, a
+  // module.exports / exports. assignment, or a dynamic import(). A
+  // file without it is a classic script: its top-level declarations
+  // are page globals, callable by bare name from other classic
+  // scripts (Django admin JS). `export {}` and `module.exports = {}`
+  // count even though they bind no names — mirrors the CLI's
+  // hasModuleSyntax flag in src/parse-js.js.
+  var hasModuleSyntax = /(^|\n)\s*import\s/.test(code) || /\bimport\s*\(/.test(code)
+    || /\bimport\.meta\b/.test(code)
+    || /(^|\n)\s*export\b/.test(code) || /\brequire\s*\(/.test(code)
+    || /\bmodule\.exports\b/.test(code) || /(^|\n)\s*exports\./.test(code);
   // A compatibility shim's imports ARE its public API (mirrors
   // src/parse-py.js): the names are re-exported for downstream code.
   var isCompatShimJs = /(^|\/)(_?compat)(\.(js|jsx|ts|tsx|mjs|cjs))?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
@@ -489,6 +508,7 @@ function parseJs(rel, raw) {
     language: 'js', definitions: [], imports: [], references: new Set(),
     calls: new Set(), constructed: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
     unreachable: [], decorators: [], dunder: new Set(), strings: strings, hasJsx: hasJsx,
+    hasModuleSyntax: hasModuleSyntax,
   };
 
   var braceDepth = 0;
@@ -2403,6 +2423,69 @@ function analyzeFiles(inputFiles, options) {
     });
   });
 
+  // --- classic scripts and global-scope calls (Django admin JS) ---
+  // A classic (non-module) script has no module syntax: `module.exports`
+  // counts even when it binds no names (`module.exports = {}`), and so
+  // does `export {}`, so the flag comes from the parser, not from the
+  // import/export lists. Top-level declarations of a classic script are
+  // globals of the page they load on — callable by bare name from any
+  // other script loaded with them. A bare-name call in one classic
+  // script resolves to the global definition of that name when exactly
+  // one top-level definition of it exists repo-wide: the calling file
+  // neither defines nor imports the name (a local binding would win),
+  // and the definition sits in another classic script. Names defined
+  // more than once are ambiguous and resolve to nothing; a global with
+  // no in-repo caller is still graded on its own evidence (a plain
+  // script's unreferenced function is SAFE — a classic script is not a
+  // free pass, only its observed cross-script calls are).
+  // Calls only, not bare references: a member access (`obj.foo()`)
+  // records the same base name as a global call, and a bare reference
+  // is not a call. Mirrors src/graph.js in the CLI.
+  var classicScripts = new Set();
+  Object.keys(files).forEach(function (rel) {
+    var info = files[rel];
+    if (info.language !== 'js' || !info.parsed) return;
+    if (!info.parsed.hasModuleSyntax) classicScripts.add(rel);
+  });
+  var globalDefs = Object.create(null); // name -> rel of the unique global definition
+  (function () {
+    var defCounts = Object.create(null); // name -> top-level runtime defs with that name
+    var classicDefFile = Object.create(null); // name -> rel, when a classic script defines it
+    Object.keys(files).forEach(function (rel) {
+      var info = files[rel];
+      if (info.language !== 'js' || !info.parsed) return;
+      info.parsed.definitions.forEach(function (d) {
+        if (d.kind === 'method' || d.kind === 'type') return;
+        defCounts[d.name] = (defCounts[d.name] || 0) + 1;
+        if (classicScripts.has(rel) && !classicDefFile[d.name]) classicDefFile[d.name] = rel;
+      });
+    });
+    Object.keys(classicDefFile).forEach(function (name) {
+      if (defCounts[name] === 1) globalDefs[name] = classicDefFile[name];
+    });
+  })();
+  Object.keys(files).forEach(function (rel) {
+    if (!classicScripts.has(rel)) return;
+    var info = files[rel];
+    if (!info.parsed) return;
+    var definedHere = new Set();
+    info.parsed.definitions.forEach(function (d) {
+      if (d.kind !== 'method' && d.kind !== 'type') definedHere.add(d.name);
+    });
+    var importedHere = new Set();
+    info.parsed.imports.forEach(function (imp) {
+      (imp.names || []).forEach(function (n) { importedHere.add(n.local); });
+    });
+    info.parsed.calls.forEach(function (name) {
+      if (definedHere.has(name) || importedHere.has(name)) return;
+      var defFile = globalDefs[name];
+      if (!defFile || defFile === rel) return;
+      var map = symbolUsage[defFile];
+      var u = map && map[name];
+      if (u) u.calledIn.add(rel);
+    });
+  });
+
   // Grading, mirroring the CLI confidence engine.
   var findings = [];
   var seenFindings = new Set();
@@ -2532,6 +2615,15 @@ function analyzeFiles(inputFiles, options) {
       if (def.kind === 'method' && usage.calledIn.size > 0) {
         return;
       }
+      // A call from another file is a real caller too: the classic-script
+      // global pass above records bare-name calls from other classic
+      // scripts against the unique repo-wide definition (Django admin
+      // JS), so a definition with any cross-file caller is live. The
+      // same-file case already returned above, so reaching here with a
+      // non-empty calledIn means the caller is in another file.
+      if (usage.calledIn.size > 0) {
+        return;
+      }
 
       var stringHits = filesMentioning(def.name);
       var stringElsewhere = [];
@@ -2565,6 +2657,14 @@ function analyzeFiles(inputFiles, options) {
       // implementation is invoked through the overloaded name.
       if (overloadedNames.has(def.name)) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: '@overload group — stubs are type information and the implementation is invoked through the overloaded name' }));
+        return;
+      }
+      // `__unittest = True` in a module tells unittest to trim that
+      // module's frames from tracebacks: the test runner reads the
+      // module attribute, so it is never dead code (Django's
+      // contrib/messages/test.py sets it for its test-mixin module).
+      if (def.name === '__unittest') {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: '__unittest module attribute — unittest trims this module\'s frames from tracebacks, the runner reads it' }));
         return;
       }
       // Next.js middleware / proxy exports are framework-resolved, but
@@ -2609,10 +2709,31 @@ function analyzeFiles(inputFiles, options) {
     });
 
     // Dead imports.
+    // A name the file ALSO defines at top level is a conditional
+    // definition, not a dead import: `if PY313: from copy import
+    // replace / else: def replace(...)` (Django's utils/copy.py)
+    // provides the same public name under every version, and the import
+    // IS the public API on the branch where it runs. Deleting the
+    // import would remove the name on that branch. An unconditional
+    // shadowing (`from x import y` then a later `def y()`) looks the
+    // same and is missed instead — a false negative, never a false SAFE.
+    var topLevelDefNames = new Set();
+    var fileLines = info.raw.split('\n');
+    parsed.definitions.forEach(function (d) {
+      // A `const foo = require('./foo')` binding is the import itself,
+      // not a second definition of the name: the definition sits on the
+      // require line, so it must not shield the import. A genuine
+      // shadowing definition (`def replace` under `else:` in Django's
+      // utils/copy.py) sits on its own line.
+      var defLine = fileLines[d.startLine - 1] || '';
+      if (/require\s*\(/.test(defLine) || /^\s*import\b/.test(defLine)) return;
+      topLevelDefNames.add(d.name);
+    });
     parsed.imports.forEach(function (imp) {
       if (imp.sideEffect || imp.reExport || imp.allExport) return;
       (imp.names || []).forEach(function (n) {
         if (n.kind === 'namespace') return;
+        if (topLevelDefNames.has(n.local)) return; // conditional definition of the same name
         if (!parsed.references.has(n.local) && !parsed.calls.has(n.local)) {
           // For a plain `import a, b` the record's source is only the
           // first module — use the name's own module (n.full) so the

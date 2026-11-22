@@ -1709,3 +1709,56 @@ test('web ts-e2e-spec: *.e2e-spec.ts / *.e2e-spec.js files are test files — KE
   const expectedSafe = new Set(['file:e2e/helpers/seed-data.ts', 'file:src/orphan.ts']);
   assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}`)), expectedSafe);
 });
+
+test('web js-global-scripts: classic-script globals called from other classic scripts are live', () => {
+  const f = loadFixture('js-global-scripts').findings;
+  // core.js, widget.js and calls.js use no module system: the top-level
+  // functions are page globals, and widget.js calls globalFn() by bare
+  // name — a real call, so globalFn is live with no finding at all
+  // (Django admin JS: quickElement in core.js, called from
+  // SelectFilter2.js / calendar.js / DateTimeShortcuts.js).
+  assert.equal(bySymbol(f, 'core.js', 'globalFn'), undefined, 'globalFn is called from widget.js and must not be flagged');
+  // The template loads all three scripts, so no file is a dead file.
+  assert.equal(byCategory(f, 'core.js', 'file').grade, 'REVIEW');
+  assert.equal(byCategory(f, 'widget.js', 'file').grade, 'REVIEW');
+  // Dead equivalents still grade SAFE: a global nothing calls, and a
+  // name two classic scripts both define (the call in calls.js is
+  // ambiguous and rescues neither definition).
+  assert.equal(bySymbol(f, 'core.js', 'deadGlobal').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'core.js', 'clash').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'widget.js', 'clash').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'function:core.js:deadGlobal',
+    'function:core.js:clash',
+    'function:widget.js:clash',
+  ]));
+});
+
+test('web py-unittest: __unittest module attribute is KEEP, never SAFE', () => {
+  // Django's contrib/messages/test.py sets `__unittest = True` so
+  // unittest trims the module's frames from tracebacks: the test
+  // runner reads the attribute, so it is never dead code. The file
+  // here is deliberately NOT a test file (test.py would be KEEP
+  // anyway) — the rule itself must keep the attribute.
+  const f = analyzeFiles([
+    { path: 'pkg/helpers.py', content: '# Make unittest ignore frames in this module when reporting failures.\n__unittest = True\n\n\nclass Mixin:\n    def check(self):\n        return True\n' },
+    { path: 'pkg/dead.py', content: 'def _dead_helper():\n    return 1\n' },
+  ]).findings;
+  assert.equal(bySymbol(f, 'pkg/helpers.py', '__unittest').grade, 'KEEP', '__unittest is read by the test runner, never SAFE');
+  // Precision: a genuinely dead private function next to it is still SAFE.
+  assert.equal(bySymbol(f, 'pkg/dead.py', '_dead_helper').grade, 'SAFE');
+});
+
+test('web py-conditional-import: an import shadowed by a same-file definition is not dead', () => {
+  const f = loadFixture('py-conditional').findings;
+  // The version-gated import IS the public API on its branch
+  // (Django's utils/copy.py): no dead-import finding for it, and the
+  // backport definition is live through its importer.
+  assert.equal(bySymbol(f, 'shim.py', 'replace'), undefined, 'the conditional import of replace is the alternate branch of the same public name');
+  // Dead equivalents still grade SAFE: a plain unused import that
+  // shares no name with a definition.
+  assert.equal(bySymbol(f, 'shim.py', 'deepcopy').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.ok(!safe.some((s) => s.category === 'import' && s.file === 'shim.py' && s.symbol === 'replace'), 'replace must never be SAFE');
+});

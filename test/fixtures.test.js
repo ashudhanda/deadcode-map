@@ -99,6 +99,27 @@ test('js-basic: SAFE false-positive rate is 0%', () => {
   assert.ok(fpRate < 0.05, `SAFE FP rate ${fpRate} exceeds 5% target`);
 });
 
+test('js-require: a plain unused const foo = require() import is SAFE, like the ESM equivalent', () => {
+  const f = findingsFor('js-require');
+  // The parser records both an import and a variable definition for a
+  // plain require binding, and the variable definition used to shield
+  // the import via the same-name top-level-definition skip (the
+  // conditional-definition rule for Django's utils/copy.py). The
+  // binding is the import itself, not a second definition, so an
+  // unreferenced plain require is SAFE — exactly like the ESM import
+  // in the same fixture. A require that IS used stays unflagged.
+  assert.equal(bySymbol(f, 'cjs-unused.js', 'foo').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'cjs-unused.js', 'foo').category, 'import');
+  assert.equal(bySymbol(f, 'unused-esm.mjs', 'foo').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'cjs-used.js', 'foo'), undefined, 'a used require must not be flagged');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`)), new Set([
+    'import:cjs-unused.js:foo',
+    'import:unused-esm.mjs:foo',
+    'file:unused-esm.mjs',
+  ]));
+});
+
 test('py-basic: live symbols are never flagged, framework kept', () => {
   const f = findingsFor('py-basic');
   for (const symbol of ['used_fn', 'format_name', '_double']) {
@@ -1072,6 +1093,57 @@ test('js-global-scripts: globals called from other classic scripts are live (Dja
     'function:core.js:deadGlobal',
     'function:core.js:clash',
     'function:widget.js:clash',
+  ]));
+});
+
+test('js-jsx-pragma: an unused memo import in a JSX file is SAFE; pragma names are credited', () => {
+  const f = findingsFor('js-jsx-pragma');
+  // Preact demo/suspense.jsx shape: `memo` is imported alongside the
+  // JSX pragma names but never referenced — no JSX transform calls
+  // `memo` (the classic transform calls `createElement` / `h`, the
+  // automatic runtime calls `jsx` / `jsxs`), there is no `@jsx`
+  // comment naming it, and the file even carries an
+  // eslint-disable-next-line for unused vars. The SAFE is a true
+  // positive: deleting `memo` from the import changes nothing. The
+  // pragma names themselves ARE credited — `createElement` and
+  // `Fragment` are never referenced in text either, but the transform
+  // needs them, so they are never flagged.
+  assert.equal(bySymbol(f, 'demo.jsx', 'memo').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'demo.jsx', 'memo').category, 'import');
+  assert.equal(bySymbol(f, 'demo.jsx', 'createElement'), undefined, 'createElement is the JSX pragma factory');
+  assert.equal(bySymbol(f, 'demo.jsx', 'Fragment'), undefined, 'Fragment is the JSX fragment factory');
+  assert.equal(bySymbol(f, 'used.jsx', 'memo'), undefined, 'a used memo import must not be flagged');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`)), new Set([
+    'import:demo.jsx:memo',
+  ]));
+});
+
+test('py-django-backend: nested classes reached only through a live class factory are alive (same-file cascade fixpoint)', () => {
+  const f = findingsFor('py-django-backend');
+  // Django's postgis `base.py` shape: `if is_psycopg3:` classes
+  // (`GeometryType`, `GeographyType`) used only by the methods of a
+  // class nested inside `postgis_adapters()`, which a live
+  // `DatabaseWrapper` method calls. The nested class is reached only
+  // through a kept-method conduit, so class liveness must iterate to
+  // a fixpoint — otherwise the nested class never counts as live, its
+  // methods never become conduits, and the names they use look dead.
+  // Private names are used so the library public-API REVIEW does not
+  // mask the cascade (the public names are covered by py-conditional).
+  assert.equal(bySymbol(f, 'backend.py', '_GeometryType'), undefined, '_GeometryType is used by _BaseDumper.get_key, reachable from the live DatabaseWrapper');
+  assert.equal(bySymbol(f, 'backend.py', '_GeographyType'), undefined, '_GeographyType is used by _BaseDumper.get_key, reachable from the live DatabaseWrapper');
+  assert.equal(bySymbol(f, 'backend.py', '_make_adapters'), undefined, '_make_adapters is called by DatabaseWrapper.register_adapters');
+  // The nested classes themselves are locals of the factory: no finding.
+  assert.equal(bySymbol(f, 'backend.py', '_BaseDumper'), undefined);
+  assert.equal(bySymbol(f, 'backend.py', '_TextDumper'), undefined);
+  // Genuinely dead code in the same file is still found: the fixpoint
+  // adds liveness only through conduits that really run.
+  assert.equal(bySymbol(f, 'backend.py', '_dead_helper').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'backend.py', '_DeadType').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'function:backend.py:_dead_helper',
+    'class:backend.py:_DeadType',
   ]));
 });
 
