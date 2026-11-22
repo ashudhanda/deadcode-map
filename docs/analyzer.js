@@ -157,6 +157,47 @@ function identifiers(text) {
   return out;
 }
 
+// Split on a separator that sits at the top level: a separator inside
+// nested (), [] or {} belongs to the nested value, not to the list.
+function splitTopLevel(text, sep) {
+  var out = [];
+  var depthParen = 0;
+  var depthBracket = 0;
+  var depthBrace = 0;
+  var start = 0;
+  for (var i = 0; i < text.length; i++) {
+    var ch = text[i];
+    if (ch === '(') depthParen++;
+    else if (ch === ')') depthParen--;
+    else if (ch === '[') depthBracket++;
+    else if (ch === ']') depthBracket--;
+    else if (ch === '{') depthBrace++;
+    else if (ch === '}') depthBrace--;
+    else if (ch === sep && depthParen === 0 && depthBracket === 0 && depthBrace === 0) {
+      out.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(text.slice(start));
+  return out;
+}
+
+// True when the identifier at (index, index + len) in an object literal
+// line is a top-level entry name: a shorthand (`A,`) or a key (`run:`).
+// It must start an entry (previous non-space char is `{`, `,`, or the
+// line starts here) and be followed by `,`, `}`, `:` or end of line.
+// A value (`run: foo`) is preceded by `:` and is a real use, not an
+// entry name.
+function isExportEntryName(line, index, len) {
+  var p = index - 1;
+  while (p >= 0 && /\s/.test(line[p])) p--;
+  if (p >= 0 && line[p] !== '{' && line[p] !== ',') return false;
+  var q = index + len;
+  while (q < line.length && /\s/.test(line[q])) q++;
+  var next = q < line.length ? line[q] : '';
+  return next === ',' || next === '}' || next === ':' || next === '';
+}
+
 /**
  * Blank out strings and comments, keeping newlines, so structural scans
  * never mistake a string or a comment for code. Template literals keep
@@ -515,12 +556,54 @@ function parseJs(rel, raw) {
   // module.exports / exports.* / export { ... } — mark definitions exported.
   var defByName = Object.create(null);
   parsed.definitions.forEach(function (d) { defByName[d.name] = d; });
-  var me = raw.match(/module\.exports\s*=\s*\{([^}]*)\}/);
-  if (me) {
-    me[1].split(',').forEach(function (part) {
+  // A `module.exports = { ... }` object may span lines and hold nested
+  // objects or function values, so a single `[^}]*` match stops at the
+  // first `}` and only the first block in a file is seen. Scan every
+  // assignment on the stripped code (strings blanked, so a brace inside
+  // a string cannot fool the depth count), match braces, and split only
+  // top-level commas — a nested property (`nested: { B }`) is not a
+  // module export, so `B` is never marked exported here.
+  var meRe = /module\.exports\s*=\s*\{/g;
+  var meM;
+  while ((meM = meRe.exec(code)) !== null) {
+    var bodyStart = meM.index + meM[0].length;
+    var meDepth = 1;
+    var meI = bodyStart;
+    while (meI < code.length && meDepth > 0) {
+      if (code[meI] === '{') meDepth++;
+      else if (code[meI] === '}') meDepth--;
+      meI++;
+    }
+    if (meDepth !== 0) continue; // unterminated object: fail open, mark nothing
+    splitTopLevel(code.slice(bodyStart, meI - 1), ',').forEach(function (part) {
       var name = part.split(':')[0].trim();
       if (defByName[name]) defByName[name].exported = true;
     });
+  }
+  // Lines belonging to a `module.exports = { ... }` object literal: the
+  // names listed there are exports, not uses, so the references pass
+  // scans them depth-aware (see the references loop below). The region
+  // runs from the opening line until the matching close, brace-depth
+  // based on the stripped code; if no close is found within the bound,
+  // only the opening line is treated as an export object (fail open —
+  // the rest is scanned like ordinary code).
+  var exportObjLines = new Set();
+  var EXPORT_OBJ_MAX_LINES = 200;
+  for (var eo = 0; eo < lines.length; eo++) {
+    if (!/^\s*module\.exports\s*=\s*\{/.test(lines[eo])) continue;
+    var eoDepth = 0;
+    var eoEnd = eo;
+    var eoClosed = false;
+    for (var eo2 = eo; eo2 < Math.min(lines.length, eo + EXPORT_OBJ_MAX_LINES); eo2++) {
+      var eoLine = lines[eo2];
+      for (var eo3 = 0; eo3 < eoLine.length; eo3++) {
+        if (eoLine[eo3] === '{') eoDepth++;
+        else if (eoLine[eo3] === '}') eoDepth--;
+      }
+      if (eoDepth === 0) { eoEnd = eo2; eoClosed = true; break; }
+    }
+    if (!eoClosed) eoEnd = eo; // fail open: skip the opening line only
+    for (var eo4 = eo; eo4 <= eoEnd; eo4++) exportObjLines.add(eo4 + 1);
   }
   var re2 = /module\.exports\.([A-Za-z_$][\w$]*)\s*=/g;
   var m2;
@@ -609,10 +692,37 @@ function parseJs(rel, raw) {
       if (imp) parsed.imports.push(imp);
       continue;
     }
-    if (/^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"]/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
-      var reM = rawLine.match(/export\s+(?:\*|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]/);
-      if (reM) parsed.imports.push({ source: reM[1], names: [], sideEffect: false, reExport: true });
-      continue;
+    if (/^\s*export\s+(?:\*|\{)/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
+      // A re-export may span lines (`export {\n A,\n B,\n} from
+      // './x'`): accumulate like the import branch above until the
+      // `from '...'` clause appears. A local `export { ... }` list
+      // that closes without a `from` is not a re-export — stop there
+      // so the next statement is never swallowed (ASI code has no `;`
+      // to stop on). The `export * as ns from '...'` alias form is
+      // accepted too (matches the CLI).
+      var reStmt = rawLine;
+      var reGuard = 0;
+      while (reGuard < 10 && il2 + 1 < rawLines.length) {
+        if (/from\s+['"]/.test(reStmt)) break;
+        if (/;\s*$/.test(reStmt)) break;
+        if (/^\s*export\s*\{/.test(reStmt)) {
+          var reBal = 0;
+          for (var reBi = 0; reBi < reStmt.length; reBi++) {
+            if (reStmt[reBi] === '{') reBal++;
+            else if (reStmt[reBi] === '}') reBal--;
+          }
+          if (reBal === 0) break;
+        }
+        il2++; reGuard++;
+        reStmt += '\n' + rawLines[il2];
+      }
+      var reM = reStmt.match(/export\s+(?:\*(?:\s+as\s+[A-Za-z_$][\w$]*)?|\{[\s\S]*?\})\s+from\s+['"]([^'"]+)['"]/);
+      if (reM) {
+        parsed.imports.push({ source: reM[1], names: [], sideEffect: false, reExport: true });
+        continue;
+      }
+      // No `from` clause: a local `export { ... }`, not a re-export —
+      // fall through so the require scan below still sees this line.
     }
     var reqM = rawLine.match(/(?:const|let|var)\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/);
     if (reqM && strippedLine.indexOf('require(') === -1) reqM = null; // inside a string/comment, not real code
@@ -674,10 +784,66 @@ function parseJs(rel, raw) {
   parsed.imports.forEach(function (imp) {
     (imp.names || []).forEach(function (n) { importLocals.add(n.local); });
   });
+  // Brace depth carried across the lines of one `module.exports = {
+  // ... }` region, so the references scan below can tell a top-level
+  // entry name (an export) from a nested or trailing use.
+  var exportObjDepth = 0;
+  var exportObjPrev = false;
   for (var li = 0; li < lines.length; li++) {
     var l = lines[li];
     var lineNo2 = li + 1;
+    var inExportObj = exportObjLines.has(lineNo2);
+    if (inExportObj && !exportObjPrev) exportObjDepth = 0; // fresh region
+    exportObjPrev = inExportObj;
     if (/^\s*import\b/.test(l)) continue;
+    if (inExportObj) {
+      // Depth-aware scan of an export-object line: only a top-level
+      // entry name is an export — a shorthand (`A,`) or a key
+      // (`run:`). A value (`run: foo`), a nested name (`nested: {
+      // B }`), a call (`run: foo()`), and identifiers inside a
+      // function value are real uses and still count (matches the CLI,
+      // which only excludes the shorthand/key names parented by the
+      // export object).
+      var regionDeclared = declaredOnLine[lineNo2] || new Set();
+      var regionSkipIds = /module\.exports\b/.test(l) ? new Set(['module', 'exports']) : null;
+      var regionDepthStart = exportObjDepth;
+      var regionIdRe = /[A-Za-z_$][\w$]*/g;
+      var regionIdM;
+      while ((regionIdM = regionIdRe.exec(l)) !== null) {
+        var regionId = regionIdM[0];
+        if (JS_KEYWORDS.has(regionId)) continue;
+        if (regionDeclared.has(regionId)) continue;
+        if (regionSkipIds && regionSkipIds.has(regionId)) continue;
+        var regionDepth = regionDepthStart;
+        for (var rp = 0; rp < regionIdM.index; rp++) {
+          if (l[rp] === '{') regionDepth++;
+          else if (l[rp] === '}') regionDepth--;
+        }
+        if (regionDepth === 1 && isExportEntryName(l, regionIdM.index, regionId.length)) continue;
+        parsed.references.add(regionId);
+      }
+      // Every call on an export-object line is a real use: a top-level
+      // entry name is never followed by `(`.
+      var regionCallRe = /([A-Za-z_$][\w$]*)\s*\(/g;
+      var regionCm;
+      while ((regionCm = regionCallRe.exec(l)) !== null) {
+        if (JS_KEYWORDS.has(regionCm[1])) continue;
+        if (regionDeclared.has(regionCm[1])) continue;
+        if (regionSkipIds && regionSkipIds.has(regionCm[1])) continue;
+        parsed.calls.add(regionCm[1]);
+      }
+      var regionNewRe = /\bnew\s+([A-Za-z_$][\w$]*)\s*\(/g;
+      var regionNm;
+      while ((regionNm = regionNewRe.exec(l)) !== null) {
+        parsed.calls.add('constructor');
+        parsed.constructed.add(regionNm[1]);
+      }
+      for (var rd = 0; rd < l.length; rd++) {
+        if (l[rd] === '{') exportObjDepth++;
+        else if (l[rd] === '}') exportObjDepth--;
+      }
+      continue;
+    }
     // A const/let/var require line binds names on that line: the binding
     // itself is not a use (otherwise no unused import could ever be
     // flagged). But a member call on the same line IS a use —
@@ -1000,11 +1166,46 @@ function parsePy(rel, raw) {
     // re-exports and flask's `cryptography` import were flagged SAFE.
     return isPackageInit || isCompatShimPy || /#\s*noqa\b/.test(stmt) || (rawStmt && /#\s*noqa\b/.test(rawStmt)) || Boolean(redundantAlias);
   }
-  // An import statement can span lines — a parenthesized from-import
-  // (`from x import (\n a,\n)`) or a backslash continuation
-  // (`import a, \\\n b`). The statement is accumulated until its parens
-  // balance and no trailing backslash remains, and every line it covers
-  // is recorded in importLines so the reference pass below skips it:
+  // A re-export / backwards-compatibility comment marks ONE name, not
+  // the whole statement (mirrors src/parse-py.js): requests' sessions.py
+  // imports REDIRECT_STATI and should_bypass_proxies in one statement,
+  // but only the latter carries the "# re-export" note. The note may sit
+  // on the name's own line, or on the line above the statement: there it
+  // must either name the symbol, or the import must carry a single name
+  // so the note unambiguously refers to it. Returns a map local -> true
+  // for the kept names. (The `# noqa` rule above stays statement-level:
+  // a noqa directive is about the whole import.)
+  var KEEP_COMMENT_RES = [/#\s*re-exports?\b/i, /#.*\bbackwards?[- ]compat/i];
+  function keepCommentNames(rawCovered, rawAbove, names) {
+    var kept = {};
+    var singleName = names.length === 1;
+    function scanLine(line, allowUnnamed) {
+      if (!line) return;
+      if (!KEEP_COMMENT_RES.some(function (re) { return re.test(line); })) return;
+      names.forEach(function (n) {
+        if (n.local === '*') return;
+        var esc = function (s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); };
+        if (allowUnnamed || new RegExp('\\b(' + esc(n.local) + '|' + esc(n.imported) + ')\\b').test(line)) kept[n.local] = true;
+      });
+    }
+    rawCovered.forEach(function (line) { scanLine(line, false); });
+    scanLine(rawAbove, singleName);
+    return kept;
+  }
+  // Split one import record by kept names, mirroring the CLI: the kept
+  // names form a re-export record, the rest keep the statement's own
+  // verdict (noqa / shim / redundant alias). Without the split, one
+  // noted name would whitelist genuinely dead siblings.
+  function pushImportSplit(base, names, kept, stmtReExport) {
+    var keptNames = names.filter(function (n) { return kept[n.local]; });
+    var restNames = names.filter(function (n) { return !kept[n.local]; });
+    if (keptNames.length > 0 && restNames.length > 0) {
+      parsed.imports.push(Object.assign({}, base, { names: keptNames, reExport: true }));
+      parsed.imports.push(Object.assign({}, base, { names: restNames, reExport: stmtReExport }));
+    } else {
+      parsed.imports.push(Object.assign({}, base, { names: names, reExport: stmtReExport || keptNames.length > 0 }));
+    }
+  }
   // otherwise the names on continuation lines would count as references
   // to themselves and a dead multi-line import would be silently missed
   // (and a trailing backslash would be recorded as a bogus import named
@@ -1029,7 +1230,7 @@ function parsePy(rel, raw) {
       covered.push(ii + 1);
     }
     covered.forEach(function (n) { importLines[n] = true; });
-    return { stmt: stmt, next: ii, rawStmt: rawLinesPy.slice(covered[0] - 1, covered[covered.length - 1]).join('\n') };
+    return { stmt: stmt, next: ii, firstLine: covered[0], rawStmt: rawLinesPy.slice(covered[0] - 1, covered[covered.length - 1]).join('\n') };
   }
   function fromNames(text) {
     var names = [];
@@ -1056,10 +1257,11 @@ function parsePy(rel, raw) {
       var acc = accumulateImport(ii, fm[3]);
       ii = acc.next;
       var fn = fromNames(acc.stmt);
-      parsed.imports.push({
-        source: fm[2] || '', names: fn.names, sideEffect: false, reExport: reExportPy(acc.stmt, fn.redundantAlias, acc.rawStmt),
+      var keptFrom = keepCommentNames(acc.rawStmt.split('\n'), rawLinesPy[acc.firstLine - 2], fn.names);
+      pushImportSplit({
+        source: fm[2] || '', sideEffect: false,
         fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
-      });
+      }, fn.names, keptFrom, reExportPy(acc.stmt, fn.redundantAlias, acc.rawStmt));
       continue;
     }
     var im2 = il.match(/^\s*import\s+(.+)$/);
@@ -1077,10 +1279,11 @@ function parsePy(rel, raw) {
         if (bits[1] && local2 === mod) redundantAlias2 = true;
         names3.push({ imported: mod.split('.')[0], local: local2, kind: 'named', full: mod });
       });
-      parsed.imports.push({
+      var keptPlain = keepCommentNames(acc2.rawStmt.split('\n'), rawLinesPy[acc2.firstLine - 2], names3);
+      pushImportSplit({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
-        names: names3, sideEffect: false, reExport: reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt), fromImport: false, relative: false, level: 0,
-      });
+        sideEffect: false, fromImport: false, relative: false, level: 0,
+      }, names3, keptPlain, reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt));
     }
   }
 

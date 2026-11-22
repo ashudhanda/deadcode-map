@@ -27,6 +27,19 @@ function byCategory(findings, file, category) {
   return findings.find((f) => f.file.endsWith(file) && f.category === category && !f.symbol);
 }
 
+test('js-file-stringrefs: a local name matching strings elsewhere does not keep its file alive', () => {
+  const f = findingsFor('js-file-stringrefs');
+  // The file is genuinely dead: no importers, and neither the file nor
+  // its top-level component is referenced anywhere. Its locals (`url`,
+  // `data`) appear in strings elsewhere, but locals are not the file's
+  // public names — before the fix they kept the file at REVIEW (umami's
+  // SettingsButton.tsx was kept alive the same way, by its local `url`
+  // matching 116 files).
+  assert.equal(byCategory(f, 'src/unused-widget.js', 'file').grade, 'SAFE');
+  // The exported-but-unimported component itself stays REVIEW.
+  assert.equal(bySymbol(f, 'src/unused-widget.js', 'UnusedWidget').grade, 'REVIEW');
+});
+
 test('js-basic: live symbols are never flagged', () => {
   const f = findingsFor('js-basic');
   for (const [file, symbol] of [
@@ -353,7 +366,22 @@ test('py-reexports: redundant aliases, noqa imports and compat shims are re-expo
   for (const symbol of ['json', 'socket', 'OrderedDict', 'urlparse']) {
     assert.equal(bySymbol(f, 'pkg/compat.py', symbol), undefined, `${symbol} in a compat shim is a re-export, never a dead import`);
   }
-  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+  // An explicit re-export or backwards-compatibility comment on the
+  // import line marks it intentional (requests keeps to_native_string
+  // "for backwards compatibility" and should_bypass_proxies as a
+  // "re-export for external consumers"): never a dead import. The
+  // comment may sit on a middle line of a multi-line import or on the
+  // line directly above it.
+  assert.equal(bySymbol(f, 'pkg/core.py', 'Counter'), undefined, 'Counter is re-exported by comment, never a dead import');
+  assert.equal(bySymbol(f, 'pkg/core.py', 'OrderedDict'), undefined, 'OrderedDict is kept for backwards compatibility, never a dead import');
+  // The genuinely dead import is still found.
+  assert.equal(bySymbol(f, 'pkg/core.py', 'os').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:pkg/core.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
 });
 
 test('js-reexports: export { X } re-exports an import, and .js imports resolve to .ts files', () => {
@@ -588,6 +616,31 @@ test('js-cascade: symbols used only by dead code are dead in the same run', () =
   for (const s of safe) {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('same-file cascade: a helper used only by a dead sibling is dead too (JS + Python)', () => {
+  for (const [dir, file, dead] of [
+    ['js-same-file-cascade', 'src/cascade.js', ['deadOuter', 'deadInner', 'selfOnly', 'ping', 'pong']],
+    ['py-same-file-cascade', 'cascade.py', ['_dead_outer', '_dead_inner', '_self_only', '_ping', '_pong']],
+  ]) {
+    const f = findingsFor(dir);
+    for (const symbol of dead) {
+      assert.equal(bySymbol(f, file, symbol).grade, 'SAFE', `${dir}: ${symbol} is used only by dead code`);
+    }
+    // Live helpers are never flagged: called by a live function, called
+    // at the top level, or aliased by a top-level variable initializer.
+    for (const symbol of (dir.startsWith('js')
+      ? ['liveOuter', 'liveInner', 'topCalled', 'topHelper', 'aliased', 'alias']
+      : ['live_outer', 'live_inner', 'top_called', 'top_helper', 'aliased', 'alias'])) {
+      assert.equal(bySymbol(f, file, symbol), undefined, `${dir}: ${symbol} must not be flagged`);
+    }
+    const safe = f.filter((x) => x.grade === 'SAFE');
+    const expectedSafe = new Set(dead.map((s) => `function:${file}:${s}`));
+    for (const s of safe) {
+      const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+      assert.ok(expectedSafe.has(key), `${dir}: unexpected SAFE finding (false positive): ${key}`);
+    }
   }
 });
 

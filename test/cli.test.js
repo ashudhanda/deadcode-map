@@ -146,3 +146,66 @@ test('CLI: --prove skips cleanly when there is no test command', () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /skipped|no test command/i);
 });
+
+test('CLI: --json report inside the repo is not scanned on the next run', () => {
+  const dir = copyFixture('js-basic');
+  const jsonPath = path.join(dir, 'report.json');
+  // Baseline: no report file on disk at all (--json - writes to stdout).
+  const base = run(dir, ['--json', '-', '--no-cache']);
+  assert.equal(base.status, 0, base.stderr);
+  const baseCount = JSON.parse(base.stdout).findings.length;
+  assert.ok(baseCount > 0, 'fixture must have findings');
+  const readCount = () => JSON.parse(fs.readFileSync(jsonPath, 'utf8')).findings.length;
+  const r1 = run(dir, ['--json', jsonPath, '--no-cache']);
+  assert.equal(r1.status, 0, r1.stderr);
+  const n1 = readCount();
+  const r2 = run(dir, ['--json', jsonPath, '--no-cache']);
+  assert.equal(r2.status, 0, r2.stderr);
+  const n2 = readCount();
+  assert.equal(n1, baseCount, 'first run with a report file must match the no-file run');
+  assert.equal(n2, n1, 'second run must match the first: the report must not count as references');
+});
+
+test('CLI: --map file inside the repo is not scanned on the next run', () => {
+  const dir = copyFixture('js-basic');
+  const mapPath = path.join(dir, 'deadcode-map.html');
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-map-out-'));
+  const r1Path = path.join(outside, 'r1.json');
+  const r2Path = path.join(outside, 'r2.json');
+  const r1 = run(dir, ['--map', mapPath, '--json', r1Path, '--no-cache']);
+  assert.equal(r1.status, 0, r1.stderr);
+  const n1 = JSON.parse(fs.readFileSync(r1Path, 'utf8')).findings.length;
+  const r2 = run(dir, ['--map', mapPath, '--json', r2Path, '--no-cache']);
+  assert.equal(r2.status, 0, r2.stderr);
+  const n2 = JSON.parse(fs.readFileSync(r2Path, 'utf8')).findings.length;
+  assert.ok(n1 > 0, 'fixture must have findings');
+  assert.equal(n2, n1, 'second run must match the first: the map must not count as references');
+});
+
+test('CLI: a user file sharing the --json output name is still scanned', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-jsonself-name-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 't', main: 'src/index.js' }));
+  fs.writeFileSync(path.join(dir, 'src', 'index.js'), "require('./a');\nconsole.log('hi');\n");
+  fs.writeFileSync(path.join(dir, 'src', 'a.js'),
+    'function deadOne() { return 1; }\n'
+    + 'function deadTwo() { return 2; }\n'
+    + 'module.exports = {};\n');
+  // Same basename as the tool output below, different directory: a
+  // real user file that must keep being scanned.
+  fs.writeFileSync(path.join(dir, 'sub', 'report.json'), JSON.stringify({ note: 'deadTwo' }));
+  const jsonPath = path.join(dir, 'report.json');
+  const bySymbol = (findings, symbol) => findings.find((f) => f.symbol === symbol);
+  const r1 = run(dir, ['--json', jsonPath, '--no-cache']);
+  assert.equal(r1.status, 0, r1.stderr);
+  const f1 = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).findings;
+  const r2 = run(dir, ['--json', jsonPath, '--no-cache']);
+  assert.equal(r2.status, 0, r2.stderr);
+  const f2 = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).findings;
+  assert.equal(bySymbol(f1, 'deadOne')?.grade, 'SAFE', 'unreferenced function must stay SAFE');
+  assert.equal(bySymbol(f2, 'deadOne')?.grade, 'SAFE', 'tool report must not resurrect deadOne on run 2');
+  assert.equal(bySymbol(f1, 'deadTwo')?.grade, 'REVIEW', 'mention in the user report.json must keep deadTwo at REVIEW');
+  assert.equal(bySymbol(f2, 'deadTwo')?.grade, 'REVIEW');
+  assert.equal(f2.length, f1.length, 'finding counts must be identical across runs');
+});

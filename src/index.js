@@ -8,7 +8,7 @@ const { discover } = require('./discover');
 const { analyze } = require('./graph');
 const { gradeFindings, loadFrameworks } = require('./confidence');
 const { gitInfo } = require('./git');
-const { parseCoverageXml } = require('./coverage');
+const { parseCoverage } = require('./coverage');
 const {
   computeConfigHash,
   computeContentHash,
@@ -83,6 +83,13 @@ function manifestHashes(discovery) {
  *   opts.cacheStats  — print hit/miss stats; implies --cache (--cache-stats)
  *   opts.cacheLocation — explicit cache file path (tests / scripts)
  *
+ * Output options on `opts`:
+ *   opts.excludeFiles — exact file paths to leave out of discovery
+ *     (absolute, or relative to the scanned root). The CLI passes the
+ *     resolved --json / --map output paths here, so a report or map
+ *     written inside the scanned root is never scanned on the next
+ *     run. Applies whether or not --cache is on.
+ *
  * Default: OFF. A scan is read-only by default and writes nothing
  * into the scanned repo unless the user opts in with --cache.
  */
@@ -95,6 +102,13 @@ function buildCacheContext(root, discovery, packs, opts) {
   const configHash = computeConfigHash({
     entries,
     includeFixtures: Boolean(opts.includeFixtures),
+    // Coverage affects grades (a covered body line demotes SAFE to
+    // REVIEW), so the coverage options join the config hash: changing
+    // them re-parses instead of reusing parses graded under the old
+    // coverage. The coverage file itself is re-read fresh every run
+    // (see scan()), so a warm run still reflects current coverage.
+    coveragePath: opts.coveragePath || null,
+    noCoverage: Boolean(opts.noCoverage),
     packs: packs.map((p) => p._file || ''),
     packContents: sha256(JSON.stringify(packs)),
     manifests: manifestHashes(discovery),
@@ -127,7 +141,12 @@ function scan(root, opts) {
     for (const w of cacheCtx.warnings) console.error(`deadcode-map cache: ${w}`);
   }
   const git = gitInfo(root, discovery.codeFiles);
-  const coverage = parseCoverageXml(root);
+  // Coverage is re-read fresh every run (never cached): it is evidence
+  // about the current code, and a stale coverage file can only demote
+  // SAFE to REVIEW, never invent a SAFE. --coverage points at an
+  // explicit Cobertura XML or lcov file; --no-coverage ignores any
+  // coverage file in the repo.
+  const coverage = opts && opts.noCoverage ? null : parseCoverage(root, opts && opts.coveragePath);
   const findings = gradeFindings({
     root: discovery.root, discovery, graph, git, coverage, packs,
     isLibrary: discovery.isLibrary,

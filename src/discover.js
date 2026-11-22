@@ -204,7 +204,21 @@ function setupHasName(file, text) {
 
 function discover(root, opts) {
   const absRoot = path.resolve(root);
-  const allFiles = walk(absRoot, [], Boolean(opts && opts.includeFixtures));
+  let allFiles = walk(absRoot, [], Boolean(opts && opts.includeFixtures));
+  // Tool-generated output files must never be scanned: a report or map
+  // written inside the scanned root on one run would otherwise count
+  // as string references on the next run and change the findings (the
+  // same reason the cache file is filtered in src/index.js). Only the
+  // exact resolved paths in opts.excludeFiles are dropped — never a
+  // directory, never a same-named file elsewhere. Paths need not exist
+  // yet: the output file is written after the scan, so the first run
+  // already excludes the path the second run finds on disk. A path
+  // outside the scanned root matches nothing and changes nothing.
+  const excludeFiles = opts && Array.isArray(opts.excludeFiles) ? opts.excludeFiles : [];
+  if (excludeFiles.length) {
+    const excluded = new Set(excludeFiles.map((p) => path.resolve(absRoot, p)));
+    allFiles = allFiles.filter((f) => !excluded.has(f));
+  }
   const codeFiles = allFiles.filter(isCodeFile);
   const textFiles = allFiles.filter((f) => ALL_EXTS.has(path.extname(f).toLowerCase()));
   const pkgPath = path.join(absRoot, 'package.json');

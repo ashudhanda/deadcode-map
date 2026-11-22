@@ -41,6 +41,33 @@ function rangeOf(node) {
   };
 }
 
+// tree-sitter 0.21's node binding rejects string inputs of 32 KiB or
+// more (parse() throws "Invalid argument" at exactly 32768 bytes), so
+// a large file failed to parse at all and was silently treated as live:
+// fastapi's 271 KiB routing.py was invisible, none of its imports
+// existed, and everything it alone used looked dead. Parse through the
+// callback form instead, which has no size limit: tree-sitter asks for
+// slices by offset. The callback receives UTF-16 code-unit offsets
+// (the binding works in JS string units throughout — node positions
+// are UTF-16 offsets too), so slices come from the JS string, NOT from
+// a UTF-8 buffer: slicing the buffer by those offsets misaligns the
+// stream after any multi-byte character and corrupts the parse. The
+// callback must return chunks under 32 KiB (the same limit applies to
+// returned strings), hence 8 KiB slices; a chunk end that would split
+// a surrogate pair is pulled back by one unit. The callback form is
+// used for every file, small or large, so the behaviour is uniform.
+const PARSE_CHUNK = 8192;
+function parseSource(parser, src) {
+  return parser.parse((index) => {
+    let end = Math.min(index + PARSE_CHUNK, src.length);
+    if (end > index && end < src.length) {
+      const prev = src.charCodeAt(end - 1);
+      if (prev >= 0xD800 && prev <= 0xDBFF) end -= 1;
+    }
+    return src.slice(index, end);
+  });
+}
+
 function text(node, src) {
   return src.slice(node.startIndex, node.endIndex);
 }
@@ -73,7 +100,7 @@ function sameNode(a, b) {
 
 function parseJsTs(filePath, src, ext) {
   const parser = parserFor(ext);
-  const tree = parser.parse(src);
+  const tree = parseSource(parser, src);
   const root = tree.rootNode;
 
   const result = {
@@ -112,10 +139,26 @@ function parseJsTs(filePath, src, ext) {
       a = a.parent;
       steps++;
     }
+    // A definition nested inside a function body is a local of that
+    // function (a nested function, a variable assigned in a body): it
+    // is scoped to its enclosing function, not to the module. The
+    // cascade must not flag it merely because its enclosing function
+    // is dead — the local is part of that function's implementation,
+    // and deleting the function deletes the local with it. Walk up
+    // past statement wrappers to the nearest function-like ancestor;
+    // a class boundary or the program ends the walk (a method's
+    // locals are still locals — the method itself is found first).
+    let enclosing = node.parent;
+    let isLocal = false;
+    while (enclosing) {
+      if (['function_declaration', 'function_expression', 'arrow_function', 'method_definition'].includes(enclosing.type)) { isLocal = true; break; }
+      if (['program', 'class_declaration', 'abstract_class_declaration', 'export_statement'].includes(enclosing.type)) break;
+      enclosing = enclosing.parent;
+    }
     result.definitions.push({
       name, kind, exported: false, isDefault: false,
       range: rangeOf(node), startLine: node.startPosition.row + 1,
-      endLine: node.endPosition.row + 1, decorators: decs, ambient, ...(extra || {}),
+      endLine: node.endPosition.row + 1, decorators: decs, ambient, local: isLocal, ...(extra || {}),
     });
   };
 
@@ -324,6 +367,16 @@ function parseJsTs(filePath, src, ext) {
   // export_statement, so it was already collected; the default flag above covers it.
 
   // --- pass 2: references, calls, strings, dynamic imports ---
+  // Reference occurrences with positions, for per-definition scopes
+  // (same-file cascade): which definition body each reference sits in.
+  // `references` stays the flat file-level set; occurrences are the
+  // positioned twin used to build each definition's `uses` list.
+  const occurrences = [];
+  const addRef = (name, node, startIndex) => {
+    if (!name) return;
+    result.references.add(name);
+    occurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
+  };
   // Names bound by imports, for the export_specifier rule below.
   const importLocals = new Set();
   for (const imp of result.imports) {
@@ -368,7 +421,7 @@ function parseJsTs(filePath, src, ext) {
 
   walk(root, (node) => {
     if (node.type === 'identifier') {
-      if (!isDefinitionSite(node)) result.references.add(text(node, src));
+      if (!isDefinitionSite(node)) addRef(text(node, src), node);
       else if (node.parent && node.parent.type === 'export_specifier'
         && sameNode(childByField(node.parent, 'name'), node)
         && importLocals.has(text(node, src))) {
@@ -376,7 +429,7 @@ function parseJsTs(filePath, src, ext) {
         // a use of the imported binding, not a definition. (A plain
         // `export { localFn }` is NOT added — the local definition stays
         // REVIEW as a public export instead of going invisible.)
-        result.references.add(text(node, src));
+        addRef(text(node, src), node);
       }
     } else if (node.type === 'type_identifier') {
       // Type positions are uses, not declarations: `declare const client:
@@ -384,16 +437,16 @@ function parseJsTs(filePath, src, ext) {
       // `request<User, CustomResponse>()`, `interface P { x: Foo }`.
       // The declaration's own name (`type A = ...`, `interface I {}`)
       // is a type_identifier too — isDefinitionSite excludes it.
-      if (!isDefinitionSite(node)) result.references.add(text(node, src));
+      if (!isDefinitionSite(node)) addRef(text(node, src), node);
     } else if (node.type === 'property_identifier') {
       // A method/field/property declaration's own name is a definition,
       // not a use: without this, every method looked used by its own
       // declaration line and methods never got findings at all (e.g. a
       // class's neverCalled() was invisible). Object-literal keys and
       // member-access names still count as references.
-      if (!isPropertyDefinitionSite(node)) result.references.add(text(node, src));
+      if (!isPropertyDefinitionSite(node)) addRef(text(node, src), node);
     } else if (node.type === 'jsx_identifier' || node.type === 'jsx_namespace_name') {
-      result.references.add(text(node, src));
+      addRef(text(node, src), node);
     } else if (node.type === 'shorthand_property_identifier') {
       // { graph, findings } in an object literal IS a use of those variables.
       // Except in `module.exports = { foo }`, where it is an export, not a use.
@@ -401,7 +454,7 @@ function parseJsTs(filePath, src, ext) {
       const assign = obj && obj.parent;
       const isModuleExports = assign && assign.type === 'assignment_expression'
         && (() => { const left = childByField(assign, 'left'); return left && /^module\.exports|^exports\./.test(text(left, src)); })();
-      if (!isModuleExports) result.references.add(text(node, src));
+      if (!isModuleExports) addRef(text(node, src), node);
     } else if (node.type === 'string' || node.type === 'template_string') {
       result.strings.push(text(node, src));
     } else if (node.type === 'new_expression') {
@@ -415,7 +468,7 @@ function parseJsTs(filePath, src, ext) {
       // it can never create a SAFE finding.
       const ctor = node.namedChild(0);
       const forClass = ctor ? text(ctor, src).split('.').pop() : null;
-      result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, forClass });
+      result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, forClass });
     } else if (node.type === 'call_expression') {
       const fn = childByField(node, 'function');
       if (fn && fn.type === 'import') {
@@ -437,8 +490,8 @@ function parseJsTs(filePath, src, ext) {
         // A decorator call (`@app.command()`) is not a call to a local
         // function of the same name — see insideDecorator above.
         if (!insideDecorator(node)) {
-          result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1 });
-          result.references.add(base);
+          result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1, startIndex: node.startIndex });
+          addRef(base, fn);
         }
         if (base === 'require') {
           const args = firstNamed(node, 'arguments');
@@ -510,6 +563,53 @@ function parseJsTs(filePath, src, ext) {
     seen.add(k);
     return true;
   });
+
+  // --- pass 4: per-definition reference scopes (same-file cascade) ---
+  // A reference belongs to the innermost definition whose range
+  // contains it (a method body beats its class, a nested function beats
+  // its outer function); references outside every definition are
+  // top-level uses — module code that runs on import. Calls contribute
+  // their callee name the same way (a `new Foo()` inside a function is
+  // a use of Foo and of `constructor` by that function, not by the
+  // file). A call without a recorded position is treated as top-level
+  // (fail-open: it keeps the name alive). The confidence engine uses
+  // these scopes to decide whether a same-file use comes from live
+  // code: a name used only inside a dead definition is dead too, and a
+  // name used only by itself (pure recursion) has no live user at all.
+  // `uses` and `topLevelUses` are plain sorted arrays, so the parse
+  // cache serialises them unchanged.
+  for (const c of result.calls) {
+    occurrences.push({ name: c.name, startIndex: c.startIndex !== undefined ? c.startIndex : -1 });
+  }
+  // Variable definitions are NOT scopes: an initializer runs in the
+  // enclosing scope, not when the variable is read (`const x =
+  // helper()` at module level calls helper() on import, and
+  // `_first = _second = _helper` aliases _helper at import). So
+  // references inside a variable's range belong to the enclosing
+  // definition (or the top level), never to the variable itself — a
+  // dead variable must not take its initializer's references down with
+  // it. Function-valued variables are kind 'function', not 'variable',
+  // so their bodies still scope to them.
+  const scopeDefs = result.definitions.filter((d) => d.kind !== 'variable');
+  const defsByStart = [...scopeDefs].sort((a, b) => a.range.startIndex - b.range.startIndex);
+  const usesByDef = new Map();
+  const topLevelUses = new Set();
+  for (const occ of occurrences) {
+    if (occ.startIndex < 0) { topLevelUses.add(occ.name); continue; }
+    let best = null;
+    for (const d of defsByStart) {
+      if (d.range.startIndex > occ.startIndex) break; // sorted: no later def can contain it
+      if (occ.startIndex < d.range.endIndex) {
+        if (!best || (d.range.endIndex - d.range.startIndex) < (best.range.endIndex - best.range.startIndex)) best = d;
+      }
+    }
+    if (best) {
+      if (!usesByDef.has(best)) usesByDef.set(best, new Set());
+      usesByDef.get(best).add(occ.name);
+    } else topLevelUses.add(occ.name);
+  }
+  for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
+  result.topLevelUses = [...topLevelUses].sort();
 
   return result;
 }

@@ -19,6 +19,7 @@
 const fs = require('fs');
 const path = require('path');
 const { mentionRegExp } = require('./graph');
+const { coverageForSymbol, coverageForSymbolBody } = require('./coverage');
 
 function loadFrameworks(dir) {
   const packs = [];
@@ -98,11 +99,12 @@ function gradeFindings(ctx) {
   // pass carry evidence.cascade = { iteration, via: [dead files] } so the
   // report can group them under their dead root.
   //
-  // Limitation, stated honestly: usage is tracked per file, not per
-  // symbol, so a symbol used ONLY by another dead symbol in the same
-  // live file is not caught — only usage from dead *files* cascades.
-  // Same-file cascade needs per-definition reference scopes, which the
-  // parsers do not record yet.
+  // Same-file cascade runs inside each pass too: the per-definition
+  // reference scopes (see gradeOnce) mark a symbol live only when a
+  // live definition in the same file uses it, so a helper used only by
+  // a dead sibling is dead in the same pass. The outer fixpoint still
+  // matters across files: a symbol whose only caller sat in a file
+  // that became dead this iteration loses that caller next iteration.
   const deadFiles = new Set(); // abs paths graded SAFE as files
   const MAX_ITERATIONS = 6;
   let iteration = 0;
@@ -152,6 +154,7 @@ function gradeFindings(ctx) {
       gitLastCommit: gitInfo ? gitInfo.lastCommit : null,
       gitCommits: gitInfo ? gitInfo.commits : null,
       coveragePct: covFile ? covFile.pct : null,
+      coverageSource: covFile ? (covFile.source || null) : null,
     };
 
     // ---- Dead file ----
@@ -177,9 +180,16 @@ function gradeFindings(ctx) {
         const mentionedElsewhere = [...stringRefs].filter((f) => f !== file && !deadFiles.has(f));
         // A file is also string-referenced when any of its symbols is
         // mentioned by name elsewhere (e.g. a config naming a handler).
+        // Only top-level symbols count: a local (a `const url` inside a
+        // component) is not the file's public name, and its mentions in
+        // unrelated files are coincidences — umami's SettingsButton.tsx
+        // was kept at REVIEW by its local `url` matching 116 files,
+        // though neither the file nor the component is referenced
+        // anywhere. Locals never keep a file alive.
         const symbolStringRefs = [];
         const deadSymbolStringRefs = [];
         for (const d of parsed.definitions) {
+          if (d.local) continue;
           const hits = [...filesMentioning(d.name)];
           for (const h of hits) {
             if (h === file) continue;
@@ -198,13 +208,20 @@ function gradeFindings(ctx) {
         } else {
           // Public API of a published library: a file with no importers
           // could still be part of the public surface.
-          const grade = kind === 'library' ? 'REVIEW' : 'SAFE';
+          // Coverage demotes a dead file the same way it demotes a dead
+          // symbol (see below): lines executed with no importers means
+          // something runs this file (a script entry, dynamic loading,
+          // or stale coverage data) — REVIEW, never SAFE.
+          const covered = covFile && covFile.pct > 0;
+          const grade = kind === 'library' || covered ? 'REVIEW' : 'SAFE';
           const finding = {
             category: 'file', file: rel, symbol: null, grade,
             startLine: 1, endLine: null, size: info.size,
             reason: kind === 'library'
               ? 'no importers, but this is a published library — public surface, review before deleting'
-              : 'no importers, not an entry point, not referenced by name anywhere',
+              : covered
+                ? `no importers, but ${covFile.pct}% of its lines are covered by tests — something executes this file`
+                : 'no importers, not an entry point, not referenced by name anywhere',
             evidence: { importers: 0, reachable: false, stringRefs: [], ...evidenceBase },
             deleteDiff: `delete ${rel} (${info.size} bytes)`,
           };
@@ -236,6 +253,88 @@ function gradeFindings(ctx) {
     const importLocals = new Set();
     for (const imp of parsed.imports) for (const n of imp.names || []) importLocals.add(n.local);
     const categoryOf = (kind) => ({ function: 'function', class: 'class', type: 'type', variable: 'variable', method: 'method' }[kind] || 'function');
+    // ---- Same-file cascade: per-definition reference scopes ----
+    // A symbol is kept alive by same-file use only when the use comes
+    // from live code. The parsers record, per definition, the names
+    // referenced inside its body (`uses`) plus the names referenced by
+    // top-level code (`topLevelUses`, which runs on import). Liveness
+    // is reachability from live roots over that definition graph:
+    // top-level uses, live cross-file uses, framework-kept definitions
+    // (they run via framework dispatch), dunder methods (they run
+    // implicitly when their class is constructed), and exported
+    // definitions of a library / public-API file (downstream code may
+    // call them, and through them their helpers). A name used only
+    // inside another dead definition — or only by itself, as in pure
+    // recursion — is not reachable and is graded on its own evidence.
+    // Reachability also catches dead cycles (mutual recursion with no
+    // entry point), which a purely iterative cascade cannot see. When
+    // the parsers predate scopes (stale cache), fall back to the old
+    // file-level same-file flag — fail-open, never a new SAFE.
+    // Limitation, stated honestly: names are matched, not bindings, so
+    // a parameter or local that shadows a top-level name still counts
+    // as a use of it (a false negative, never a false SAFE).
+    const scopes = Array.isArray(parsed.topLevelUses);
+    let sameFileLive = null;
+    if (scopes) {
+      const defUses = new Map(); // name -> Set<used names>
+      for (const d of parsed.definitions) {
+        if (!defUses.has(d.name)) defUses.set(d.name, new Set());
+        for (const u of d.uses || []) defUses.get(d.name).add(u);
+      }
+      // A method is a conduit too: the tool deliberately never proves
+      // a method dead (methods are REVIEW at most — objects, tests and
+      // frameworks call them through dispatch the static graph cannot
+      // see), so a method's callees must not be provable dead through
+      // it either. Without this, every helper called only from methods
+      // of a live class looked dead: Click's _normalize_opt (called
+      // from Parser methods), FastAPI's _dependency_semaphores (read in
+      // a method), Flask's _got_registered_once, axios's normalizeDate
+      // (called from a VitePress transform method) all went SAFE.
+      // The cost is false negatives: a helper used only by methods of
+      // a dead class stays hidden. That is the safe direction, and a
+      // future step can narrow it by tracking the enclosing class
+      // (a method is a conduit only when its class is live).
+      const keepDef = (d) => keepSymbols
+        || d.kind === 'method'
+        || frameworkKeepSymbol(rel, d.name, d.decorators, packs).length > 0
+        || d.frameworkField || d.ambient || overloadedNames.has(d.name)
+        || (parsed.dunder && parsed.dunder.has(d.name))
+        || (d.kind === 'method' && d.name.startsWith('__'))
+        || (d.exported && (kind === 'library' || kind === 'unknown' || (reExportedFiles && reExportedFiles.has(file))));
+      // Live roots: top-level code (runs on import) and live
+      // cross-file uses. A kept definition is a CONDUIT, not a live
+      // root: it still gets its own KEEP / REVIEW finding, but the
+      // names it uses stay alive through it (a framework-dispatched
+      // handler really runs, and a public-API function may be called
+      // by downstream code). So liveness is reachability from the live
+      // roots UNION reachability from the kept definitions, minus the
+      // kept definitions themselves unless a live root reaches them.
+      // Without that last step, every exported-but-never-imported
+      // function vanished from the report instead of being REVIEW.
+      const liveRoots = new Set(parsed.topLevelUses || []);
+      for (const [name, u] of usageMap) {
+        const liveImporters = [...u.importedBy].filter((f) => !deadFiles.has(f));
+        const liveCallers = [...u.calledIn].filter((f) => f !== file && !deadFiles.has(f));
+        if (liveImporters.length > 0 || liveCallers.length > 0) liveRoots.add(name);
+      }
+      const keepNames = new Set();
+      for (const d of parsed.definitions) if (keepDef(d)) keepNames.add(d.name);
+      const bfs = (seeds) => {
+        const seen = new Set();
+        const queue = [...seeds];
+        while (queue.length) {
+          const cur = queue.pop();
+          if (seen.has(cur)) continue;
+          seen.add(cur);
+          for (const nxt of defUses.get(cur) || []) if (!seen.has(nxt)) queue.push(nxt);
+        }
+        return seen;
+      };
+      const live = bfs(liveRoots);
+      const viaKept = bfs(keepNames);
+      sameFileLive = new Set([...live, ...viaKept]);
+      for (const name of keepNames) if (!live.has(name)) sameFileLive.delete(name);
+    }
     for (const def of parsed.definitions) {
       if (importLocals.has(def.name)) continue;
       // Methods belong to a class; a method with no callers is a candidate
@@ -261,7 +360,16 @@ function gradeFindings(ctx) {
       const deadCallers = [...usage.calledIn].filter((f) => deadFiles.has(f));
       // A call from the symbol's own file is same-file use, not an external caller.
       const calledElsewhere = calledIn.filter((f) => f !== file);
-      const sameFileUse = usage.sameFile || calledIn.includes(file);
+      // Locals (nested functions, variables assigned in a body) keep
+      // the old file-level rule: a local is part of its enclosing
+      // function's implementation, so any reference in the file keeps
+      // it alive — the cascade must not flag it merely because its
+      // enclosing function is dead. Module- and class-level symbols
+      // use the reachability scopes above (or the old rule when the
+      // parsers predate scopes).
+      const sameFileUse = def.local
+        ? (usage.sameFile || calledIn.includes(file))
+        : (scopes ? sameFileLive.has(def.name) : (usage.sameFile || calledIn.includes(file)));
       // Same-file use is real use: a symbol called or referenced in its
       // own file is alive, full stop. It used to be flagged REVIEW as
       // "unexport-to-local", but that turned every module's own helpers
@@ -278,7 +386,7 @@ function gradeFindings(ctx) {
       const stringElsewhere = [...stringHits].filter((f) => f !== file && !deadFiles.has(f));
       const deadStringRefs = [...stringHits].filter((f) => deadFiles.has(f));
       const cov = coverage
-        ? require('./coverage').coverageForSymbol(coverage, file, def.startLine, def.endLine)
+        ? coverageForSymbol(coverage, file, def.startLine, def.endLine)
         : null;
       const snippet = info.src.slice(def.range.startIndex, Math.min(def.range.endIndex, def.range.startIndex + 400));
 
@@ -288,10 +396,13 @@ function gradeFindings(ctx) {
         startLine: def.startLine, endLine: def.endLine,
         size: def.range.endIndex - def.range.startIndex,
         evidence: {
+          // evidenceBase first: its coveragePct is the FILE pct, and the
+          // symbol pct below must win for a symbol finding (the old
+          // order silently showed the file pct for every symbol).
+          ...evidenceBase,
           importers: importedBy.length, callers: calledElsewhere.length,
           stringRefs: stringElsewhere.map((f) => path.relative(root, f)),
           exported: def.exported, coveragePct: cov ? cov.pct : null,
-          ...evidenceBase,
         },
         deleteDiff: snippet,
       };
@@ -413,8 +524,26 @@ function gradeFindings(ctx) {
       }
       // Unexported, 0 references, 0 string refs, no dynamic use — or an
       // exported symbol in an app repo, where there is no published
-      // public surface to protect: SAFE.
-      add(withCascade({ ...common, grade: 'SAFE', reason: 'unexported, 0 callers, 0 references, 0 string mentions' }));
+      // public surface to protect: SAFE — unless coverage says
+      // otherwise. Coverage is a second, independent signal: a symbol
+      // with no static callers whose body lines were executed (tests,
+      // framework dispatch, dynamic calls the graph cannot see) is not
+      // provably dead. Coverage can only demote SAFE to REVIEW, never
+      // promote: stale or partial coverage data can add REVIEWs, never
+      // false SAFEs. The check uses body lines only
+      // (coverageForSymbolBody): a `def` / `function` / `class` line
+      // executes when its module is imported, so counting it would
+      // demote every function in an imported module. One-line
+      // definitions have no body lines and are never demoted on
+      // coverage.
+      const bodyCov = coverage
+        ? coverageForSymbolBody(coverage, file, def.startLine, def.endLine)
+        : null;
+      if (bodyCov && bodyCov.pct > 0) {
+        add({ ...common, grade: 'REVIEW', reason: `0 static callers, but ${bodyCov.pct}% of its body lines are covered by tests — something executes it, likely dynamically or via a framework` });
+      } else {
+        add(withCascade({ ...common, grade: 'SAFE', reason: def.exported ? 'exported in an app repo, 0 callers, 0 references, 0 string mentions' : 'unexported, 0 callers, 0 references, 0 string mentions' }));
+      }
     }
 
     // ---- Dead imports ----

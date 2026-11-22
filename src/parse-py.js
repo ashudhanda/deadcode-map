@@ -28,6 +28,21 @@ function rangeOf(node) {
   };
 }
 
+// See parse-js.js parseSource/text: the 32 KiB string limit, the
+// callback form for every file, UTF-16 offsets throughout, and the
+// surrogate-pair-safe chunk end.
+const PARSE_CHUNK = 8192;
+function parseSource(parser, src) {
+  return parser.parse((index) => {
+    let end = Math.min(index + PARSE_CHUNK, src.length);
+    if (end > index && end < src.length) {
+      const prev = src.charCodeAt(end - 1);
+      if (prev >= 0xD800 && prev <= 0xDBFF) end -= 1;
+    }
+    return src.slice(index, end);
+  });
+}
+
 function text(node, src) {
   return src.slice(node.startIndex, node.endIndex);
 }
@@ -54,7 +69,7 @@ const DUNDER_KEEP = new Set([
 ]);
 
 function parsePy(filePath, src) {
-  const tree = getParser().parse(src);
+  const tree = parseSource(getParser(), src);
   const root = tree.rootNode;
 
   const result = {
@@ -74,6 +89,16 @@ function parsePy(filePath, src) {
   };
 
   const pendingDecorators = new Map();
+  // Reference occurrences with positions, for per-definition scopes
+  // (same-file cascade) — see parse-js.js pass 4. `references` stays
+  // the flat file-level set; occurrences are the positioned twin used
+  // to build each definition's `uses` list.
+  const occurrences = [];
+  const addRef = (name, node, startIndex) => {
+    if (!name) return;
+    result.references.add(name);
+    occurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
+  };
   // Class-body inventories for the class-attribute rules (FP-6):
   // per class, the names defined directly in its body, whether the body
   // defines any method, and the class node itself (for its bases).
@@ -135,12 +160,29 @@ function parsePy(filePath, src) {
       // is KEEP, never SAFE.
       frameworkField = /BaseModel|TypedDict/.test(baseText) || decs.some((d) => /dataclass/.test(d));
     }
+    // A definition inside a function body is a local of that function
+    // (a nested function, a variable assigned in a body): it is scoped
+    // to its enclosing function, not to the module — see parse-js.js
+    // addDef. Walk up to the nearest function or class boundary; a
+    // class body is not a function scope (class attributes are
+    // module-level findings), and the walk starts at node.parent so a
+    // definition never counts as its own enclosing function.
+    let isLocal = false;
+    {
+      let a = node.parent;
+      while (a) {
+        if (a.type === 'function_definition') { isLocal = true; break; }
+        if (a.type === 'class_definition' || a.type === 'module') break;
+        a = a.parent;
+      }
+    }
     result.definitions.push({
       name, kind: finalKind, exported: false, isDefault: false,
       range: rangeOf(node), startLine: node.startPosition.row + 1,
       endLine: node.endPosition.row + 1,
       decorators: pendingDecorators.get(node.startIndex) || [],
       _parentType: parentType,
+      local: isLocal,
       frameworkField,
       documentedAttr,
       // Internal: the enclosing class node, resolved by the post-pass
@@ -162,12 +204,32 @@ function parsePy(filePath, src) {
   const isCompatShim = /(^|\/)(_?compat)(\.py)?$/.test(normRel) || /(^|\/)_?compat\//.test(normRel);
   // `# noqa` (usually `# noqa: F401`) on an import line marks the
   // import as intentional: a re-export the author knows is unused in
-  // this file.
+  // this file. The comment may sit on any line of a multi-line import,
+  // so check the whole span plus the line above. Line-based, so it
+  // does not depend on position units.
   const hasNoqa = (node) => {
-    const stmt = text(node, src);
-    const endIdx = src.indexOf('\n', node.endIndex);
-    const tail = endIdx === -1 ? '' : src.slice(node.endIndex, endIdx);
-    return /#\s*noqa\b/.test(stmt + tail);
+    const lines = srcLines.slice(Math.max(0, node.startPosition.row - 1), node.endPosition.row + 1);
+    return lines.some((line) => /#\s*noqa\b/.test(line));
+  };
+  // A re-export / backwards-compatibility comment marks ONE name, not
+  // the whole statement: requests' sessions.py imports REDIRECT_STATI
+  // and should_bypass_proxies in one statement, but only the latter
+  // carries the "# re-export" note — the former is genuinely dead.
+  // The note may sit on the name's own line, or on the line above the
+  // statement: there it must either name the symbol (utils.py: "#
+  // to_native_string is unused here, but imported here for backwards
+  // compatibility") or the import must carry a single name, so the note
+  // unambiguously refers to it. Candidates are the local name plus the
+  // imported name when they differ (an alias may be mentioned by either).
+  const KEEP_COMMENT_RES = [/#\s*re-exports?\b/i, /#.*\bbackwards?[- ]compat/i];
+  const nameHasKeepComment = (stmtNode, childNode, candidates, singleName) => {
+    const ownLine = srcLines[childNode.endPosition.row] || '';
+    if (KEEP_COMMENT_RES.some((re) => re.test(ownLine))) return true;
+    const above = srcLines[stmtNode.startPosition.row - 1] || '';
+    if (!above || !KEEP_COMMENT_RES.some((re) => re.test(above))) return false;
+    if (singleName) return true;
+    return candidates.some((name) => name !== '*'
+      && new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(above));
   };
 
   // --- pass 1: structure ---
@@ -182,7 +244,7 @@ function parsePy(filePath, src) {
             // code uses it as a.b.c.foo(). Recording `c` made the
             // binding unfindable and hid genuinely unused dotted imports.
             const local = full.split('.')[0];
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) });
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) });
           } else if (c.type === 'aliased_import') {
             const nameNode = childByField(c, 'name');
             const aliasNode = childByField(c, 'alias');
@@ -193,7 +255,7 @@ function parsePy(filePath, src) {
             // API). A plain `import X` defaults local to X and is NOT
             // a re-export, so only an explicitly written alias counts.
             const redundantAlias = Boolean(aliasNode) && text(aliasNode, src) === full;
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) || redundantAlias });
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) || redundantAlias });
           }
         }
         break;
@@ -221,20 +283,37 @@ function parsePy(filePath, src) {
           if (moduleNode && c.startIndex === moduleNode.startIndex && c.endIndex === moduleNode.endIndex) continue;
           if (c.type === 'dotted_name') {
             const n = text(c, src);
-            names.push({ imported: n, local: n, kind: 'named' });
+            names.push({ imported: n, local: n, kind: 'named', child: c, candidates: [n] });
           } else if (c.type === 'aliased_import') {
             const nameNode = childByField(c, 'name');
             const aliasNode = childByField(c, 'alias');
             const n = nameNode ? text(nameNode, src) : '';
             const alias = aliasNode ? text(aliasNode, src) : n;
             if (aliasNode && alias === n) redundantAlias = true;
-            names.push({ imported: n, local: alias, kind: 'named' });
+            names.push({ imported: n, local: alias, kind: 'named', child: c, candidates: [alias, n] });
           } else if (c.type === 'wildcard_import') {
-            names.push({ imported: '*', local: '*', kind: 'namespace' });
+            names.push({ imported: '*', local: '*', kind: 'namespace', child: c, candidates: ['*'] });
           }
         }
         const rel = node.namedChild(0) && node.namedChild(0).type === 'relative_import';
-        result.imports.push({ names, source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true, reExport: isPackageInit || isCompatShim || hasNoqa(node) || redundantAlias });
+        // A keep comment marks individual names, so a mixed import is
+        // split: the kept names form a re-export record, the rest keep
+        // the statement's own verdict (noqa / shim / redundant alias).
+        // Without the split, one noted name would whitelist genuinely
+        // dead siblings in the same statement (REDIRECT_STATI).
+        const stmtReExport = isPackageInit || isCompatShim || hasNoqa(node) || redundantAlias;
+        const strip = (n) => ({ imported: n.imported, local: n.local, kind: n.kind });
+        const singleName = names.length === 1;
+        for (const n of names) n.kept = nameHasKeepComment(node, n.child, n.candidates, singleName);
+        const keptNames = names.filter((n) => n.kept).map(strip);
+        const restNames = names.filter((n) => !n.kept).map(strip);
+        const base = { source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true };
+        if (keptNames.length > 0 && restNames.length > 0) {
+          result.imports.push({ ...base, names: keptNames, reExport: true });
+          result.imports.push({ ...base, names: restNames, reExport: stmtReExport });
+        } else {
+          result.imports.push({ ...base, names: names.map(strip), reExport: stmtReExport || keptNames.length > 0 });
+        }
         break;
       }
       case 'decorated_definition': {
@@ -398,9 +477,14 @@ function parsePy(filePath, src) {
   // is a live re-export, not a dead import.
   const allMatch = src.match(/__all__\s*\+?=\s*[\[(]([\s\S]*?)[\])]/);
   if (allMatch) {
+    // Positions are module-level by construction (__all__ is a
+    // top-level assignment), but record them like any other reference
+    // so the scope pass attributes them to the top level, not to a
+    // definition that happens to follow.
+    const groupStart = src.indexOf(allMatch[1], allMatch.index);
     for (const m of allMatch[1].matchAll(/['"]([^'"]+)['"]/g)) {
       result.exports.push({ name: m[1], local: m[1], kind: 'named', range: rangeOf(root), isDefault: false });
-      result.references.add(m[1]);
+      addRef(m[1], null, groupStart + m.index);
     }
   }
   // In Python every top-level public name is importable, so treat top-level
@@ -496,11 +580,11 @@ function parsePy(filePath, src) {
         // decorator object, not a reference to a same-named definition.
         const p = node.parent;
         const isDecAttr = p && p.type === 'attribute' && sameNode(childByField(p, 'attribute'), node) && insideDecorator(p);
-        if (!isDecAttr) result.references.add(text(node, src));
+        if (!isDecAttr) addRef(text(node, src), node);
       }
     } else if (node.type === 'attribute') {
       const attr = childByField(node, 'attribute');
-      if (attr && !insideDecorator(node)) result.references.add(text(attr, src));
+      if (attr && !insideDecorator(node)) addRef(text(attr, src), attr);
     } else if (node.type === 'string' || node.type === 'string_content') {
       result.strings.push(text(node, src));
       // String annotations are uses: `ctx: "Context"`,
@@ -511,8 +595,9 @@ function parsePy(filePath, src) {
       // so a TYPE_CHECKING import used only in annotations is live.
       // Plain strings (docstrings, messages, dict values) do not count.
       if (node.type === 'string_content' && isAnnotationString(node)) {
-        for (const m of text(node, src).matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
-          result.references.add(m[0]);
+        const s = text(node, src);
+        for (const m of s.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+          addRef(m[0], node, node.startIndex + m.index);
         }
       }
       // %-format placeholders are uses: `"%(complete_func)s" % vars`
@@ -520,8 +605,9 @@ function parsePy(filePath, src) {
       // (or a variable) named in a placeholder is live — even in the
       // same file, where the plain string pass does not count. The
       // lookbehind skips `%%(name)s`, an escaped literal percent.
-      for (const m of text(node, src).matchAll(/(?<!%)%\(([A-Za-z_][A-Za-z0-9_]*)\)[sdifr%]/g)) {
-        result.references.add(m[1]);
+      const fmt = text(node, src);
+      for (const m of fmt.matchAll(/(?<!%)%\(([A-Za-z_][A-Za-z0-9_]*)\)[sdifr%]/g)) {
+        addRef(m[1], node, node.startIndex + m.index);
       }
     } else if (node.type === 'call') {
       const fn = childByField(node, 'function');
@@ -531,8 +617,8 @@ function parsePy(filePath, src) {
         // A decorator call (`@app.command()`) is not a call to a local
         // function of the same name — see insideDecorator above.
         if (!insideDecorator(node)) {
-          result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1 });
-          result.references.add(base);
+          result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1, startIndex: node.startIndex });
+          addRef(base, fn);
         }
         if (['getattr', 'importlib', '__import__', 'eval', 'exec'].includes(base)) {
           result.dynamic = true;
@@ -571,6 +657,40 @@ function parsePy(filePath, src) {
       }
     }
   });
+
+  // --- pass 4: per-definition reference scopes (same-file cascade) ---
+  // Same shape as parse-js.js pass 4: a reference belongs to the
+  // innermost definition whose range contains it; references outside
+  // every definition are top-level uses. Calls contribute their callee
+  // name the same way; a call without a recorded position is treated
+  // as top-level (fail-open). See parse-js.js for the full rationale.
+  for (const c of result.calls) {
+    occurrences.push({ name: c.name, startIndex: c.startIndex !== undefined ? c.startIndex : -1 });
+  }
+  // Variable definitions are NOT scopes — see parse-js.js pass 4:
+  // an initializer runs in the enclosing scope, so references inside
+  // a variable's range belong to the enclosing definition (or the top
+  // level), never to the variable itself.
+  const scopeDefs = result.definitions.filter((d) => d.kind !== 'variable');
+  const defsByStart = [...scopeDefs].sort((a, b) => a.range.startIndex - b.range.startIndex);
+  const usesByDef = new Map();
+  const topLevelUses = new Set();
+  for (const occ of occurrences) {
+    if (occ.startIndex < 0) { topLevelUses.add(occ.name); continue; }
+    let best = null;
+    for (const d of defsByStart) {
+      if (d.range.startIndex > occ.startIndex) break; // sorted: no later def can contain it
+      if (occ.startIndex < d.range.endIndex) {
+        if (!best || (d.range.endIndex - d.range.startIndex) < (best.range.endIndex - best.range.startIndex)) best = d;
+      }
+    }
+    if (best) {
+      if (!usesByDef.has(best)) usesByDef.set(best, new Set());
+      usesByDef.get(best).add(occ.name);
+    } else topLevelUses.add(occ.name);
+  }
+  for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
+  result.topLevelUses = [...topLevelUses].sort();
 
   return result;
 }

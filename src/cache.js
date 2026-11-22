@@ -43,7 +43,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const FORMAT_VERSION = 1;
+const FORMAT_VERSION = 2; // v2: parse results carry per-definition `uses` / `topLevelUses` scopes (batch 3) — v1 caches lack them
 const DOTFILE_NAME = '.deadcode-map-cache.json';
 const NODE_MODULES_CACHE_REL = path.join('node_modules', '.cache', 'deadcode-map', 'cache.json');
 

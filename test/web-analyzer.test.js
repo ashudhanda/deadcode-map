@@ -507,7 +507,19 @@ test('web py-reexports: redundant aliases, noqa imports and compat shims are re-
   for (const symbol of ['json', 'socket', 'OrderedDict', 'urlparse']) {
     assert.equal(bySymbol(f, 'pkg/compat.py', symbol), undefined, `${symbol} in a compat shim is a re-export, never a dead import`);
   }
-  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+  // An explicit re-export or backwards-compatibility comment marks one
+  // name (mirrors the CLI): Counter is noted on its own line,
+  // OrderedDict by the note above its single-name import.
+  assert.equal(bySymbol(f, 'pkg/core.py', 'Counter'), undefined, 'Counter is re-exported by comment, never a dead import');
+  assert.equal(bySymbol(f, 'pkg/core.py', 'OrderedDict'), undefined, 'OrderedDict is kept for backwards compatibility, never a dead import');
+  // The genuinely dead import is still found.
+  assert.equal(bySymbol(f, 'pkg/core.py', 'os').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:pkg/core.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
 });
 
 test('web js-reexports: export { X } re-exports an import, and .js imports resolve to .ts files', () => {
@@ -1050,4 +1062,52 @@ test('web tests-dir: files under tests/ or test/ are KEEP at most, never SAFE', 
   assert.equal(byCategory(f, 'src/test/test-utils.tsx', 'file').grade, 'KEEP');
   assert.equal(bySymbol(f, 'src/test/test-utils.tsx', 'renderAll').grade, 'KEEP');
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web re-export multiline: export { ... } from keeps the target live', () => {
+  const files = [
+    { path: 'src/index.js', content: "const b = require('./barrel');\nconsole.log(b);\n" },
+    { path: 'src/barrel.js', content: "export {\n  A,\n  B,\n} from './x';\n" },
+    { path: 'src/x.js', content: 'export function A() {}\nexport function B() {}\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(byCategory(f, 'src/x.js', 'file'), undefined, 'x.js is re-exported by the barrel, so it is not a dead file');
+  assert.equal(bySymbol(f, 'src/x.js', 'A'), undefined);
+  assert.equal(bySymbol(f, 'src/x.js', 'B'), undefined);
+});
+
+test('web module-exports multiline: a name only listed in the export object is not a live use', () => {
+  const files = [
+    { path: 'src/index.js', content: "const r = require('./reexp');\nconsole.log(r);\n" },
+    { path: 'src/reexp.js', content: "const foo = require('./foo');\nmodule.exports = {\n  foo,\n};\n" },
+    { path: 'src/foo.js', content: 'module.exports = function foo() {};\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  // `foo` appears only on a continuation line of the export object: that
+  // is an export, not a use, so the import is dead (matches the CLI).
+  assert.equal(bySymbol(f, 'src/reexp.js', 'foo').grade, 'SAFE');
+});
+
+test('web module-exports multiline: names after a function value are still marked exported', () => {
+  const files = [
+    { path: 'src/index.js', content: "const u = require('./under');\nconsole.log(u);\n" },
+    { path: 'src/under.js', content: 'function _internal() {}\nfunction A() {}\nmodule.exports = {\n  A,\n  run: () => { return 1; },\n  _internal,\n};\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  // The old single `[^}]*` match stopped at the arrow function's `}`,
+  // so `_internal` was never marked exported and graded SAFE.
+  assert.equal(bySymbol(f, 'src/under.js', '_internal').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/under.js', 'A').grade, 'REVIEW');
+});
+
+test('web module-exports multiline: a nested value is still a live use', () => {
+  const files = [
+    { path: 'src/index.js', content: "const n = require('./nested');\nconsole.log(n);\n" },
+    { path: 'src/nested.js', content: 'function A() {}\nfunction B() {}\nmodule.exports = {\n  A,\n  nested: { B },\n};\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  // `B` sits inside a nested object in the export value, so it is a real
+  // reference (matches the CLI); only the top-level `A` is an export.
+  assert.equal(bySymbol(f, 'src/nested.js', 'B'), undefined);
+  assert.equal(bySymbol(f, 'src/nested.js', 'A').grade, 'REVIEW');
 });

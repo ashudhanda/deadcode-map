@@ -52,6 +52,13 @@ Options:
                        .deadcode-map-cache.json next to the scanned root)
   --no-cache           Force a full scan: ignore the cache and write nothing
   --cache-stats        Enable the cache and print hit/miss stats after the scan
+  --coverage <file>    Use this Cobertura XML or lcov file as a confidence
+                       signal (default: auto-discover coverage.xml or
+                       lcov.info in the scanned root). Covered body lines
+                       demote a would-be SAFE finding to REVIEW — coverage
+                       never promotes a finding to SAFE, so a stale file
+                       can only add REVIEWs, never false SAFEs
+  --no-coverage        Ignore any coverage file in the scanned repo
   --no-color           Disable coloured output
   --version            Print the version
   --help               Print this help
@@ -65,6 +72,7 @@ function parseArgs(argv) {
     fix: false, prove: false, testCommand: null, includeReview: false,
     includeFixtures: false, top: 10, color: true,
     cache: false, noCache: false, cacheStats: false,
+    coveragePath: null, noCoverage: false,
   };
   const args = argv.slice(2);
   for (let i = 0; i < args.length; i++) {
@@ -87,6 +95,8 @@ function parseArgs(argv) {
     else if (a === '--cache') opts.cache = true;
     else if (a === '--no-cache') opts.noCache = true;
     else if (a === '--cache-stats') opts.cacheStats = true;
+    else if (a === '--coverage') opts.coveragePath = args[++i];
+    else if (a === '--no-coverage') opts.noCoverage = true;
     else if (a === '--no-color') opts.color = false;
     else if (a.startsWith('-')) { console.error(`Unknown option: ${a}\n${help()}`); process.exit(2); }
     else opts.path = a;
@@ -113,7 +123,18 @@ function main() {
   }
 
   const cacheOpts = { cache: opts.cache, noCache: opts.noCache, cacheStats: opts.cacheStats };
-  const { graph, findings, cache } = scan(root, { includeFixtures: opts.includeFixtures, ...cacheOpts });
+  const coverageOpts = { coveragePath: opts.coveragePath, noCoverage: opts.noCoverage };
+  // The tool's own outputs must never be scanned: a --json report or
+  // --map file written inside the scanned root would otherwise count
+  // as string references on the next run and change the findings.
+  // Only the exact output paths are excluded, resolved against the
+  // working directory — the same place the files are written.
+  // '--json -' writes to stdout, so there is no file to exclude, and
+  // a path outside the scanned root matches nothing.
+  const excludeFiles = [opts.json, opts.map]
+    .filter((p) => p && p !== '-')
+    .map((p) => path.resolve(p));
+  const { graph, findings, cache } = scan(root, { includeFixtures: opts.includeFixtures, excludeFiles, ...cacheOpts, ...coverageOpts });
   let visible = findings;
 
   // Baseline handling.

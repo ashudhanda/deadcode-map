@@ -199,7 +199,13 @@ deadcode-map [path] --baseline          # hide findings already in .deadcode-map
 deadcode-map [path] --update-baseline   # record current findings as the baseline
 deadcode-map [path] --prove             # prove SAFE deletions with your tests first
 deadcode-map [path] --fix               # delete SAFE findings only
+deadcode-map [path] --coverage report.xml  # test-coverage evidence (Cobertura XML or lcov); auto-detected when present
+deadcode-map [path] --no-coverage       # ignore coverage files entirely
 ```
+
+Coverage is a one-way safety net: a symbol whose body lines ran under tests is demoted from would-be SAFE to REVIEW, never the other way round — coverage never promotes a REVIEW to SAFE, and a file with covered lines is never a SAFE dead file. Only the symbol's body lines count (the `def` line runs on import, so it is excluded). When no coverage file is given, the tool auto-detects `coverage.xml`, `coverage/coverage.xml`, `lcov.info`, or `coverage/lcov.info` in the scanned repo; pass `--coverage <file>` to point at a specific report. Only the first report found is used — reports are not merged.
+
+A `--json` report or `--map` file written inside the scanned repo is excluded from the scan itself, so repeat runs report identical findings — the tool's own output never counts as a reference to the symbols it lists. Only the exact output path is excluded; any other file, including one with the same name in another directory, is still scanned.
 
 Exit codes: 0 ok, 1 `--fail-on` triggered, 2 usage error / no such directory. A repo guide for agents lives in [AGENTS.md](AGENTS.md).
 
@@ -255,15 +261,16 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 
 1. A real import/call graph built from entry points — no flat name-matching.
 2. A string-reference pass: the symbol name is searched across the whole repo (code, config, templates) before flagging. Only code-like mentions count — the name as a whole string (`'named'`, `{"handler": "wired"}`) or delimited by code characters (`'handlers.named'`, `'./named'`). Words inside sentences (`'a named export is nice'`, a docstring, README prose) do not count, and `.md` / `.txt` files never count.
-3. Dynamic-import / reflection detection downgrades to REVIEW.
-4. Framework rule packs as data files (`frameworks/next.json`, `frameworks/fastapi.json`, …).
-5. Confidence grading + `--min-confidence`; `--fix` / `--prove` act on SAFE only.
-6. Baseline (`.deadcode-map.json`) + inline ignore (`// deadcode-map-ignore-next`, `# deadcode-map: ignore` — planned, see Roadmap).
-7. `prove` as the final arbiter: if the tests pass without it, it is dead.
+3. Coverage evidence demotes would-be SAFE to REVIEW: a symbol whose body lines ran under tests is REVIEW, never SAFE, even with no callers — coverage never promotes. Same-file liveness is reachability over per-definition reference scopes, so a helper used only by another dead symbol in the same live file is caught (methods are conduits: their uses propagate, but a helper called only from a method is not SAFE unless the method is also dead — narrowing that needs enclosing-class tracking, see limitations).
+4. Dynamic-import / reflection detection downgrades to REVIEW.
+5. Framework rule packs as data files (`frameworks/next.json`, `frameworks/fastapi.json`, …).
+6. Confidence grading + `--min-confidence`; `--fix` / `--prove` act on SAFE only.
+7. Baseline (`.deadcode-map.json`) + inline ignore (`// deadcode-map-ignore-next`, `# deadcode-map: ignore` — planned, see Roadmap).
+8. `prove` as the final arbiter: if the tests pass without it, it is dead.
 
 ## Measured results (checkable, not marketing)
 
-Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (71 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (52 web tests). New fixtures in this batch: `ts-types`, `py-annotations`, `js-app`, `js-library`, `js-cascade`, `py-typer`, `js-methods`, `py-reexports`, `js-reexports`, `py-pydantic`, `ts-ambient`, `ts-testfile`, `py-decorated`, `js-alias`, `py-class-attrs` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
+Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (93 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (56 web tests). New fixtures in batch 3: `js-same-file-cascade`, `py-same-file-cascade`, `js-file-stringrefs` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
 
 | Fixture | Files | SAFE found | SAFE false positives | SAFE FP rate |
 |---|---|---|---|---|
@@ -280,7 +287,7 @@ Fixtures live in `fixtures/` with planted dead items and known live items. Run t
 
 ### Real-repo benchmark (10 public repos + 3 diagnosis repos, CLI)
 
-Measured 2026-11-22 with the current tool (commit `8a68925` —
+Measured 2026-11-23 with the current tool (batch 3 —
 re-measure with `node ~/workspace/bench-repos/bench-run.js`). Before =
 the tool at the start of batch 1 (corpus scan B / diagnosis numbers);
 after = now. SAFE precision is hand-sampled per repo, not asserted
@@ -291,17 +298,17 @@ from the count.
 | express | 142 | 0 | 0 | — |
 | commander | 159 | 3 | 0 | — |
 | zustand | 49 | 5 | 0 | — |
-| preact | 239 | 33 | 20 | 16/20 verified true (unused demo imports); 4 are `export { … }` re-exports the web counts as live — CLI gap, see limitations |
-| date-fns | 1776 | 100 | 1 | 100% (1 unused variable) |
+| preact | 239 | 33 | 20 | 16/20 verified true (unused demo imports); 4 are JSX-pragma imports (`createElement`, `React`, `h`, `memo`, `Fragment`) the web counts as live — CLI gap, see limitations |
+| date-fns | 1776 | 100 | 2 | 2/2 true (1 unused variable; 1 one-off jscodeshift codemod with no importer or script — true by the tool's model, manually-run tools are a known edge) |
 | next-blog | 22 | 11 | 11 | 100% (unused React imports) |
 | flask | 83 | 17 | 0 | — |
 | fastapi | 1237 | 71 | 0 | — |
 | requests | 37 | 33 | 2 | 100% (2 unused type aliases) |
 | click | 91 | 2 | 0 | — |
 | axios | 261 | 90 | 0 | — |
-| typer | 645 | 43 | 3 | not re-sampled in batch 2 (was 5/5 genuinely dead at 5 SAFE) |
-| umami | 1520 | 1044 | 32 | ~100% sampled in batch 1 (dead components, unused utils) |
-| **Total** | **3836 + 2426** | **1452** | **69** | **62 of 69 verified true; 4 preact re-exports are a known CLI gap, 3 typer not re-sampled** |
+| typer | 645 | 43 | 5 | 5/5 true (re-sampled in batch 3; the 2 new ones are never-read `TyperGroup` class attributes) |
+| umami | 1520 | 1044 | 38 | 38/38 true (re-sampled in batch 3; the 6 new ones are 5 dead helpers in `src/lib/react.ts` and 1 dead component file, `SettingsButton.tsx`) |
+| **Total** | **3836 + 2426** | **1452** | **78** | **74 of 78 verified true; 4 preact JSX-pragma imports are a known CLI gap** |
 
 What fixed the bulk of it, in order: re-exports counted as uses
 (`import X as X`, `export { X }`, `# noqa: F401`, compat shims);
@@ -318,6 +325,19 @@ consumed class attributes (Pygments theme classes, external-base
 overrides like Werkzeug's `default_mimetype`, chained-assignment
 aliases, Sphinx-documented flags) — and ported the inverted string
 index to the web checker, so web-only SAFE is now 0.
+Batch 3 added same-file cascade (per-definition reference scopes;
+methods are conduits), coverage demotion (Cobertura/lcov, one-way),
+a fix for the 32 KiB parse limit (tree-sitter's node binding throws
+past 32,768 bytes, so large files were silently treated as live —
+55 of 6,278 corpus files, including fastapi's `routing.py`), Python
+re-export comments (`# re-export` / `# backwards-compat` keep one
+name, including span-wide `# noqa: F401` on multi-line imports),
+and a fix for locals inflating file findings (a local named `url`
+kept umami's `SettingsButton.tsx` at REVIEW by matching 116 files —
+locals no longer count as file-level string references). The 9 new
+SAFEs in batch 3 are all verified true: 5 dead helpers in umami's
+`src/lib/react.ts`, the dead `SettingsButton.tsx` file, 2 never-read
+`TyperGroup` class attributes, and date-fns' one-off codemod.
 
 Scan times (same machine): umami 1520 files 15.6 s (~97 files/s),
 fastapi 1237 files 12.9 s, date-fns 1776 files 8.6 s — the O(symbols ×
@@ -334,19 +354,20 @@ unless the tool version is pinned — an earlier measurement gap (flask
 mid-measurement, not nondeterminism: the current tool is byte-identical
 across 3 repeat runs on flask/requests/click.
 
-The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by `test/web-analyzer.test.js` (52 tests). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
+The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by `test/web-analyzer.test.js` (56 tests). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). Batch 3 fixed web multi-line `export { … } from` (no import edge before) and multi-line `module.exports = { … }` (false negative before); measured on the same clones, web SAFE is 28 vs CLI SAFE 35, with only preact (−5) and zustand (−1) findings dropping as the new edges resolved. It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
 
-Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (44 findings, 0 in `src/`), which is the point of the fixtures.
+Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (119 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 
 Known limitations, stated honestly:
 
-- **`export { X }` re-exports in JS demo files**: the web checker counts a re-export as a use, the CLI does not yet in every shape — 4 preact demo imports (`export { createElement }` and siblings) are CLI SAFE but web REVIEW. Same family as the batch-1 re-export fixes; the CLI side is the next fix.
-- **Web multi-line `export { … } from` creates no import edge** (only single-line is parsed): a module reachable only via a multi-line re-export would look like a dead file in the web checker. No corpus case hits it yet.
-- **Web multi-line `module.exports = { … }`**: continuation lines are scanned as references, so an exported name can look same-file-used and lose its REVIEW finding in the web checker (false negative, pre-existing).
-- **Cascade is file-level only**: a symbol used only by another dead symbol in the *same live file* is not caught — only usage from dead *files* cascades. Same-file cascade needs per-definition reference scopes the parsers do not record yet.
-- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 28 vs CLI SAFE 34, web-only SAFE 0 — every web SAFE is also a CLI SAFE. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
+- **JSX-pragma imports in demo files**: the CLI flags 20 SAFE imports in preact's demo files (`createElement`, `React`, `h`, `memo`, `Fragment`) — JSX-pragma imports the tool treats as unused because it assumes the automatic JSX runtime. The web checker flags only 16 of them: the 4 gap cases sit in the only two demo files with multi-line imports, whose continuation lines the web references pass scans as identifiers. Treating classic-runtime JSX factory imports as used when the file contains JSX is a design decision, not yet made.
+- **Web multi-line import continuation lines**: the web references pass skips only lines starting with `import`, so continuation lines of a multi-line import are scanned as identifiers — a false negative (the 4 preact demo imports above).
+- **Method conduits are broad**: a helper used only by methods of a dead class stays hidden, because a method is a conduit regardless of whether its class is live. Narrowing needs enclosing-class tracking (a method is a conduit only when its class is live).
+- **Manually-run tools are not entry points**: a file invoked by path on a CLI — a jscodeshift transform passed with `-t`, a migration script — has no importers and no references, so it grades SAFE even though a human would keep it. Same family: `.deadcode-map.json` itself is written inside the scanned repo and would be scanned on the next run (the `--json` / `--map` outputs are excluded, the baseline file is not yet).
+- **Coverage is single-report only**: only the first coverage report found is used; reports are not merged.
+- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 28 vs CLI SAFE 35, web-only SAFE 0 — every web SAFE is also a CLI SAFE. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
 - **tsconfig `extends` is not followed**: `paths` must live in the local `tsconfig.json` / `jsconfig.json` — a base config that holds the paths is not read.
 - **JSX transform**: a `React` / `createElement` import in a JSX file is graded on the assumption the repo uses the automatic JSX runtime (Next.js, preact). A repo on the classic transform (JSX compiles to `React.createElement`) would see those imports flagged SAFE wrongly.
 - **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
