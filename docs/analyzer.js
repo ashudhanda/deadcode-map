@@ -90,7 +90,11 @@ var JSX_PRAGMA_NAMES = [
 // references pass. 200 lines still bounds a malformed statement.
 var IMPORT_STMT_MAX_LINES = 200;
 
-var TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
+var TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
+// `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
+// runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
+// test entry point like `.spec.` / `.test.`, never a dead file —
+// mirrors src/confidence.js TEST_FILE in the CLI.
 // A file literally named test.ts / test.tsx (date-fns) holds type-test
 // functions whose bodies ARE the assertions — the declarations are the
 // test, so the file is test code: KEEP at most, never SAFE.
@@ -105,7 +109,7 @@ var ENTRY_BASENAMES = new Set([
 ]);
 var ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//,
-  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
+  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
   /\/migrations\//, /\/seeds?\//,
@@ -1539,7 +1543,9 @@ function parsePy(rel, raw) {
     // CLI's tree-sitter parser sees the comment; the web parser must
     // not lose it to stripping). Without this, requests' compat
     // re-exports and flask's `cryptography` import were flagged SAFE.
-    return isPackageInit || isCompatShimPy || /#\s*noqa\b/.test(stmt) || (rawStmt && /#\s*noqa\b/.test(rawStmt)) || Boolean(redundantAlias);
+    // Linters accept the marker in either case (`# NOQA` in Django),
+    // so the match is case-insensitive — mirrors src/parse-py.js.
+    return isPackageInit || isCompatShimPy || /#\s*noqa\b/i.test(stmt) || (rawStmt && /#\s*noqa\b/i.test(rawStmt)) || Boolean(redundantAlias);
   }
   // A re-export / backwards-compatibility comment marks ONE name, not
   // the whole statement (mirrors src/parse-py.js): requests' sessions.py
@@ -1581,6 +1587,35 @@ function parsePy(rel, raw) {
       parsed.imports.push(Object.assign({}, base, { names: names, reExport: stmtReExport || keptNames.length > 0 }));
     }
   }
+  // Whether each line sits inside a `try:` statement (FP-13,
+  // mirrors src/parse-py.js inTryExcept): an import there is often an
+  // availability probe (`try: import numpy`, `try: from PIL import
+  // Image`) whose purpose is the import itself. A try statement spans
+  // from its `try:` line through its `except:` / `else:` / `finally:`
+  // suites at the same indent — an import in an `except:` fallback is
+  // a probe too, matching the CLI's ancestor check, which stops at the
+  // enclosing try_statement. The stack pops on a dedent to (or past)
+  // the try's indent, unless the line continues the statement
+  // (`except:` / `else:` / `finally:`). A `try:` line itself counts:
+  // an import on the same line (`try: import numpy`) is inside it.
+  // Blank lines and bracket continuations never end a suite.
+  var tryAtLine = [];
+  (function () {
+    var tryStack = []; // {indent}
+    for (var ti = 0; ti < lines.length; ti++) {
+      var tline = lines[ti];
+      var ttrim = tline.trim();
+      var tindent = indentOf(tline);
+      if (ttrim !== '' && depthAtLineStart[ti] === 0) {
+        while (tryStack.length && tindent <= tryStack[tryStack.length - 1].indent) {
+          if (/^(except|else|finally)\b/.test(ttrim) && tindent === tryStack[tryStack.length - 1].indent) break;
+          tryStack.pop();
+        }
+      }
+      if (depthAtLineStart[ti] === 0 && /^try\s*:/.test(ttrim)) tryStack.push({ indent: tindent });
+      tryAtLine.push(tryStack.length > 0);
+    }
+  })();
   // otherwise the names on continuation lines would count as references
   // to themselves and a dead multi-line import would be silently missed
   // (and a trailing backslash would be recorded as a bogus import named
@@ -1629,18 +1664,20 @@ function parsePy(rel, raw) {
       // not an import — it is never dead, and the CLI does not record it
       // either. Skip it so `annotations` is never flagged.
       if (fm[2] === '__future__') continue;
+      var inTryFrom = tryAtLine[ii] || false;
       var acc = accumulateImport(ii, fm[3]);
       ii = acc.next;
       var fn = fromNames(acc.stmt);
       var keptFrom = keepCommentNames(acc.rawStmt.split('\n'), rawLinesPy[acc.firstLine - 2], fn.names);
       pushImportSplit({
-        source: fm[2] || '', sideEffect: false,
+        source: fm[2] || '', sideEffect: false, inTryExcept: inTryFrom,
         fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
       }, fn.names, keptFrom, reExportPy(acc.stmt, fn.redundantAlias, acc.rawStmt));
       continue;
     }
     var im2 = il.match(/^\s*import\s+(.+)$/);
     if (im2) {
+      var inTryPlain = tryAtLine[ii] || false;
       var acc2 = accumulateImport(ii, im2[1]);
       ii = acc2.next;
       var names3 = [];
@@ -1657,7 +1694,7 @@ function parsePy(rel, raw) {
       var keptPlain = keepCommentNames(acc2.rawStmt.split('\n'), rawLinesPy[acc2.firstLine - 2], names3);
       pushImportSplit({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
-        sideEffect: false, fromImport: false, relative: false, level: 0,
+        sideEffect: false, inTryExcept: inTryPlain, fromImport: false, relative: false, level: 0,
       }, names3, keptPlain, reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt));
     }
   }
@@ -2581,10 +2618,17 @@ function analyzeFiles(inputFiles, options) {
           // first module — use the name's own module (n.full) so the
           // reason names the real source.
           var fromSource = imp.fromImport ? imp.source : (n.full || imp.source);
+          // Import-as-probe (FP-13, mirrors src/confidence.js): an
+          // unused import inside try/except exists to test whether the
+          // dependency is installed (Django's `try: import numpy`
+          // flag, `try: from PIL import Image`); the import IS the
+          // use. REVIEW, never SAFE — a leftover optional import in a
+          // try block looks identical, so a human checks.
+          var impGrade = isTest ? 'KEEP' : imp.inTryExcept ? 'REVIEW' : 'SAFE';
           add({
-            category: 'import', file: rel, symbol: n.local, grade: isTest ? 'KEEP' : 'SAFE',
+            category: 'import', file: rel, symbol: n.local, grade: impGrade,
             startLine: 1, endLine: null, size: 0,
-            reason: isTest ? 'unused import in a test file (kept)' : 'imported "' + n.imported + '" from "' + fromSource + '" but never referenced in this file',
+            reason: isTest ? 'unused import in a test file (kept)' : imp.inTryExcept ? 'imported "' + n.imported + '" from "' + fromSource + '" inside try/except but never referenced — the import itself may be the availability probe' : 'imported "' + n.imported + '" from "' + fromSource + '" but never referenced in this file',
             evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
             deleteDiff: 'remove "' + n.local + '" from import of "' + fromSource + '" in ' + rel,
           });

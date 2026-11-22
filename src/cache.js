@@ -43,7 +43,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const FORMAT_VERSION = 3; // v3: parse results carry Java fields plus Python class inventory / attributeRefs (batch 6) — v2 caches lack them
+const FORMAT_VERSION = 4; // v4: conditional module-level defs are exported (batch 7: `if`/`try`-nested defs report parentType 'module'), and JS parses carry hasModuleSyntax — v3 caches lack both
 const DOTFILE_NAME = '.deadcode-map-cache.json';
 const NODE_MODULES_CACHE_REL = path.join('node_modules', '.cache', 'deadcode-map', 'cache.json');
 

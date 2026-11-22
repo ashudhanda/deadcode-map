@@ -952,6 +952,16 @@ test('py-attr-overrides: framework-consumed class attributes via override family
   // module-level variable that shares its name with an attribute read
   // elsewhere (`obj._timeout`) is still SAFE.
   assert.equal(bySymbol(f, 'globals_mod.py', '_timeout').grade, 'SAFE');
+  // (R1c) An attribute a subclass overrides with a @property method,
+  // not a plain attribute, is still an override (Django's PostgreSQL
+  // `prohibits_null_characters_in_text_exception`, a @cached_property
+  // over the base class's plain attribute): REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'base.py', 'cached_flag').grade, 'REVIEW');
+  // A class attribute the repo's own docs promise as public API
+  // (Sphinx `.. attribute::` in docs.txt) is public interface even
+  // when no code reads it (Django's `BaseTaskBackend.supports_get_result`,
+  // documented in docs/ref/tasks.txt): REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'base.py', 'documented_flag').grade, 'REVIEW');
   // Negatives: genuinely dead class attributes stay SAFE — a base
   // attribute no subclass overrides and nothing reads, a feature flag
   // with no override and no reader, and a subclass attribute of the
@@ -995,4 +1005,124 @@ test('py-try-import: an unused import inside try/except is an availability probe
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
   }
   assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), expectedSafe);
+});
+
+test('ts-test-d: type-test files are test code, never SAFE (Vue FP-7)', () => {
+  const f = findingsFor('ts-test-d');
+  // `*.test-d.ts` files are run by the type checker (`tsc -p
+  // tsconfig.test.json` in vuejs-core's `test-dts-only` script): the
+  // file is a test entry, so it is never flagged as a dead file at all,
+  // and its declarations ARE the test, so unused ones are KEEP, never SAFE.
+  assert.equal(byCategory(f, 'src/types.test-d.ts', 'file'), undefined, 'a test-d file is an entry point, never a dead file');
+  assert.equal(bySymbol(f, 'src/types.test-d.ts', 'UnusedTestType').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'src/types.test-d.ts', 'unusedTestConst').grade, 'KEEP');
+  // The type-only import keeps the interface live through the test file.
+  assert.equal(bySymbol(f, 'src/lib.ts', 'Widget'), undefined);
+  assert.equal(bySymbol(f, 'src/lib.ts', 'usedFn'), undefined);
+  // Dead equivalents in a normal file still grade as before: an
+  // unexported dead function is SAFE, an exported-but-uncalled one is
+  // REVIEW (unknown kind: no manifest signal either way).
+  assert.equal(bySymbol(f, 'src/lib.ts', 'deadPrivate').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/lib.ts', 'deadExport').grade, 'REVIEW');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set(['function:src/lib.ts:deadPrivate']));
+});
+
+test('js-workspace-selfref: imports of the package own name resolve to in-repo source (Vue FP-8)', () => {
+  const f = findingsFor('js-workspace-selfref');
+  // `@scope/a` resolves to packages/a/src/index.ts and the subpath
+  // `@scope/a/src/util` to packages/a/src/util.ts — the imports are
+  // real edges, so the imported symbols are live, not dead.
+  for (const [file, symbol] of [
+    ['packages/a/src/index.ts', 'usedFn'],
+    ['packages/a/src/index.ts', 'usedConst'],
+    ['packages/a/src/util.ts', 'usedUtil'],
+  ]) {
+    assert.equal(bySymbol(f, file, symbol), undefined, `${file}:${symbol} is imported via the workspace package name and must not be flagged`);
+  }
+  // Dead equivalents still grade SAFE: exported-but-uncalled symbols in
+  // this private workspace (app kind) are dead, whether imported by
+  // name or by subpath.
+  assert.equal(bySymbol(f, 'packages/a/src/index.ts', 'deadExport').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'packages/a/src/util.ts', 'deadUtil').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'function:packages/a/src/index.ts:deadExport',
+    'function:packages/a/src/util.ts:deadUtil',
+  ]));
+});
+
+test('js-global-scripts: globals called from other classic scripts are live (Django admin JS)', () => {
+  const f = findingsFor('js-global-scripts');
+  // core.js, widget.js and calls.js use no module system: the top-level
+  // functions are page globals, and widget.js calls globalFn() by bare
+  // name — a real call, so globalFn is live with no finding at all.
+  assert.equal(bySymbol(f, 'core.js', 'globalFn'), undefined, 'globalFn is called from widget.js and must not be flagged');
+  // The template loads all three scripts, so no file is a dead file.
+  assert.equal(byCategory(f, 'core.js', 'file').grade, 'REVIEW');
+  assert.equal(byCategory(f, 'widget.js', 'file').grade, 'REVIEW');
+  // Dead equivalents still grade SAFE: a global nothing calls, and a
+  // name two classic scripts both define (the call in calls.js is
+  // ambiguous and rescues neither definition).
+  assert.equal(bySymbol(f, 'core.js', 'deadGlobal').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'core.js', 'clash').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'widget.js', 'clash').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'function:core.js:deadGlobal',
+    'function:core.js:clash',
+    'function:widget.js:clash',
+  ]));
+});
+
+test('py-conditional: conditional module-level definitions are public; conditional imports are re-exports; __unittest is kept', () => {
+  const f = findingsFor('py-conditional');
+  // A class / function defined under a module-level `if` is still a
+  // module-level public binding (Django's postgis `if is_psycopg3:
+  // class GeographyType`): in a published library it is REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'cond.py', 'PublicWidget').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'cond.py', 'public_fn').grade, 'REVIEW');
+  // The version-gated import IS the public API on its branch
+  // (Django's utils/copy.py): no dead-import finding for it, and the
+  // backport definition is live through its importer.
+  assert.equal(bySymbol(f, 'shim.py', 'replace'), undefined, 'the conditional import of replace is the alternate branch of the same public name');
+  // Dead equivalents still grade SAFE: a private conditional
+  // definition, a private module-level function, and a plain unused
+  // import that shares no name with a definition.
+  assert.equal(bySymbol(f, 'cond.py', '_dead_fn').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'cond.py', '_cond_dead').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'shim.py', 'deepcopy').grade, 'SAFE');
+  // `__unittest = True` is read by the test runner (Django's
+  // contrib/messages/test.py): KEEP, never SAFE.
+  assert.equal(bySymbol(f, 'test_helpers.py', '__unittest').grade, 'KEEP');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'function:cond.py:_dead_fn',
+    'function:cond.py:_cond_dead',
+    'import:shim.py:deepcopy',
+  ]));
+});
+
+test('js-shared-name: a method and a const sharing a name are graded separately (NestJS missingFile)', () => {
+  const f = findingsFor('js-shared-name');
+  const byKind = (file, category, symbol) => f.find((x) => x.file.endsWith(file) && x.category === category && x.symbol === symbol);
+  // The Live method reads the module const of the same name, and the
+  // class is live (constructed in the entry point), so the method is a
+  // conduit and the const is live through it: no finding for the const.
+  assert.equal(byKind('src/live.js', 'variable', 'shared'), undefined, 'the const is read by the live method of the same name');
+  // The method itself is still only REVIEW (methods are never SAFE),
+  // never invisible: the conduit keeps its callees alive, not itself.
+  assert.equal(byKind('src/live.js', 'method', 'shared').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/live.js', 'Live'), undefined);
+  // Precision: the same name shape with a method that never reads the
+  // const must NOT rescue the const — the collision alone is nothing.
+  assert.equal(byKind('src/dead.js', 'variable', 'orphan').grade, 'SAFE');
+  assert.equal(byKind('src/dead.js', 'method', 'orphan').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/dead.js', 'Dead').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
+    'variable:src/dead.js:orphan',
+    'class:src/dead.js:Dead',
+    'file:src/dead.js:null',
+  ]));
 });

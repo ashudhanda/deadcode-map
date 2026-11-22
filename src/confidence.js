@@ -67,7 +67,7 @@ function frameworkKeepSymbol(rel, name, decorators, packs) {
 // `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
 // runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
 // test entry point like `.spec.` / `.test.`, never a dead file.
-const TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
+const TEST_FILE = /(\.test\.|\.spec\.|\.test-d\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
 // A file literally named test.ts / test.tsx (date-fns) holds type-test
 // functions whose bodies ARE the assertions — the declarations are the
 // test, so the file is test code: KEEP at most, never SAFE.
@@ -124,10 +124,38 @@ function gradeFindings(ctx) {
     for (const c of ginfo.parsed.classes || []) byName.set(c.name, { name: c.name, bases: c.bases || [], file: gfile });
     if (byName.size > 0) classesByFile.set(gfile, byName);
     for (const d of ginfo.parsed.definitions || []) {
-      if (!d.className || d.kind !== 'variable') continue;
+      // A @property method (or a nested class) with the same name
+      // overrides the base attribute too: Django's PostgreSQL backend
+      // defines prohibits_null_characters_in_text_exception as a
+      // @cached_property method over the base class's plain attribute,
+      // and the override is real even though the kinds differ.
+      if (!d.className || (d.kind !== 'variable' && d.kind !== 'method' && d.kind !== 'class')) continue;
       const key = `${gfile}\0${d.className}`;
       if (!classAttrs.has(key)) classAttrs.set(key, new Set());
       classAttrs.get(key).add(d.name);
+    }
+  }
+  // Documented class attributes (Django `supports_get_result`): a
+  // Sphinx `.. attribute:: Class.attr` directive in the repo's docs
+  // (.txt / .md) documents the attribute as public API of its class,
+  // even when no code in the repo reads it — the docs are the interface
+  // contract for third-party backends. Only the exact `Class.attr`
+  // pair counts (a bare attr name would collide across classes), and
+  // the grade is REVIEW, never KEEP: docs can go stale, so a human
+  // still checks. Prose files are read here on purpose: unlike the
+  // string-reference pass, this is not a claim that the docs execute
+  // the code — it is a claim that the docs promise the attribute exists.
+  const documentedClassAttrs = new Map(); // "Class.attr" -> doc rel path
+  for (const f of discovery.textFiles || []) {
+    const ext = path.extname(f).toLowerCase();
+    if (ext !== '.txt' && ext !== '.md') continue;
+    let text;
+    try { text = fs.readFileSync(f, 'utf8'); } catch (_) { continue; }
+    for (const m of text.matchAll(/^\s*\.\.\s+(?:attribute|autoattribute)::\s+([\w.]+)\s*$/gm)) {
+      const parts = m[1].split('.');
+      if (parts.length < 2) continue;
+      const key = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+      if (!documentedClassAttrs.has(key)) documentedClassAttrs.set(key, path.relative(root, f));
     }
   }
   // Resolve a base-class name to the class that defines it: the same
@@ -433,19 +461,35 @@ function gradeFindings(ctx) {
     // Limitation, stated honestly: names are matched, not bindings, so
     // a parameter or local that shadows a top-level name still counts
     // as a use of it (a false negative, never a false SAFE).
+    //
+    // Liveness is tracked per DEFINITION, not per name: two definitions
+    // may share a name — a module-level const and a method of the same
+    // name (NestJS `missingFile`: the const at line 61 and the
+    // NodeStreamController route handler at line 694) — and the old
+    // name-keyed graph merged them into one node. The kept method is a
+    // conduit, not a live root, so the shared name was deleted from the
+    // live set and the const it alone uses looked dead. Per-definition
+    // nodes keep the method's conduit status from deleting the const's
+    // liveness: the method still gets its own REVIEW finding, the const
+    // is live through the method. Name resolution inside the graph is
+    // still by name (a use of `foo` reaches every definition named
+    // `foo`), so the only change is which definitions a kept-but-unreached
+    // name takes down with it: none that it does not own.
     const scopes = Array.isArray(parsed.topLevelUses);
-    let sameFileLive = null;
+    let sameFileLiveDefs = null;
     // Java arity channel: the set of definition names whose bodies can
     // keep a private method alive, and the (name, arity) liveness test
     // for a private method / constructor. See the assignment below.
     let javaLiveScopeNames = null;
     let javaArityIsLive = null;
     if (scopes) {
-      const defUses = new Map(); // name -> Set<used names>
+      const defsByName = new Map(); // name -> definitions with that name
       for (const d of parsed.definitions) {
-        if (!defUses.has(d.name)) defUses.set(d.name, new Set());
-        for (const u of d.uses || []) defUses.get(d.name).add(u);
+        if (!defsByName.has(d.name)) defsByName.set(d.name, []);
+        defsByName.get(d.name).push(d);
       }
+      const defUses = new Map(); // definition -> Set<used names>
+      for (const d of parsed.definitions) defUses.set(d, new Set(d.uses || []));
       // Live roots: top-level code (runs on import) and live
       // cross-file uses. A kept definition is a CONDUIT, not a live
       // root: it still gets its own KEEP / REVIEW finding, but the
@@ -456,12 +500,14 @@ function gradeFindings(ctx) {
       // kept definitions themselves unless a live root reaches them.
       // Without that last step, every exported-but-never-imported
       // function vanished from the report instead of being REVIEW.
-      const liveRoots = new Set(parsed.topLevelUses || []);
+      const liveRootNames = new Set(parsed.topLevelUses || []);
       for (const [name, u] of usageMap) {
         const liveImporters = [...u.importedBy].filter((f) => !deadFiles.has(f));
         const liveCallers = [...u.calledIn].filter((f) => f !== file && !deadFiles.has(f));
-        if (liveImporters.length > 0 || liveCallers.length > 0) liveRoots.add(name);
+        if (liveImporters.length > 0 || liveCallers.length > 0) liveRootNames.add(name);
       }
+      const liveRootDefs = new Set();
+      for (const name of liveRootNames) for (const d of defsByName.get(name) || []) liveRootDefs.add(d);
       // A method is a conduit too: the tool deliberately never proves
       // a method dead (methods are REVIEW at most — objects, tests and
       // frameworks call them through dispatch the static graph cannot
@@ -517,24 +563,26 @@ function gradeFindings(ctx) {
         || (d.kind === 'method' && d.name.startsWith('__'))
         || (parsed.language === 'java' && d.kind === 'method' && ((d.annotations || []).length > 0 || d.anonymousClass === true))
         || (d.exported && (kind === 'library' || kind === 'unknown' || (reExportedFiles && reExportedFiles.has(file))));
-      const baseKeepNames = new Set();
-      for (const d of parsed.definitions) if (baseKeepDef(d)) baseKeepNames.add(d.name);
-      const bfs = (seeds) => {
+      const baseKeepDefs = new Set();
+      for (const d of parsed.definitions) if (baseKeepDef(d)) baseKeepDefs.add(d);
+      const bfsDefs = (seeds) => {
         const seen = new Set();
         const queue = [...seeds];
         while (queue.length) {
           const cur = queue.pop();
           if (seen.has(cur)) continue;
           seen.add(cur);
-          for (const nxt of defUses.get(cur) || []) if (!seen.has(nxt)) queue.push(nxt);
+          for (const used of defUses.get(cur) || []) {
+            for (const nxt of defsByName.get(used) || []) if (!seen.has(nxt)) queue.push(nxt);
+          }
         }
         return seen;
       };
-      const live = bfs(liveRoots);
-      const viaBaseKept = bfs(baseKeepNames);
+      const liveDefs = bfsDefs(liveRootDefs);
+      const viaBaseKeptDefs = bfsDefs(baseKeepDefs);
       const liveClassNames = new Set();
       for (const d of classDefs) {
-        if (live.has(d.name) || baseKeepNames.has(d.name) || viaBaseKept.has(d.name)) liveClassNames.add(d.name);
+        if (liveDefs.has(d) || baseKeepDefs.has(d) || viaBaseKeptDefs.has(d)) liveClassNames.add(d.name);
       }
       const keepDef = (d) => baseKeepDef(d)
         || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d)))
@@ -545,11 +593,11 @@ function gradeFindings(ctx) {
           // conduit status here. Public / protected / package-private
           // methods of a live class stay conduits, as before.
           && !(parsed.language === 'java' && d.visibility === 'private' && !(d.annotations || []).length));
-      const keepNames = new Set();
-      for (const d of parsed.definitions) if (keepDef(d)) keepNames.add(d.name);
-      const viaKept = bfs(keepNames);
-      sameFileLive = new Set([...live, ...viaKept]);
-      for (const name of keepNames) if (!live.has(name)) sameFileLive.delete(name);
+      const keepDefs = new Set();
+      for (const d of parsed.definitions) if (keepDef(d)) keepDefs.add(d);
+      const viaKeptDefs = bfsDefs(keepDefs);
+      sameFileLiveDefs = new Set([...liveDefs, ...viaKeptDefs]);
+      for (const d of keepDefs) if (!liveDefs.has(d)) sameFileLiveDefs.delete(d);
       // Java: a private method is live only when live code calls it
       // with a matching (name, arity). The name-based sameFileLive
       // cannot tell format/1 from format/2, so private methods get
@@ -565,7 +613,7 @@ function gradeFindings(ctx) {
       // `this()` carry the class, `super()` carries none and matches
       // nothing in this file.
       if (parsed.language === 'java') {
-        javaLiveScopeNames = new Set([...live, ...viaKept]);
+        javaLiveScopeNames = new Set([...liveDefs, ...viaKeptDefs].map((d) => d.name));
         javaArityIsLive = (def) => {
           const key = def.isConstructor
             ? `constructor/${def.arity}@${def.className || 'super'}`
@@ -630,7 +678,7 @@ function gradeFindings(ctx) {
       // parsers predate scopes).
       const sameFileUse = def.local
         ? (usage.sameFile || calledIn.includes(file))
-        : (scopes ? sameFileLive.has(def.name) : (usage.sameFile || calledIn.includes(file)));
+        : (scopes ? sameFileLiveDefs.has(def) : (usage.sameFile || calledIn.includes(file)));
       // Java private methods need arity-aware liveness, not the
       // name-based same-file flag: format/2 is dead even when format/1
       // is called from live code. The Java branch below decides with
@@ -715,6 +763,14 @@ function gradeFindings(ctx) {
         add({ ...common, grade: 'KEEP', reason: '@overload group — stubs are type information and the implementation is invoked through the overloaded name' });
         continue;
       }
+      // `__unittest = True` in a module tells unittest to trim that
+      // module's frames from tracebacks: the test runner reads the
+      // module attribute, so it is never dead code (Django's
+      // contrib/messages/test.py sets it for its test-mixin module).
+      if (def.name === '__unittest') {
+        add({ ...common, grade: 'KEEP', reason: '__unittest module attribute — unittest trims this module\'s frames from tracebacks, the runner reads it' });
+        continue;
+      }
       if (parsed.dunder && parsed.dunder.has(def.name)) {
         add({ ...common, grade: 'KEEP', reason: `module dunder ${def.name} — read by the import system / packaging tooling, never auto-deleted` });
         continue;
@@ -775,6 +831,16 @@ function gradeFindings(ctx) {
         const readers = attrReadElsewhere(file, def.name);
         if (readers.length > 0) {
           add({ ...common, grade: 'REVIEW', reason: `read as .${def.name} in ${readers.length} other file${readers.length === 1 ? '' : 's'} (${readers.slice(0, 3).join(', ')}${readers.length > 3 ? ', ...' : ''}) — attribute lookup, not a code reference`, evidence: { ...common.evidence, attrReaders: readers } });
+          continue;
+        }
+        // Documented in the repo's docs (Sphinx `.. attribute::`):
+        // the docs promise the attribute exists, so it is public API
+        // even when no code in the repo reads it (Django documents
+        // BaseTaskBackend.supports_get_result in docs/ref/tasks.txt
+        // as a backend capability third-party backends implement).
+        const docPath = documentedClassAttrs.get(`${def.className}.${def.name}`);
+        if (docPath) {
+          add({ ...common, grade: 'REVIEW', reason: `documented as ${def.className}.${def.name} in ${docPath} — public API, review before deleting` });
           continue;
         }
       }
@@ -860,7 +926,16 @@ function gradeFindings(ctx) {
           add({ ...common, grade: 'KEEP', reason: 'serialVersionUID — read by Java serialization, never auto-deleted' });
           continue;
         }
-        const fwClassAnn = (def.classAnnotations || []).find((a) => FRAMEWORK_CLASS_ANNOTATIONS.has(a));
+        // The enclosing-class stereotype check is data-driven as well as
+        // hardcoded: FRAMEWORK_CLASS_ANNOTATIONS (parse-java.js) is the
+        // fallback for the core stereotypes and Lombok, and the
+        // framework packs contribute their keepClassAnnotations lists
+        // (frameworks/spring.json, frameworks/jackson-jpa.json) — so a
+        // pack-only stereotype such as @ControllerAdvice or
+        // @JsonIgnoreProperties keeps members at REVIEW too, with no
+        // annotation list hardcoded here for the new packs.
+        const fwClassAnn = (def.classAnnotations || []).find((a) => FRAMEWORK_CLASS_ANNOTATIONS.has(a)
+          || (packs || []).some((pack) => (pack.keepClassAnnotations || []).includes(a)));
         if (fwClassAnn) {
           add({ ...common, grade: 'REVIEW', reason: `enclosing class is annotated @${fwClassAnn} — the framework may invoke this member` });
           continue;
@@ -943,10 +1018,21 @@ function gradeFindings(ctx) {
     }
 
     // ---- Dead imports ----
+    // A name the file ALSO defines at top level is a conditional
+    // definition, not a dead import: `if PY313: from copy import
+    // replace / else: def replace(...)` (Django's utils/copy.py) provides
+    // the same public name under every version, and the import IS the
+    // public API on the branch where it runs. Deleting the import would
+    // remove the name on that branch. An unconditional shadowing
+    // (`from x import y` then a later `def y()`) looks the same and is
+    // missed instead — a false negative, never a false SAFE.
+    const topLevelDefNames = new Set();
+    for (const d of parsed.definitions) if (!d.local) topLevelDefNames.add(d.name);
     for (const imp of parsed.imports) {
       if (imp.sideEffect || imp.reExport) continue;
       for (const n of imp.names || []) {
         if (n.kind === 'namespace') continue; // import * as ns — usage is via ns.x
+        if (topLevelDefNames.has(n.local)) continue; // conditional definition of the same name
         if (!parsed.references.has(n.local) && !parsed.calls.some((c) => c.name === n.local)) {
           const isTestFile = isTest;
           // Import-as-probe (FP-13): an unused import inside try/except

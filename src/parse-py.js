@@ -119,9 +119,19 @@ function parsePy(filePath, src) {
     // The enclosing scope: walk past statement wrappers (an assignment
     // sits under an expression_statement, a decorated def under a
     // decorated_definition, a chained-assignment target under its outer
-    // assignment) to the real parent — module, block, or class.
+    // assignment) to the real parent — module, block, or class. Grouping
+    // statements do not change the scope either: a definition nested
+    // inside a module-level `if` / `try` / `with` / `for` block is still
+    // a module-level binding — `if is_psycopg3: class GeographyType`
+    // and `if PY313: from copy import replace / else: def replace` are
+    // conditional definitions of public module names, not locals. The
+    // walk stops at the first module / class / function boundary, so a
+    // definition inside a function nested in an `if` still reports its
+    // function, and a definition in a class body still reports its class.
     let scope = node.parent;
-    while (scope && (scope.type === 'expression_statement' || scope.type === 'decorated_definition' || scope.type === 'assignment')) scope = scope.parent;
+    while (scope && ['expression_statement', 'decorated_definition', 'assignment',
+      'block', 'if_statement', 'else_clause', 'try_statement', 'except_clause',
+      'with_statement', 'for_statement', 'while_statement'].includes(scope.type)) scope = scope.parent;
     const parentType = scope ? scope.type : 'module';
     // The enclosing class, if any: walk up past statement wrappers and
     // grouping statements (`if` / `try` / `with` / `for` blocks inside a
@@ -154,6 +164,13 @@ function parsePy(filePath, src) {
     // resolve which base class the attribute belongs to.
     const inClassBody = kind === 'variable' && Boolean(enclosingClass);
     const classNode = inClassBody ? enclosingClass : null;
+    // A method (or a nested class) also belongs to its enclosing class
+    // for the override rules: a @property method overrides a base-class
+    // attribute of the same name, so the class context must travel on
+    // method definitions too, not just on variables. frameworkField and
+    // documentedAttr above stay variable-only: a method is not a model
+    // field and carries no attribute doc comment.
+    const classContextNode = (kind === 'variable' || kind === 'function' || kind === 'class') ? enclosingClass : null;
     // A Sphinx `#:` comment block directly above a class attribute
     // documents it as part of the class's public API (an
     // extension-facing flag, a mixin default): the comment is the
@@ -211,7 +228,7 @@ function parsePy(filePath, src) {
       // Internal: the enclosing class node, resolved by the post-pass
       // below into externalBase / configClassAttr / chainedAlias.
       // Deleted before the result leaves parsePy.
-      _classStart: classNode ? classNode.startIndex : null,
+      _classStart: classContextNode ? classContextNode.startIndex : null,
       ...(extra || {}),
     });
     if (DUNDER_KEEP.has(name) || /^__\w+__$/.test(name)) result.dunder.add(name);
@@ -528,17 +545,25 @@ function parsePy(filePath, src) {
     // is the class's own method) aliases that method: the names are one
     // object, part of the class's interface. An assignment ending in
     // any other name is an ordinary alias and stays a candidate.
-    if (d.chainedAliasOf && info.methods.has(d.chainedAliasOf)) d.chainedAlias = true;
-    d.externalBase = info.externalBase;
+    // externalBase / configClassAttr stay variable-only: a method is
+    // not a class attribute, and the confidence engine's external-base
+    // branch speaks about attributes — a method in an external-base
+    // subclass keeps its own (method) grading. Only className travels
+    // on every definition: the override rules need to know which
+    // methods a class defines, too.
+    if (d.kind === 'variable') {
+      if (d.chainedAliasOf && info.methods.has(d.chainedAliasOf)) d.chainedAlias = true;
+      d.externalBase = info.externalBase;
+      // A subclass of an externally-defined base whose body defines only
+      // attributes (no methods) is a framework-consumed config class (a
+      // Pygments Style subclass): the framework reads the attributes at
+      // runtime.
+      d.configClassAttr = info.externalBase && !info.hasMethod;
+    }
     // The enclosing class name travels on the definition: the
     // confidence engine's override rules (FP-6) resolve the class
     // hierarchy from it.
     d.className = info.name;
-    // A subclass of an externally-defined base whose body defines only
-    // attributes (no methods) is a framework-consumed config class (a
-    // Pygments Style subclass): the framework reads the attributes at
-    // runtime.
-    d.configClassAttr = info.externalBase && !info.hasMethod;
     delete d._classStart;
   }
   // Class inventory for the confidence engine's override rules (FP-6):

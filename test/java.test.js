@@ -166,8 +166,11 @@ test('java-basic: test sources are KEEP at most, never SAFE', () => {
   assert.equal(byCategory(f, TEST_FILE, 'file'), undefined, 'a Java test file is never a dead file');
   assert.equal(bySymbol(f, TEST_FILE, 'testLive').grade, 'KEEP');
   assert.equal(bySymbol(f, TEST_FILE, 'testHelper').grade, 'KEEP');
-  assert.equal(bySymbol(f, TEST_FILE, 'Test').grade, 'KEEP');
-  assert.equal(bySymbol(f, TEST_FILE, 'Test').category, 'import');
+  // The `org.junit.jupiter.api.Test` import is used by the @Test
+  // annotation itself, so it is live and has no finding at all — it
+  // used to be reported as a KEEP import finding, which was the
+  // annotation-name reference bug (see the annotation-import test).
+  assert.equal(bySymbol(f, TEST_FILE, 'Test'), undefined, 'the Test import is used by @Test, so it has no finding');
   assert.equal(f.filter((x) => x.file.endsWith(TEST_FILE) && x.grade === 'SAFE').length, 0);
 });
 
@@ -196,6 +199,32 @@ test('java: a file with ERROR/MISSING nodes yields no SAFE findings', () => {
   assert.equal(parsed.hasErrors, true, 'the broken file must set hasErrors');
   const f = scan(dir).findings;
   assert.equal(f.length, 0, `a broken file must yield no findings at all, got: ${JSON.stringify(f.map((x) => `${x.file}:${x.symbol || ''}`))}`);
+});
+
+test('java: an import used only by an annotation is live, never SAFE', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-java-annotation-import-'));
+  fs.writeFileSync(path.join(dir, 'Ann.java'), `package com.example;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class Ann {
+  @JsonProperty("label")
+  private String labelled() {
+    return "x";
+  }
+
+  private void deadPlain() {
+  }
+}
+`);
+  const f = scan(dir).findings;
+  // The import is used by the annotation: deleting it would break
+  // compilation, so it must not be flagged at all. (Before the fix
+  // the annotation name was excluded from references and this import
+  // was reported SAFE — a false positive.)
+  assert.equal(bySymbol(f, 'Ann.java', 'JsonProperty'), undefined, 'an import used only by an annotation must not be flagged');
+  assert.equal(bySymbol(f, 'Ann.java', 'labelled').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'Ann.java', 'deadPlain').grade, 'SAFE');
 });
 
 test('java-basic: --fix deletes dead methods with their Javadoc, dead fields and unused imports', () => {

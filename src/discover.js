@@ -152,7 +152,7 @@ const ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//, // framework route directories
   /(^|\/)examples\//, // example scripts are standalone entry points, run directly
   /(^|\/)(scripts|tools)\//, // manually-run tools: invoked by hand, never imported (see isManualScriptPath)
-  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
+  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.test-d\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
   /Test\.java$/, // JUnit test class (src/test/java or *Test.java)
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
@@ -181,7 +181,9 @@ function isManualScriptPath(rel) {
 
 function looksLikeEntry(rel, abs, pkgEntries) {
   if (pkgEntries.has(abs)) return { entry: true, reason: 'package.json entry point' };
-  const base = path.basename(abs, path.extname(abs));
+  // Entry basenames are case-insensitive: Django's `Gruntfile.js` is
+  // executed by the grunt CLI exactly like a lowercase `gruntfile.js`.
+  const base = path.basename(abs, path.extname(abs)).toLowerCase();
   if (ENTRY_BASENAMES.has(base)) return { entry: true, reason: `entry basename "${base}"` };
   for (const re of ENTRY_PATTERNS) {
     if (re.test(rel) || re.test(abs)) return { entry: true, reason: `matches entry pattern ${re}` };

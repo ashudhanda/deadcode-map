@@ -1,0 +1,7 @@
+Backend capability flags
+========================
+
+.. attribute:: BaseFeatures.documented_flag
+
+   Whether the backend documents this flag as public API. Third-party
+   backends implement it; no code in this repo reads it.

@@ -95,7 +95,11 @@ const CLASS_NODE_TYPES = new Set([
 // reads fields through generated accessors; Spring/JPA stereotypes
 // mark container-managed classes. The check is annotation-name based,
 // not a fixed framework list — any annotation on the member itself
-// already keeps it (see confidence.js).
+// already keeps it (see confidence.js). This set is the fallback for
+// the core stereotypes and Lombok; the wider Spring and Jackson/JPA
+// lists live as data in frameworks/spring.json and
+// frameworks/jackson-jpa.json (keepClassAnnotations), which
+// confidence.js consults alongside this set.
 const FRAMEWORK_CLASS_ANNOTATIONS = new Set([
   'Data', 'Getter', 'Setter', 'Value', 'Builder',
   'AllArgsConstructor', 'NoArgsConstructor', 'RequiredArgsConstructor',
@@ -534,7 +538,13 @@ function parseJava(filePath, src) {
     if ((p.type === 'formal_parameter' || p.type === 'spread_parameter') && sameNode(childByField(p, 'name'), node)) return true;
     if (CLASS_NODE_TYPES.has(p.type) && sameNode(childByField(p, 'name'), node)) return true;
     if ((p.type === 'method_declaration' || p.type === 'constructor_declaration') && sameNode(childByField(p, 'name'), node)) return true;
-    if ((p.type === 'marker_annotation' || p.type === 'annotation') && sameNode(childByField(p, 'name'), node)) return true;
+    // Annotation names are NOT definition sites: `@JsonProperty` is a
+    // use of the imported annotation type, so an import used only by
+    // an annotation is live — deleting it would break compilation.
+    // (Qualified annotation names were already counted, because their
+    // leaf identifier's parent is the scoped name, not the annotation;
+    // only the simple `@Name` form was excluded, and it was wrongly
+    // reported as an unused import at SAFE.)
     if (p.type === 'enum_constant' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'enhanced_for_statement' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'catch_formal_parameter' && sameNode(childByField(p, 'name'), node)) return true;

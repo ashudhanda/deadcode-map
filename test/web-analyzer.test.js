@@ -1645,3 +1645,67 @@ test('web return-as-cast: a return ending in as continues on the next line', () 
   const r = analyzeFiles(files);
   assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'the type on the next line is part of the return');
 });
+
+test('web py-probe: an uppercase `# NOQA` import-as-probe is intentional, never SAFE', () => {
+  const f = loadFixture('py-probe').findings;
+  // Django: `from PIL import Image  # NOQA` inside try/except in
+  // db/models/fields/files.py exists to test whether Pillow is
+  // installed; the import IS the use. The noqa marker was missed
+  // because the check was case-sensitive (`noqa` but not `NOQA`).
+  assert.equal(bySymbol(f, 'checks.py', 'Image'), undefined, 'uppercase # NOQA probe import must not be flagged');
+  assert.equal(bySymbol(f, 'checks.py', '_Image2'), undefined, 'lowercase # noqa: F401 probe import must not be flagged');
+  // Control: a genuinely unused import with no marker is still SAFE.
+  assert.equal(bySymbol(f, 'checks.py', 'os').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'checks.py', 'os').category, 'import');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:checks.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-try-import: an unused import inside try/except is an availability probe (FP-13)', () => {
+  const f = loadFixture('py-try-import').findings;
+  // Django FP-13: `try: import numpy` (contrib/gis/shortcuts.py) and
+  // `try: from PIL import Image` (db/models/fields/files.py) exist to
+  // test whether the dependency is installed; the import IS the use.
+  // Without a `# NOQA` marker they are REVIEW, never SAFE — a leftover
+  // optional import in a try block looks identical, so a human checks.
+  assert.equal(bySymbol(f, 'probe.py', 'numpy').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'probe.py', 'Image').grade, 'REVIEW');
+  // A try-wrapped import that IS referenced afterwards is live.
+  assert.equal(bySymbol(f, 'probe.py', 'usedlib'), undefined, 'used try-wrapped import must not be flagged');
+  // Control: a plain unused import with no try and no marker is SAFE.
+  assert.equal(bySymbol(f, 'probe.py', 'deadlib').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:probe.py:deadlib']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), expectedSafe);
+});
+
+test('web ts-e2e-spec: *.e2e-spec.ts / *.e2e-spec.js files are test files — KEEP, never SAFE', () => {
+  const f = loadFixture('ts-e2e-spec').findings;
+  // NestJS: 22 `sample/*/e2e/*.e2e-spec.ts` files were graded SAFE
+  // although each sample runs them via its own vitest.config.e2e.mts
+  // (`include: ['e2e/**/*.e2e-spec.ts']`, `test:e2e` script). The
+  // `.e2e-spec.` suffix is a test-file marker like `.spec.` / `.test.`.
+  for (const file of ['e2e/cats/cats.e2e-spec.ts', 'e2e/cats/cats.e2e-spec.js']) {
+    // A test file is an entry point, so it is reachable and never gets
+    // a file finding at all — the same as `*.spec.ts` / `*.test.ts`.
+    assert.equal(byCategory(f, file, 'file'), undefined, `${file} is a test entry point, never a dead file`);
+    assert.equal(bySymbol(f, file, 'unusedHelper').grade, 'KEEP', 'unused import in a test file is kept');
+  }
+  // The specs are entries, so the modules they import stay live.
+  assert.equal(byCategory(f, 'src/cats/cats.module.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/cats/cats.service.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/cats/unused-helper.ts', 'file'), undefined);
+  // The fix is filename-based, not directory-based: a non-spec file
+  // under e2e/ and a plain unimported file are still dead.
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['file:e2e/helpers/seed-data.ts', 'file:src/orphan.ts']);
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}`)), expectedSafe);
+});

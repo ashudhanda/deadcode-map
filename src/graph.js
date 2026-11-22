@@ -198,9 +198,70 @@ function resolvePyModule(fromFile, source, existingFiles, root) {
   return null;
 }
 
+/**
+ * Workspace package self-references (FP-8): a monorepo's own packages
+ * are imported by name from inside the repo (`import { createApp } from
+ * 'vue'` in vuejs-core, `@vue/shared` from a sibling package,
+ * `dts-built-test/src/index` as a workspace subpath). The name resolves
+ * to the package's own source, not to an npm install: the package
+ * directory's src/index (preferred — dist/ is build output and is
+ * skipped from scans) or the manifest's main / module / types entry
+ * when no src/index exists. Longest name wins, so `@vue` never shadows
+ * `@vue/shared`. A name with no in-repo source returns null and falls
+ * through to the alias / external-dependency handling below.
+ */
+function loadWorkspacePackages(discovery, existingFiles) {
+  const byName = new Map(); // package name -> { dir, sourceEntry }
+  for (const f of discovery.textFiles || []) {
+    if (path.basename(f) !== 'package.json') continue;
+    let manifest;
+    try { manifest = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { continue; }
+    if (!manifest || typeof manifest.name !== 'string' || !manifest.name) continue;
+    if (byName.has(manifest.name)) continue; // first manifest wins; duplicates are a repo error
+    const dir = path.dirname(f);
+    let sourceEntry = null;
+    for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']) {
+      const cand = path.join(dir, 'src', 'index' + ext);
+      if (existingFiles.has(cand)) { sourceEntry = cand; break; }
+    }
+    if (!sourceEntry) {
+      const entries = [];
+      const collect = (v) => {
+        if (typeof v === 'string') entries.push(v);
+        else if (v && typeof v === 'object') Object.values(v).forEach(collect);
+      };
+      collect(manifest.main); collect(manifest.module); collect(manifest.types); collect(manifest.typings);
+      collect(manifest.exports);
+      for (const e of entries) {
+        const resolved = resolveFromBase(path.resolve(dir, e), existingFiles);
+        if (resolved) { sourceEntry = resolved; break; }
+      }
+    }
+    if (!sourceEntry) {
+      for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']) {
+        const cand = path.join(dir, 'index' + ext);
+        if (existingFiles.has(cand)) { sourceEntry = cand; break; }
+      }
+    }
+    byName.set(manifest.name, { dir, sourceEntry });
+  }
+  return [...byName.entries()].sort((a, b) => b[0].length - a[0].length); // longest name first
+}
+
+function resolveWorkspaceSelfRef(source, workspacePackages, existingFiles) {
+  for (const [name, pkg] of workspacePackages) {
+    if (source === name) return pkg.sourceEntry;
+    if (source.startsWith(name + '/')) {
+      return resolveFromBase(path.join(pkg.dir, source.slice(name.length + 1)), existingFiles);
+    }
+  }
+  return null;
+}
+
 function analyze(root, discovery) {
   const existingFiles = new Set(discovery.codeFiles);
   const tsAliases = loadTsAliases(discovery);
+  const workspacePackages = loadWorkspacePackages(discovery, existingFiles);
   const files = new Map(); // abs -> { rel, language, parsed, src, size }
 
   for (const f of discovery.codeFiles) {
@@ -256,10 +317,13 @@ function analyze(root, discovery) {
           externalDeps.get(imp.source).add(f);
         }
       } else if (info.language !== 'py' && imp.source) {
+        // Workspace self-reference first: the repo's own package name
+        // resolves to its source, never to an npm install (FP-8).
         // tsconfig/jsconfig `paths` aliases (`@/lib/...`): the standard
         // Next.js / Vite / monorepo import style. A bare specifier that
-        // is not an alias is an external dependency (npm package).
-        target = resolveAlias(f, imp.source, tsAliases, existingFiles);
+        // is neither is an external dependency (npm package).
+        target = resolveWorkspaceSelfRef(imp.source, workspacePackages, existingFiles);
+        if (!target) target = resolveAlias(f, imp.source, tsAliases, existingFiles);
         if (!target) {
           if (!externalDeps.has(imp.source)) externalDeps.set(imp.source, new Set());
           externalDeps.get(imp.source).add(f);
@@ -289,11 +353,13 @@ function analyze(root, discovery) {
       }
     }
     // Dynamic import() targets are real edges too — a file loaded only
-    // via import() is live, not dead. Aliases apply here as well.
+    // via import() is live, not dead. Aliases and workspace
+    // self-references apply here as well.
     for (const dyn of info.parsed.dynamicImports || []) {
       const target = dyn.startsWith('.')
         ? resolveRelative(f, dyn, existingFiles)
-        : resolveAlias(f, dyn, tsAliases, existingFiles);
+        : (resolveWorkspaceSelfRef(dyn, workspacePackages, existingFiles)
+          || resolveAlias(f, dyn, tsAliases, existingFiles));
       if (target) {
         edges.push({ target, source: dyn, names: [], range: null, dynamic: true });
         if (!importers.has(target)) importers.set(target, new Set());
@@ -581,9 +647,67 @@ function analyze(root, discovery) {
     }
   }
 
+  // --- classic scripts and global-scope calls (Django admin JS) ---
+  // A classic (non-module) script has no module syntax: `module.exports`
+  // counts even when it binds no names (`module.exports = {}`), and so
+  // does `export {}`, so the flag comes from the parser, not from the
+  // import/export lists. Top-level declarations of a classic script are
+  // globals of the page they load on — callable by bare name from any
+  // other script loaded with them. A bare-name call in one classic
+  // script resolves to the global definition of that name when exactly
+  // one top-level definition of it exists repo-wide: the calling file
+  // neither defines nor imports the name (a local binding would win),
+  // and the definition sits in another classic script. Names defined
+  // more than once are ambiguous and resolve to nothing; a global with
+  // no in-repo caller is still graded on its own evidence (a plain
+  // script's unreferenced function is SAFE — a classic script is not a
+  // free pass, only its observed cross-script calls are).
+  // Calls only, not bare references: a member access (`obj.foo()`)
+  // records the same base name as a global call, and a bare reference
+  // is not a call.
+  const classicScripts = new Set();
+  for (const [f, info] of files) {
+    if (info.language !== 'js' || !info.parsed) continue;
+    if (!info.parsed.hasModuleSyntax) classicScripts.add(f);
+  }
+  const globalDefs = new Map(); // name -> abs file of the unique global definition
+  {
+    const defCounts = new Map(); // name -> top-level runtime defs with that name
+    const classicDefFile = new Map(); // name -> file, when a classic script defines it
+    for (const [f, info] of files) {
+      if (info.language !== 'js' || !info.parsed) continue;
+      for (const d of info.parsed.definitions || []) {
+        if (d.local || d.kind === 'method' || d.kind === 'type') continue;
+        defCounts.set(d.name, (defCounts.get(d.name) || 0) + 1);
+        if (classicScripts.has(f) && !classicDefFile.has(d.name)) classicDefFile.set(d.name, f);
+      }
+    }
+    for (const [name, f] of classicDefFile) {
+      if (defCounts.get(name) === 1) globalDefs.set(name, f);
+    }
+  }
+  for (const [g, ginfo] of files) {
+    if (!classicScripts.has(g) || !ginfo.parsed) continue;
+    const definedHere = new Set();
+    for (const d of ginfo.parsed.definitions || []) {
+      if (!d.local && d.kind !== 'method' && d.kind !== 'type') definedHere.add(d.name);
+    }
+    const importedHere = new Set();
+    for (const imp of ginfo.parsed.imports || []) for (const n of imp.names || []) importedHere.add(n.local);
+    for (const call of ginfo.parsed.calls || []) {
+      const name = call.name;
+      if (definedHere.has(name) || importedHere.has(name)) continue;
+      const defFile = globalDefs.get(name);
+      if (!defFile || defFile === g) continue;
+      const map = symbolUsage.get(defFile);
+      const u = map && map.get(name);
+      if (u) u.calledIn.add(g);
+    }
+  }
+
   return {
     files, importers, importsByFile, externalDeps, reachable,
-    filesMentioning, symbolUsage, reExports, reExportedFiles,
+    filesMentioning, symbolUsage, reExports, reExportedFiles, classicScripts,
   };
 }
 

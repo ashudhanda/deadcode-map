@@ -162,6 +162,12 @@ function parseJsTs(filePath, src, ext) {
     unreachable: [],
     decorators: [],
     hasJsx: false,
+    // True when the file uses module syntax (import / export / require /
+    // module.exports / dynamic import). A file without it is a classic
+    // script: its top-level declarations are page globals, callable by
+    // bare name from other classic scripts (Django admin JS). `export {}`
+    // and `module.exports = {}` count even though they bind no names.
+    hasModuleSyntax: false,
   };
 
   const definedNames = new Set();
@@ -211,6 +217,7 @@ function parseJsTs(filePath, src, ext) {
   walk(root, (node) => {
     switch (node.type) {
       case 'import_statement': {
+        result.hasModuleSyntax = true;
         const sourceNode = firstNamed(node, 'string');
         const source = sourceNode ? text(sourceNode, src).replace(/^['"`]|['"`]$/g, '') : '';
         const names = [];
@@ -242,6 +249,7 @@ function parseJsTs(filePath, src, ext) {
         break;
       }
       case 'export_statement': {
+        result.hasModuleSyntax = true;
         const decl = firstNamed(node, 'lexical_declaration')
           || firstNamed(node, 'function_declaration')
           || firstNamed(node, 'class_declaration')
@@ -354,6 +362,7 @@ function parseJsTs(filePath, src, ext) {
     if (node.type === 'call_expression') {
       const fn = childByField(node, 'function');
       if (fn && text(fn, src) === 'require') {
+        result.hasModuleSyntax = true;
         const args = firstNamed(node, 'arguments');
         const firstArg = args ? args.namedChild(0) : null;
         if (firstArg && firstArg.type === 'string') {
@@ -384,6 +393,7 @@ function parseJsTs(filePath, src, ext) {
     if (node.type === 'assignment_expression') {
       const left = childByField(node, 'left');
       const right = childByField(node, 'right');
+      if (left && /^module\.exports|^exports\./.test(text(left, src))) result.hasModuleSyntax = true;
       if (left && right && text(left, src) === 'module.exports' && right.type === 'object') {
         for (let i = 0; i < right.namedChildCount; i++) {
           const p = right.namedChild(i);
@@ -522,6 +532,7 @@ function parseJsTs(filePath, src, ext) {
         // import_expression. A static-string target is a real import edge
         // (graph.js), so record it — without this, a file loaded only via
         // import() was kept alive only by the string-reference pass.
+        result.hasModuleSyntax = true;
         result.dynamic = true;
         result.dynamicReasons.push(`dynamic import() at line ${node.startPosition.row + 1}`);
         const args = firstNamed(node, 'arguments');
@@ -548,6 +559,7 @@ function parseJsTs(filePath, src, ext) {
         }
       }
     } else if (node.type === 'import_expression') {
+      result.hasModuleSyntax = true;
       result.dynamic = true;
       result.dynamicReasons.push(`dynamic import() at line ${node.startPosition.row + 1}`);
       const args = firstNamed(node, 'arguments');

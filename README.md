@@ -283,7 +283,7 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 
 ## Measured results (checkable, not marketing)
 
-Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (93 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (56 web tests). New fixtures in batch 3: `js-same-file-cascade`, `py-same-file-cascade`, `js-file-stringrefs` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
+Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (135 CLI tests passing, 1 skipped) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (84 web tests). New fixtures in batch 3: `js-same-file-cascade`, `py-same-file-cascade`, `js-file-stringrefs` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
 
 | Fixture | Files | SAFE found | SAFE false positives | SAFE FP rate |
 |---|---|---|---|---|
@@ -352,6 +352,70 @@ SAFEs in batch 3 are all verified true: 5 dead helpers in umami's
 `src/lib/react.ts`, the dead `SettingsButton.tsx` file, 2 never-read
 `TyperGroup` class attributes, and date-fns' one-off codemod.
 
+### Batch 7 update (2026-11-23, 15 public repos, 14,443 files)
+
+Batch 5 expanded the corpus with five more repos (Vue, SvelteKit,
+Django, NestJS, Pydantic). Batch 6 cut their CLI SAFE from 176 to 47;
+batch 7 cut it to 26 — hand-judged one by one, **26/26 verified true
+(100% SAFE precision)**. Re-measure with `node
+~/workspace/bench-repos/bench-run.js` (old corpus) and the batch-6
+after JSONs under `~/workspace/bench-repos/bench7-verify/` (expansion
+repos); web numbers via `node ~/workspace/bench-repos/web-bench5.js`.
+
+| Repo | Files | CLI SAFE batch 5 | CLI SAFE batch 6 | CLI SAFE batch 7 | SAFE precision batch 7 |
+|---|---|---|---|---|---|
+| vuejs-core | 522 | 9 | 9 | 0 | — |
+| sveltejs-kit | 1579 | 6 | 0 | 0 | — |
+| django-django | 3054 | 112 | 13 | 2 | 2/2 true (`globalThreshold`, `handles_files`) |
+| nestjs-nest | 2284 | 49 | 25 | 24 | 24/24 true (9 dead `test.dto.ts` files, 4 unimported entity files, 2 unregistered `logging.plugin.ts` files, `audio.module.ts`, 8 unused imports) |
+| pydantic-pydantic | 3168 | 0 | 0 | 0 | — |
+| **Total** | **10,607** | **176** | **47** | **26** | **26/26 true** |
+
+What fixed it in batch 7: type-test files (`*.test-d.ts(x)`, run by
+`test-dts-only`) are entry points; workspace self-references (`vue` /
+`@vue/*` imported from inside vuejs-core) count as uses; classic
+(non-module) script globals resolve repo-wide (`quickElement` et al. in
+Django's admin JS); module-level defs under grouping statements
+(`if` / `try` / `with`) are visible, so `TYPE_CHECKING`-guarded
+TypeAliases are correctly exported public API (REVIEW, never SAFE);
+`__unittest` is KEEP; per-definition liveness fixed the NestJS
+`missingFile` bug (a shared name merged a live const with a dead
+method). The web checker got the same ports for case-insensitive
+`# NOQA`, `*.e2e-spec.ts` test files, and try/except probe imports:
+web SAFE 26 → 15 (django 16 → 7, nestjs 10 → 8, rest 0, maxDup 1×).
+Web-only SAFE is now 6, all django, all known false positives whose
+CLI fixes are not yet ported to the web: the 4 admin-`core.js` globals
+(`quickElement`, `removeChildren`, `findPosX`, `findPosY`), the
+`__unittest` variable, and the `replace` import. Web SAFE precision
+is 9/15 (the other 9 overlap CLI SAFE and are verified true). The
+batch-2 claim above that web-only SAFE is 0 is superseded by this
+measurement.
+
+Old corpus (10 repos + 3 diagnosis repos) re-measured at batch 7:
+SAFE 45 → 42, with zero findings lost and zero new SAFE. The 3
+changes are all SAFE → REVIEW demotions of exported TypeAlias /
+TypeVar declarations (`CookiesType`, `ProxiesType` in requests,
+`GrpType` in typer) — the conditional-def fix above. Four
+`*.test-d.ts(x)` file findings disappeared (type tests are now entry
+points) and 5 new REVIEW findings appeared (conditional-def variables
+such as fastapi's `ujson` and click's `BEFORE_BAR` / `AFTER_BAR`) —
+improved recall, same conservative grading. Remaining old-corpus SAFE:
+preact 1 (`memo` in `demo/suspense.jsx` — the known JSX-pragma CLI
+gap), date-fns 1 (the one-off `expectify.js` codemod), typer 4,
+umami 36, everything else 0.
+
+Java landed in the CLI in batch 6 (private-only SAFE:
+tree-sitter-java, calls grouped by name + arity, field read-vs-write
+tracking, fail-open on parse errors; exact-16 fixture SAFE set, 0
+false SAFE). Batch 7 added framework packs as data —
+`frameworks/spring.json` (61 keep-decorators, 20 class annotations)
+and `frameworks/jackson-jpa.json` (59 + 9) — and a fix for imports
+used only by annotations (`@JsonProperty`) wrongly graded SAFE. Web
+checker Java support was deliberately not shipped: a regex port
+cannot meet the "never a SAFE the CLI would not" bar (no scopes, no
+arity channel, field read-vs-write needs binding resolution); it
+needs a real scanner, not regex.
+
 Scan times (same machine): umami 1520 files 15.6 s (~97 files/s),
 fastapi 1237 files 12.9 s, date-fns 1776 files 8.6 s — the O(symbols ×
 files) string pass is now an inverted index and git is one `git log`
@@ -375,7 +439,7 @@ A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) 
 
 Known limitations, stated honestly:
 
-- **Java scope (private-only)**: SAFE applies only to private methods (including `private static`), private fields, private constructors, unused imports (never on-demand `import foo.*`), and unused locals of private methods. Unused parameters are REVIEW, never SAFE: deleting one changes the method's arity, so every call site would break, and `--fix` only deletes the declaration. Everything else in Java — public, protected, and package-private members, whole classes — is REVIEW at most, never SAFE, and Java files are never dead-file candidates (there is no Java import resolution yet, so a file cannot be proven unimported). Overloads are told apart by (name, arity) only: same-name, same-arity overloads (`process(int)` vs `process(String)`) are one unit — a call to one keeps both alive. A varargs method matches any call with arity >= its fixed arity. Any annotation on a private member keeps it (`@PostConstruct`, `@JsonProperty`, `@Autowired`, ...), as does a framework stereotype on its enclosing class (Spring, JPA, Lombok), `native`, and `serialVersionUID`. A name mentioned in any string — Java source, Spring/MyBatis XML, `application.properties`, YAML — downgrades to REVIEW; names built by string concatenation (`"by" + "NameOnly"`) are undetectable and remain a documented caveat. Test sources (`src/test/java`, `*Test.java`) are KEEP at most, never SAFE. `--prove` runs `mvn -q test` / `./gradlew test` (15-minute timeout) when Maven/Gradle is installed. The web checker does not support Java (CLI only). Fixtures are validated with tree-sitter (0 ERROR nodes), not `javac`.
+- **Java scope (private-only)**: SAFE applies only to private methods (including `private static`), private fields, private constructors, unused imports (never on-demand `import foo.*`), and unused locals of private methods. Unused parameters are REVIEW, never SAFE: deleting one changes the method's arity, so every call site would break, and `--fix` only deletes the declaration. Everything else in Java — public, protected, and package-private members, whole classes — is REVIEW at most, never SAFE, and Java files are never dead-file candidates (there is no Java import resolution yet, so a file cannot be proven unimported). Overloads are told apart by (name, arity) only: same-name, same-arity overloads (`process(int)` vs `process(String)`) are one unit — a call to one keeps both alive. A varargs method matches any call with arity >= its fixed arity. Any annotation on a private member keeps it (`@PostConstruct`, `@JsonProperty`, `@Autowired`, ...), as does a framework stereotype on its enclosing class (Spring, JPA, Lombok), `native`, and `serialVersionUID`. The Spring and Jackson/JPA annotation lists live as data in `frameworks/spring.json` and `frameworks/jackson-jpa.json` (a pack-only stereotype such as `@ControllerAdvice` or `@JsonIgnoreProperties` keeps members at REVIEW too). An import used only by an annotation (`@JsonProperty`) is live — deleting it would break compilation. A name mentioned in any string — Java source, Spring/MyBatis XML, `application.properties`, YAML — downgrades to REVIEW; names built by string concatenation (`"by" + "NameOnly"`) are undetectable and remain a documented caveat. Test sources (`src/test/java`, `*Test.java`) are KEEP at most, never SAFE. `--prove` runs `mvn -q test` / `./gradlew test` (15-minute timeout) when Maven/Gradle is installed. The web checker does not support Java (CLI only). Fixtures are validated with tree-sitter (0 ERROR nodes), not `javac`.
 - **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 2 vs CLI SAFE 4, web-only SAFE 0 — every web SAFE is also a CLI SAFE. The remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
 - **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
 

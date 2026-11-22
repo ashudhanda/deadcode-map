@@ -25,3 +25,11 @@ class BaseFeatures:
     supports_x = True
     supports_y = False
     dead_feature = 1
+    # Overridden by a subclass as a @cached_property method, not a
+    # plain attribute (Django's PostgreSQL backend defines
+    # prohibits_null_characters_in_text_exception that way): the
+    # override is real either way.
+    cached_flag = None
+    # Documented as public API in docs.txt, though no code in this repo
+    # reads it (Django's `BaseTaskBackend.supports_get_result`).
+    documented_flag = False
