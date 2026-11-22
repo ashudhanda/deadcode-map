@@ -59,8 +59,15 @@ var PY_KEYWORDS = new Set([
   'return', 'raise', 'break', 'continue', 'pass', 'import', 'from', 'as',
   'def', 'class', 'lambda', 'and', 'or', 'not', 'in', 'is', 'None', 'True',
   'False', 'global', 'nonlocal', 'assert', 'del', 'yield', 'await', 'async',
-  'print', 'self', 'cls',
 ]);
+// `print`, `self` and `cls` are deliberately NOT in this set: they are a
+// builtin function and conventional parameter names, not keywords. With
+// them here, a `from rich import print` whose `print(...)` calls were
+// all skipped as "keywords" looked unused (fastapi translate.py), and
+// a `from .testing import FlaskClient as cls` whose `cls(...)` call was
+// skipped the same way looked unused (flask app.py). Removing them only
+// adds `print` / `self` / `cls` to references — harmless, since no
+// definition is ever named that way.
 
 var TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
 // A file literally named test.ts / test.tsx (date-fns) holds type-test
@@ -204,6 +211,30 @@ function stripJs(code, collect) {
       out += c; i++;
     } else if (c === "'" || c === '"') {
       var q = c;
+      // A quote with no closing quote on the same line is not a string
+      // delimiter — a JS single/double-quoted string cannot span lines
+      // (except a backslash-newline continuation, which the scan below
+      // allows). The common case is an apostrophe in JSX text (`I'm`,
+      // `we're`, `don't`): without this, the `'` opened a "string" that
+      // swallowed the rest of the file — every definition, reference
+      // and brace after it vanished, so the file's imports looked dead
+      // and reachable code looked unreachable (preact demos). A real
+      // string (`return'x'`) DOES close on the same line, so it is
+      // still recognised. An unterminated quote in broken code is
+      // likewise treated as a plain character instead of blanking the
+      // file to EOF.
+      var k = i + 1;
+      var closesQuote = false;
+      while (k < n) {
+        if (code[k] === '\\') {
+          if (code[k + 1] === '\n') { k += 2; continue; } // line continuation: the string goes on
+          k += 2; continue;
+        }
+        if (code[k] === '\n') break; // no closer on this line
+        if (code[k] === q) { closesQuote = true; break; }
+        k++;
+      }
+      if (!closesQuote) { out += c; i++; continue; }
       var start = i;
       out += ' '; i++;
       while (i < n && code[i] !== q) {
@@ -375,14 +406,57 @@ function parseJs(rel, raw) {
       });
       markDeclared(lineNo, m[1]);
     } else if (classStack.length) {
-      // Method inside a class body.
+      // Method inside a class body — but only when the `name(` line
+      // starts a definition, not a call. The signature's closing paren
+      // must be followed by `{` (or a `:` return-type annotation). A
+      // call line such as `handleOptionValue(val, ...);` or a nested
+      // call `parseNumericPattern(x, y),` used to be recorded as a
+      // phantom method — which also suppressed the real call (a
+      // declaration line is not a use), so the real definition looked
+      // dead (commander, date-fns MonthParser). The signature may span
+      // lines, so the scan follows the parens a few lines down.
       var mm = line.match(/^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+|get\s+|set\s+)*(?:#)?([A-Za-z_$][\w$]*)\s*\(/);
       if (mm && !JS_KEYWORDS.has(mm[1]) && mm[1] !== 'if' && mm[1] !== 'for' && mm[1] !== 'while' && mm[1] !== 'switch' && mm[1] !== 'catch') {
-        parsed.definitions.push({
-          name: mm[1], kind: 'method', exported: false,
-          startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
-        });
-        markDeclared(lineNo, mm[1]);
+        var isDef = (function () {
+          var depth = 0;
+          var seenOpen = false;
+          for (var sli = ln; sli < Math.min(lines.length, ln + 6); sli++) {
+            var sl = lines[sli];
+            var from = sli === ln ? sl.indexOf('(') : 0;
+            for (var sci = from; sci < sl.length; sci++) {
+              var sch = sl[sci];
+              if (sch === '(') { depth++; seenOpen = true; }
+              else if (sch === ')') {
+                depth--;
+                if (seenOpen && depth === 0) {
+                  // The character after the closing paren decides: `{`
+                  // (or a `:` return type) starts a method body; `;`,
+                  // `,`, `)`, `.` or an operator continues an
+                  // expression — a call.
+                  var rest = sl.slice(sci + 1).trim();
+                  if (rest === '') {
+                    // The `{` may sit on the next line (`) \n {`).
+                    for (var nj = sli + 1; nj < Math.min(lines.length, sli + 3); nj++) {
+                      var nx = lines[nj].trim();
+                      if (nx === '') continue;
+                      return nx.charAt(0) === '{';
+                    }
+                    return false;
+                  }
+                  return rest.charAt(0) === '{' || rest.charAt(0) === ':';
+                }
+              }
+            }
+          }
+          return false;
+        })();
+        if (isDef) {
+          parsed.definitions.push({
+            name: mm[1], kind: 'method', exported: false,
+            startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+          });
+          markDeclared(lineNo, mm[1]);
+        }
       }
     }
 
@@ -408,8 +482,13 @@ function parseJs(rel, raw) {
       markDeclared(lineNo, m[1]);
     }
 
-    // TypeScript type / interface.
-    m = line.match(/^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)/);
+    // TypeScript type / interface. The name must be followed by `=`,
+    // `{` or `extends` (allowing `<...>` generics): a bare name
+    // followed by `,` or `}` is an item in an `import type { ... }` /
+    // `export type { ... }` list, not a definition — without this, every
+    // re-exported type in such a list became a phantom definition that
+    // looked dead (zustand src/middleware.ts).
+    m = line.match(/^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)((?:\s*<[^>]*>)?\s*(?:=|\{|extends\b))/);
     if (m) {
       parsed.definitions.push({
         name: m[1], kind: 'type', exported: /^\s*export\b/.test(line),
@@ -455,11 +534,22 @@ function parseJs(rel, raw) {
   var ex = raw.match(/export\s*\{([^}]*)\}/);
   if (ex) {
     ex[1].split(',').forEach(function (part) {
-      var bits = part.trim().split(/\s+as\s+/);
+      // `export { type Foo }` re-exports the type Foo: strip the `type`
+      // modifier before looking the name up (same rule as the import
+      // specifiers below).
+      var bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/);
       var name = bits[bits.length - 1].trim();
       if (defByName[name]) defByName[name].exported = true;
     });
   }
+  // `module.exports = foo` exports the whole module as `foo`: mark it
+  // exported so it grades REVIEW (public surface), never SAFE. The
+  // object-literal form above covers `module.exports = { foo }`; a
+  // member access or call (`module.exports = foo.bar()`,
+  // `module.exports = foo()`) is a real expression, not a bare export,
+  // and is handled by the references pass instead.
+  var meBare = raw.match(/module\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*(?:;|$)/m);
+  if (meBare && defByName[meBare[1]]) defByName[meBare[1]].exported = true;
 
   // Imports, parsed line-by-line from the raw source (the stripped code
   // has no string literals left, so specifiers must come from here).
@@ -477,13 +567,21 @@ function parseJs(rel, raw) {
       var brace = spec.match(/\{([^}]*)\}/);
       if (brace) {
         brace[1].split(',').forEach(function (part) {
-          part = part.trim();
+          // `import { type Foo }` / `import { type Foo as Bar }` bind
+          // Foo (or Bar), not a name literally called `type Foo`: strip
+          // the `type` modifier. A bare `type` with no name after it
+          // (`import { type }`) is untouched — the modifier needs the
+          // trailing whitespace to apply.
+          part = part.trim().replace(/^type\s+/, '');
           if (!part) return;
           var bits = part.split(/\s+as\s+/);
           names.push({ imported: bits[0].trim(), local: (bits[1] || bits[0]).trim(), kind: 'named' });
         });
       }
-      var defm = spec.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
+      // A leading `type` modifier on a default import (`import type Foo
+      // from '...'`): the binding is Foo, not `type`.
+      var defSpec = spec.replace(/^type\s+/, '');
+      var defm = defSpec.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
       if (defm) names.push({ imported: 'default', local: defm[1], kind: 'default' });
     }
     return { source: im[2], names: names, sideEffect: !spec, reExport: isCompatShimJs };
@@ -601,13 +699,20 @@ function parseJs(rel, raw) {
       }
     }
     // A `module.exports = ...` line is an export, not a use — but only
-    // when it STARTS the line. `module.exports` chained mid-line
-    // (`var app = module.exports = express()`) also calls express() on
-    // the same line, so the line is scanned with only the `module` /
-    // `exports` identifiers dropped. (A pure `module.exports =
-    // express()` — exporting a call result — is still skipped: a known
-    // gap, the call is not counted.)
-    if (/^\s*module\.exports\s*=/.test(l)) continue;
+    // when the exported value is an object literal (`module.exports =
+    // { live }`: `live` is the export name, not a use) or a bare
+    // identifier (`module.exports = foo`: `foo` IS the export, and it
+    // is marked exported above, so it grades REVIEW). Any other
+    // right-hand side is a real expression, so the line is scanned
+    // like any other, with only the `module` / `exports` identifiers
+    // dropped: `module.exports = withBundleAnalyzer({...})` calls the
+    // import, `module.exports = xs.filter(isExportNode)` passes the
+    // import as an argument, and `module.exports = express()` calls it
+    // (that last shape used to be a known gap).
+    if (/^\s*module\.exports\s*=/.test(l)) {
+      var rhs = l.replace(/^\s*module\.exports\s*=\s*/, '');
+      if (/^\{/.test(rhs) || /^[A-Za-z_$][\w$]*\s*;?\s*$/.test(rhs)) continue;
+    }
     var skipExportsIds = /module\.exports\b/.test(l) ? new Set(['module', 'exports']) : null;
     var declared = declaredOnLine[lineNo2] || new Set();
     // Decorator line (`@app.command()`, `@Component({...})`,
@@ -708,20 +813,46 @@ function parseJs(rel, raw) {
       // and so does a return whose value is a template literal spanning
       // lines (its `${...}` expressions look like code but are not
       // statements). Detect the unclosed backtick on the raw line.
+      // A return whose expression continues on the next line does not
+      // terminate either: the line ends with an operator (`return a +`)
+      // or the next line starts a member chain / continuation (`return
+      // str` followed by `.split(...).map(...)`, `return toThenable(..)`
+      // followed by `.then(...)` — commander help.js, zustand
+      // persist.ts, date-fns format/index.ts).
       // And a return that is the body of a BRACELESS if/for/while (the
       // control header is the previous line, with no `{`) only exits
       // conditionally — it does not terminate the block. Without this,
       // the statement after it was flagged unreachable (commander:
       // `if (str === undefined ...) return this._description;` followed
-      // by a reachable assignment).
+      // by a reachable assignment). A braceless header can span lines
+      // (`if (\n cond\n )`), so the header is found by walking back
+      // until its parens balance (commander command.js, date-fns
+      // buildMds.ts, _lib/tp/index.ts).
       var opens = (ul.match(/[\{\(\[]/g) || []).length;
       var closes = (ul.match(/[\}\)\]]/g) || []).length;
       var rawLineU = rawLinesU[ui] || '';
       var bt = (rawLineU.match(/`/g) || []).length;
-      var prevU = '';
-      for (var pi = ui - 1; pi >= 0; pi--) { if (lines[pi].trim() !== '') { prevU = lines[pi]; break; } }
-      var braceless = /^\s*else\s*$/.test(prevU) || /^\s*(if|else\s+if|for|while)\b[^;{]*\)\s*$/.test(prevU);
-      if (opens <= closes && bt % 2 === 0 && !braceless) { terminatedAt = dBefore; terminatedLineU = ui; }
+      var headerLines = [];
+      var parenDepthU = 0;
+      for (var pi = ui - 1; pi >= 0 && headerLines.length < 10; pi--) {
+        var plU = lines[pi];
+        if (plU.trim() === '') continue;
+        headerLines.unshift(plU);
+        for (var pcU = 0; pcU < plU.length; pcU++) {
+          if (plU[pcU] === '(') parenDepthU++;
+          else if (plU[pcU] === ')') parenDepthU--;
+        }
+        if (parenDepthU === 0) break;
+      }
+      var headerU = headerLines.join('\n');
+      var braceless = /^\s*\}?\s*else\s*$/.test(headerU) || /^\s*(if|else\s+if|for|while)\b[^;{]*\)\s*$/.test(headerU);
+      var endsWithOperator = /[({[,&|?:+\-*/%=<>!]$/.test(trimmed);
+      var nextTrimmed = '';
+      for (var ni = ui + 1; ni < lines.length; ni++) {
+        if (lines[ni].trim() !== '') { nextTrimmed = lines[ni].trim(); break; }
+      }
+      var continuesNextLine = /^[?:,)\].&|+]/.test(nextTrimmed);
+      if (opens <= closes && bt % 2 === 0 && !braceless && !endsWithOperator && !continuesNextLine) { terminatedAt = dBefore; terminatedLineU = ui; }
     }
   }
 
@@ -855,8 +986,19 @@ function parsePy(rel, raw) {
   // (Mirrors src/parse-py.js.)
   var isPackageInit = baseOf(rel) === '__init__.py';
   var isCompatShimPy = /(^|\/)(_?compat)(\.py)?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
-  function reExportPy(stmt, redundantAlias) {
-    return isPackageInit || isCompatShimPy || /#\s*noqa\b/.test(stmt) || Boolean(redundantAlias);
+  // Raw lines, defined here (not in the references pass below) because
+  // the import loop needs them: a `# noqa` marker lives in a comment,
+  // which the stripped code has blanked.
+  var rawLinesPy = raw.split('\n');
+  function reExportPy(stmt, redundantAlias, rawStmt) {
+    // The noqa marker lives in a comment, which the stripped code has
+    // blanked — so it is invisible in `stmt`. Check the raw statement
+    // too: `import cryptography  # noqa: F401` and a multi-line
+    // `from x import (  # noqa: F401` are intentional re-exports (the
+    // CLI's tree-sitter parser sees the comment; the web parser must
+    // not lose it to stripping). Without this, requests' compat
+    // re-exports and flask's `cryptography` import were flagged SAFE.
+    return isPackageInit || isCompatShimPy || /#\s*noqa\b/.test(stmt) || (rawStmt && /#\s*noqa\b/.test(rawStmt)) || Boolean(redundantAlias);
   }
   // An import statement can span lines — a parenthesized from-import
   // (`from x import (\n a,\n)`) or a backslash continuation
@@ -887,7 +1029,7 @@ function parsePy(rel, raw) {
       covered.push(ii + 1);
     }
     covered.forEach(function (n) { importLines[n] = true; });
-    return { stmt: stmt, next: ii };
+    return { stmt: stmt, next: ii, rawStmt: rawLinesPy.slice(covered[0] - 1, covered[covered.length - 1]).join('\n') };
   }
   function fromNames(text) {
     var names = [];
@@ -915,7 +1057,7 @@ function parsePy(rel, raw) {
       ii = acc.next;
       var fn = fromNames(acc.stmt);
       parsed.imports.push({
-        source: fm[2] || '', names: fn.names, sideEffect: false, reExport: reExportPy(acc.stmt, fn.redundantAlias),
+        source: fm[2] || '', names: fn.names, sideEffect: false, reExport: reExportPy(acc.stmt, fn.redundantAlias, acc.rawStmt),
         fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
       });
       continue;
@@ -937,7 +1079,7 @@ function parsePy(rel, raw) {
       });
       parsed.imports.push({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
-        names: names3, sideEffect: false, reExport: reExportPy(acc2.stmt, redundantAlias2), fromImport: false, relative: false, level: 0,
+        names: names3, sideEffect: false, reExport: reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt), fromImport: false, relative: false, level: 0,
       });
     }
   }
@@ -951,7 +1093,8 @@ function parsePy(rel, raw) {
   // `references` here and no unused Python import was ever flagged.
   // Imports in __init__.py are re-exports (they define the package
   // namespace), so they are marked reExport below and never flagged.
-  var rawLinesPy = raw.split('\n');
+  // (rawLinesPy is defined above, by the import loop — it needs the raw
+  // lines for the `# noqa` check.)
   for (var ri = 0; ri < lines.length; ri++) {
     var rl = lines[ri];
     var rNo = ri + 1;
@@ -1062,7 +1205,20 @@ function parsePy(rel, raw) {
       parsed.unreachable.push({ line: ui2 + 1, reason: 'code after return/raise/break/continue', snippet: t2.slice(0, 120) });
       continue;
     }
-    if (/^\s*(return|raise|break|continue)\b/.test(ul2)) { terminatedIndent = ind2; terminatedLinePy = ui2; }
+    if (/^\s*(return|raise|break|continue)\b/.test(ul2)) {
+      // Only a complete statement terminates the block: a multi-line
+      // `raise X(\n ...\n ) from e` or `return (\n ...\n )` keeps going
+      // on the next lines, and the `) from e` / `).rstrip()` line is
+      // part of it, not a new unreachable statement (flask cli.py,
+      // click, fastapi). A statement is complete when its brackets
+      // balance and it does not end with a backslash continuation.
+      var depthPy = 0;
+      for (var di = 0; di < ul2.length; di++) {
+        if (ul2[di] === '(' || ul2[di] === '[' || ul2[di] === '{') depthPy++;
+        else if (ul2[di] === ')' || ul2[di] === ']' || ul2[di] === '}') depthPy--;
+      }
+      if (depthPy <= 0 && !/\\\s*$/.test(ul2)) { terminatedIndent = ind2; terminatedLinePy = ui2; }
+    }
   }
 
   return parsed;
@@ -1445,8 +1601,67 @@ function analyzeFiles(inputFiles, options) {
   // .forEach call below with "stringHits.forEach is not a function".
   // The CLI uses a Map for the same cache and never had this bug.
   var stringCache = Object.create(null);
-  function filesMentioning(name) {
-    if (stringCache[name]) return stringCache[name];
+  // Inverted string index, built once per scan (lazily, on first use) —
+  // mirrors src/graph.js. The old filesMentioning scanned every text
+  // file per symbol — O(symbols x files) — which collapsed throughput
+  // on large repos (fastapi: 236s web vs 12.9s CLI). The index maps
+  // each code-like token to the files mentioning it, so a lookup is a
+  // hash hit, not a scan. Tokenisation mirrors codeLikeStringMention:
+  // in code files a token only counts when it sits in code (delimited
+  // by non-space characters), so words inside sentences do not count;
+  // in raw config files any whole-word token counts, matching the old
+  // raw-text regex. The index itself is a null-prototype object for
+  // the same reason as stringCache above: token keys are untrusted
+  // symbol names, so a plain {} would return inherited members for
+  // tokens like "constructor" or "toString".
+  var stringIndex = null; // Object.create(null): token -> Set of rels | null
+  function buildStringIndex() {
+    var index = Object.create(null);
+    function addToken(token, rel) {
+      if (!index[token]) index[token] = new Set();
+      index[token].add(rel);
+    }
+    function addLiteral(literal, rel, codeLike) {
+      var re = /[A-Za-z_][A-Za-z0-9_]*/g;
+      var m;
+      while ((m = re.exec(literal)) !== null) {
+        // A token must not start in the middle of a number: `%5c` in a
+        // URL is not a reference to `c`, and `%70age` is not a reference
+        // to `age` — \b in the old per-name scan agrees (a digit before
+        // the name breaks the word boundary). The token regex can only
+        // start a match right after a digit (a letter or `_` before it
+        // would have been consumed into the token itself), so a digit
+        // guard is the whole fix.
+        if (m.index > 0 && /[0-9]/.test(literal[m.index - 1])) continue;
+        if (codeLike) {
+          var before = m.index === 0 ? '' : literal[m.index - 1];
+          var after = m.index + m[0].length >= literal.length ? '' : literal[m.index + m[0].length];
+          if ((before !== '' && /\s/.test(before)) || (after !== '' && /\s/.test(after))) continue;
+        }
+        addToken(m[0], rel);
+      }
+    }
+    textFiles.forEach(function (f) {
+      var ext = extOf(f.rel);
+      if (PROSE_EXTS[ext]) return; // prose never executes
+      var info = files[f.rel];
+      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0)) {
+        if (info.parsed) {
+          (info.parsed.strings || []).forEach(function (s) { addLiteral(s, f.rel, true); });
+          return;
+        }
+        // Unparseable code file: fall back to a raw-text match rather
+        // than risk hiding a real reference.
+      } else if (!RAW_MATCH_EXTS[ext]) {
+        return; // unknown text extension — do not guess
+      }
+      addLiteral(f.content, f.rel, false);
+    });
+    stringIndex = index;
+  }
+  // The old per-name scan, kept for names the index cannot answer
+  // (scoped / hyphenated / dotted names with non-word characters).
+  function scanFilesMentioning(name) {
     var re = mentionRegExp(name);
     var hits = new Set();
     textFiles.forEach(function (f) {
@@ -1467,6 +1682,17 @@ function analyzeFiles(inputFiles, options) {
       }
       try { if (re.test(f.content)) hits.add(f.rel); } catch (_) {}
     });
+    return hits;
+  }
+  function filesMentioning(name) {
+    if (stringCache[name]) return stringCache[name];
+    var hits;
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      if (!stringIndex) buildStringIndex();
+      hits = stringIndex[name] || new Set();
+    } else {
+      hits = scanFilesMentioning(name);
+    }
     stringCache[name] = hits;
     return hits;
   }

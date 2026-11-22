@@ -74,14 +74,22 @@ function parsePy(filePath, src) {
   };
 
   const pendingDecorators = new Map();
+  // Class-body inventories for the class-attribute rules (FP-6):
+  // per class, the names defined directly in its body, whether the body
+  // defines any method, and the class node itself (for its bases).
+  const classInfos = [];
+  // One split for the whole file: addDef reads the lines above a
+  // definition (Sphinx `#:` attribute docs), pass 3 reuses it.
+  const srcLines = src.split('\n');
 
   const addDef = (name, kind, node, extra) => {
     if (!name) return;
     // The enclosing scope: walk past statement wrappers (an assignment
     // sits under an expression_statement, a decorated def under a
-    // decorated_definition) to the real parent — module, block, or class.
+    // decorated_definition, a chained-assignment target under its outer
+    // assignment) to the real parent — module, block, or class.
     let scope = node.parent;
-    while (scope && (scope.type === 'expression_statement' || scope.type === 'decorated_definition')) scope = scope.parent;
+    while (scope && (scope.type === 'expression_statement' || scope.type === 'decorated_definition' || scope.type === 'assignment')) scope = scope.parent;
     const parentType = scope ? scope.type : 'module';
     // A function defined inside a class body is a method, not a module
     // function. The check uses the walked scope, not node.parent: a
@@ -92,14 +100,28 @@ function parsePy(filePath, src) {
       && scope.parent && scope.parent.type === 'class_definition') {
       finalKind = 'method';
     }
+    // A class attribute: a variable assigned directly in a class body.
+    // The enclosing class node is recorded so the post-pass below can
+    // resolve which base class the attribute belongs to.
+    const inClassBody = kind === 'variable' && scope && scope.type === 'block'
+      && scope.parent && scope.parent.type === 'class_definition';
+    const classNode = inClassBody ? scope.parent : null;
+    // A Sphinx `#:` comment block directly above a class attribute
+    // documents it as part of the class's public API (an
+    // extension-facing flag, a mixin default): the comment is the
+    // signal, so it travels on the definition; confidence.js grades it.
+    let documentedAttr = false;
+    if (inClassBody) {
+      let row = node.startPosition.row - 1;
+      while (row >= 0 && /^\s*#:/.test(srcLines[row] || '')) { documentedAttr = true; row -= 1; }
+    }
     // Framework-populated model fields: a class attribute inside a
     // Pydantic BaseModel subclass or a @dataclass is populated by the
     // framework from external data (JSON, constructor kwargs) and is
     // never read by attribute in-repo — so it is KEEP, never SAFE.
     // The flag travels on the definition; confidence.js grades it.
     let frameworkField = false;
-    if (kind === 'variable' && scope && scope.type === 'block' && scope.parent && scope.parent.type === 'class_definition') {
-      const classNode = scope.parent;
+    if (inClassBody) {
       const supers = childByField(classNode, 'superclasses');
       const baseText = supers ? text(supers, src) : '';
       const decs = pendingDecorators.get(classNode.startIndex) || [];
@@ -120,6 +142,11 @@ function parsePy(filePath, src) {
       decorators: pendingDecorators.get(node.startIndex) || [],
       _parentType: parentType,
       frameworkField,
+      documentedAttr,
+      // Internal: the enclosing class node, resolved by the post-pass
+      // below into externalBase / configClassAttr / chainedAlias.
+      // Deleted before the result leaves parsePy.
+      _classStart: classNode ? classNode.startIndex : null,
       ...(extra || {}),
     });
     if (DUNDER_KEEP.has(name) || /^__\w+__$/.test(name)) result.dunder.add(name);
@@ -232,8 +259,43 @@ function parsePy(filePath, src) {
       case 'class_definition': {
         const nameNode = childByField(node, 'name');
         if (nameNode) addDef(text(nameNode, src), 'class', node);
-        // Methods are function_definitions inside the class body; they are
-        // collected by the function_definition case above.
+        // Member inventory for the class-attribute rules: the names
+        // defined directly in the class body (methods, chained aliases,
+        // plain attributes) and whether the body defines any method at
+        // all. Statements sit under expression_statement wrappers;
+        // decorated defs under decorated_definition.
+        const body = childByField(node, 'body');
+        const members = new Set();
+        let hasMethod = false;
+        if (body) {
+          for (let i = 0; i < body.namedChildCount; i++) {
+            let stmt = body.namedChild(i);
+            if (stmt.type === 'expression_statement') stmt = stmt.namedChild(0);
+            if (!stmt) continue;
+            if (stmt.type === 'decorated_definition') {
+              for (let j = 0; j < stmt.namedChildCount; j++) {
+                const w = stmt.namedChild(j);
+                if (w.type === 'function_definition' || w.type === 'class_definition') stmt = w;
+              }
+            }
+            if (stmt.type === 'function_definition') {
+              hasMethod = true;
+              const n = childByField(stmt, 'name');
+              if (n) members.add(text(n, src));
+            } else if (stmt.type === 'class_definition') {
+              const n = childByField(stmt, 'name');
+              if (n) members.add(text(n, src));
+            } else if (stmt.type === 'assignment') {
+              let a = stmt;
+              while (a && a.type === 'assignment') {
+                const l = childByField(a, 'left');
+                if (l && l.type === 'identifier') members.add(text(l, src));
+                a = childByField(a, 'right');
+              }
+            }
+          }
+        }
+        classInfos.push({ startIndex: node.startIndex, endIndex: node.endIndex, members, hasMethod, node });
         break;
       }
       case 'assignment': {
@@ -246,8 +308,20 @@ function parsePy(filePath, src) {
         // a parent class's attributes): flagging them SAFE was noise.
         // Annotated assignments WITH a value still define the name.
         if (left && left.type === 'identifier' && right) {
+          // Chained assignment (`a = b = c = value`): tree-sitter nests
+          // the assignments, so the value is at the end of the right
+          // spine of the OUTERMOST assignment node. When that value is
+          // a bare name, every name in the chain aliases it — the
+          // post-pass below checks whether the name is defined in the
+          // same class, which is what makes the alias live.
+          let top = node;
+          while (top.parent && top.parent.type === 'assignment') top = top.parent;
+          let terminal = childByField(top, 'right');
+          let chainLen = 1;
+          while (terminal && terminal.type === 'assignment') { chainLen += 1; terminal = childByField(terminal, 'right'); }
+          const isChain = chainLen > 1 || top !== node;
           const kind = right && (right.type === 'lambda') ? 'function' : 'variable';
-          addDef(text(left, src), kind, node);
+          addDef(text(left, src), kind, node, (isChain && terminal && terminal.type === 'identifier') ? { chainedAliasOf: text(terminal, src) } : undefined);
         }
         break;
       }
@@ -259,6 +333,63 @@ function parsePy(filePath, src) {
         break;
     }
   });
+
+  // --- class-attribute rules (FP-6): resolve the class context of
+  // each class-body variable definition. ---
+  // A base counts as external when its name is imported into this file
+  // by a non-relative import: the parent class is defined outside this
+  // file (another package, or another module of this repo imported by
+  // absolute path), so its attributes may be read by framework code the
+  // repo cannot see. A relative import (`from .base import Base`) or a
+  // base defined in this file is in-repo: the parent source is here, so
+  // an override is provable from the graph instead.
+  const externalImportLocals = new Set();
+  for (const imp of result.imports) {
+    if (imp.fromImport && imp.level) continue; // relative: in-repo
+    for (const n of imp.names || []) externalImportLocals.add(n.local);
+  }
+  // Base names of a class: the leading identifier of each entry in the
+  // superclasses list (`CallbackDict[str, t.Any]` -> CallbackDict,
+  // `mod.Base` -> mod). Split on top-level commas only, so commas
+  // inside generics do not split a base in two.
+  const baseNamesOf = (classNode) => {
+    const supers = childByField(classNode, 'superclasses');
+    if (!supers) return [];
+    const raw = text(supers, src).replace(/^\(|\)$/g, '');
+    const parts = [];
+    let depth = 0;
+    let cur = '';
+    for (const ch of raw) {
+      if (ch === '[' || ch === '(') depth += 1;
+      if (ch === ']' || ch === ')') depth -= 1;
+      if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += ch;
+    }
+    if (cur.trim()) parts.push(cur);
+    return parts.map((p) => (p.trim().match(/^[A-Za-z_][A-Za-z0-9_]*/) || [])[0]).filter(Boolean);
+  };
+  for (const info of classInfos) {
+    info.externalBase = baseNamesOf(info.node).some((b) => externalImportLocals.has(b));
+  }
+  for (const d of result.definitions) {
+    // NB: a class at offset 0 has _classStart === 0, which is falsy —
+    // test for null, not truthiness.
+    if (d._classStart == null) { delete d._classStart; continue; }
+    const info = classInfos.find((c) => c.startIndex === d._classStart);
+    if (!info) { delete d._classStart; continue; }
+    // A chained-assignment alias is live only when the aliased name is
+    // defined in the same class (`popitem = _fail`, where _fail is the
+    // class's own method): the names are one object, part of the
+    // class's interface. A chain ending in any other name is an
+    // ordinary alias and stays a candidate.
+    if (d.chainedAliasOf && info.members.has(d.chainedAliasOf)) d.chainedAlias = true;
+    d.externalBase = info.externalBase;
+    // A subclass of an externally-defined base whose body defines only
+    // attributes (no methods) is a framework-consumed config class (a
+    // Pygments Style subclass): the framework reads the attributes at
+    // runtime.
+    d.configClassAttr = info.externalBase && !info.hasMethod;
+    delete d._classStart;
+  }
 
   // __all__ = [...] (or (...) — typer's _typing.py uses a tuple, and
   // either form may span lines) makes names public exports, and a name
@@ -412,7 +543,7 @@ function parsePy(filePath, src) {
   });
 
   // --- pass 3: unreachable code (statements after return/raise/break/continue) ---
-  const srcLines = src.split('\n');
+  // (srcLines is defined at the top of parsePy.)
   walk(root, (node) => {
     if (node.type === 'block') {
       let terminated = false;

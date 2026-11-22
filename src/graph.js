@@ -394,6 +394,14 @@ function analyze(root, discovery) {
       const re = /[A-Za-z_][A-Za-z0-9_]*/g;
       let m;
       while ((m = re.exec(literal)) !== null) {
+        // A token must not start in the middle of a number: `%5c` in a
+        // URL is not a reference to `c`, and `%70age` is not a reference
+        // to `age` — \b in the old per-name scan agrees (a digit before
+        // the name breaks the word boundary). The token regex can only
+        // start a match right after a digit (a letter or `_` before it
+        // would have been consumed into the token itself), so a digit
+        // guard is the whole fix. (The web analyzer has the same guard.)
+        if (m.index > 0 && /[0-9]/.test(literal[m.index - 1])) continue;
         if (codeLike) {
           const before = m.index === 0 ? '' : literal[m.index - 1];
           const after = m.index + m[0].length >= literal.length ? '' : literal[m.index + m[0].length];

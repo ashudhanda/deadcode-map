@@ -59,3 +59,22 @@ test('web analyzer: a standalone function named like a prototype member is handl
   const flagged = out.findings.filter((f) => f.symbol === 'hasOwnProperty');
   assert.equal(flagged.length, 0, 'a used function must not be flagged');
 });
+
+test('web analyzer: string-index tokens named like prototype members return a Set', () => {
+  // The inverted string index (docs/analyzer.js, mirroring src/graph.js)
+  // is a null-prototype object for the same reason as the cache above:
+  // a token like "toString" must look up a Set of files, never the
+  // inherited Object.prototype.toString function. "toString" as a
+  // code-like string token is a string mention, so the unexported
+  // toString in a.js is REVIEW (string-referenced), never SAFE — and
+  // the lookup itself must not throw.
+  const out = analyzeFiles([
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/b.js' }) },
+    { path: 'src/a.js', content: 'function toString() { return "x"; }\nmodule.exports = { toString };\n' },
+    { path: 'src/b.js', content: 'const key = "toString";\nconsole.log(key);\n' },
+  ]);
+  assert.ok(Array.isArray(out.findings), 'findings must be an array');
+  const flagged = out.findings.find((f) => f.file === 'src/a.js' && f.symbol === 'toString');
+  assert.ok(flagged, 'toString must be found');
+  assert.equal(flagged.grade, 'REVIEW', 'a string-referenced symbol is REVIEW, never SAFE');
+});

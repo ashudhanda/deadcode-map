@@ -46,6 +46,12 @@ Options:
   --include-fixtures   Scan fixture/test-data directories too (fixtures/, __fixtures__/ —
                        excluded by default, at any depth)
   --top <n>            How many findings to list in the terminal (default 10)
+  --cache              Cache per-file parses to speed up repeat scans
+                       (default: off; cache lives in node_modules/.cache/
+                       deadcode-map/ when node_modules exists, else in
+                       .deadcode-map-cache.json next to the scanned root)
+  --no-cache           Force a full scan: ignore the cache and write nothing
+  --cache-stats        Enable the cache and print hit/miss stats after the scan
   --no-color           Disable coloured output
   --version            Print the version
   --help               Print this help
@@ -58,6 +64,7 @@ function parseArgs(argv) {
     baseline: false, updateBaseline: false, showBaseline: false,
     fix: false, prove: false, testCommand: null, includeReview: false,
     includeFixtures: false, top: 10, color: true,
+    cache: false, noCache: false, cacheStats: false,
   };
   const args = argv.slice(2);
   for (let i = 0; i < args.length; i++) {
@@ -77,6 +84,9 @@ function parseArgs(argv) {
     else if (a === '--include-review') opts.includeReview = true;
     else if (a === '--include-fixtures') opts.includeFixtures = true;
     else if (a === '--top') opts.top = parseInt(args[++i], 10) || 10;
+    else if (a === '--cache') opts.cache = true;
+    else if (a === '--no-cache') opts.noCache = true;
+    else if (a === '--cache-stats') opts.cacheStats = true;
     else if (a === '--no-color') opts.color = false;
     else if (a.startsWith('-')) { console.error(`Unknown option: ${a}\n${help()}`); process.exit(2); }
     else opts.path = a;
@@ -102,7 +112,8 @@ function main() {
     process.exit(2);
   }
 
-  const { graph, findings } = scan(root, { includeFixtures: opts.includeFixtures });
+  const cacheOpts = { cache: opts.cache, noCache: opts.noCache, cacheStats: opts.cacheStats };
+  const { graph, findings, cache } = scan(root, { includeFixtures: opts.includeFixtures, ...cacheOpts });
   let visible = findings;
 
   // Baseline handling.
@@ -158,6 +169,17 @@ function main() {
     console.log(`--prove: ${result.status} — ${result.proven || 0} proven, ${result.breaks || 0} break${result.breaks === 1 ? 's' : ''}.`);
     for (const r of result.results || []) console.log(`  ${r.status.padEnd(7)} ${r.cluster} — ${r.reason}`);
     if (result.reason) console.log(`  ${result.reason}`);
+  }
+
+  if (opts.cacheStats) {
+    // With --json - stdout is pure JSON, so stats go to stderr instead.
+    const out = opts.json === '-' ? console.error : console.log;
+    if (!cache || !cache.enabled) {
+      out('Cache: disabled (--no-cache), no stats collected.');
+    } else {
+      out(`Cache: ${cache.hits} hit(s), ${cache.misses} missed (${cache.hitRate}% hit rate), `
+        + `~${cache.estimatedSavedMs}ms parse time saved — ${cache.location}`);
+    }
   }
 
   // Exit code for CI.

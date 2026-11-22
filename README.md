@@ -33,6 +33,9 @@ deadcode-map ./my-app --fix                 # delete SAFE findings only
 deadcode-map ./my-app --prove               # prove SAFE deletions with your tests
 deadcode-map ./my-app --prove --test-command "pytest -q"
 deadcode-map ./my-app --include-fixtures    # also scan fixtures/ test-data dirs (excluded by default)
+deadcode-map ./my-app --cache               # cache per-file parses; repeat scans are ~8-10x faster
+deadcode-map ./my-app --cache --cache-stats # show cache hit rate after the scan
+deadcode-map ./my-app --no-cache            # force a full scan, ignore the cache
 deadcode-map mcp                            # start the MCP server on stdio (for AI tools)
 ```
 
@@ -260,7 +263,7 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 
 ## Measured results (checkable, not marketing)
 
-Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (56 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (39 web tests). New fixtures in this batch: `ts-types`, `py-annotations`, `js-app`, `js-library`, `js-cascade`, `py-typer`, `js-methods`, `py-reexports`, `js-reexports`, `py-pydantic`, `ts-ambient`, `ts-testfile`, `py-decorated`, `js-alias` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
+Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (71 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (52 web tests). New fixtures in this batch: `ts-types`, `py-annotations`, `js-app`, `js-library`, `js-cascade`, `py-typer`, `js-methods`, `py-reexports`, `js-reexports`, `py-pydantic`, `ts-ambient`, `ts-testfile`, `py-decorated`, `js-alias`, `py-class-attrs` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
 
 | Fixture | Files | SAFE found | SAFE false positives | SAFE FP rate |
 |---|---|---|---|---|
@@ -269,35 +272,36 @@ Fixtures live in `fixtures/` with planted dead items and known live items. Run t
 | `py-relative` (Python, relative imports) | 7 | 1 | 0 | **0%** |
 | `py-imports` (Python, dotted imports + module dunders) | 4 | 1 | 0 | **0%** |
 | `py-multiline` (Python, parenthesized + backslash imports) | 2 | 3 | 0 | **0%** |
-| `js-string` (JS, prose vs code-like string mentions) | 6 | 2 | 0 | **0%** |
+| `js-string` (JS, prose vs code-like string mentions) | 6 | 3 | 0 | **0%** |
 | `py-string` (Python, docstring prose vs code-like mentions) | 4 | 1 | 0 | **0%** |
 | `js-deps` (JS, dead dependencies: README prose vs real imports) | 5 | 0 | 0 | **0%** |
 | `js-framework` (Next.js `pages/`) | 1 | 0 | 0 | **0%** |
+| `py-class-attrs` (Python, config classes / external-base overrides / chained aliases / documented attrs) | 5 | 6 | 0 | **0%** |
 
 ### Real-repo benchmark (10 public repos + 3 diagnosis repos, CLI)
 
-Measured 2026-11-22 with the current tool (commit `aa038d6` for the
-re-export/framework fixes, plus the alias fix below — re-measure with
-`node ~/workspace/bench-repos/bench-run.js`). Before = the tool at the
-start of this batch (corpus scan B / diagnosis numbers); after = now.
-SAFE precision is hand-sampled per repo, not asserted from the count.
+Measured 2026-11-22 with the current tool (commit `8a68925` —
+re-measure with `node ~/workspace/bench-repos/bench-run.js`). Before =
+the tool at the start of batch 1 (corpus scan B / diagnosis numbers);
+after = now. SAFE precision is hand-sampled per repo, not asserted
+from the count.
 
 | Repo | Files | SAFE before | SAFE after | Sampled SAFE precision after |
 |---|---|---|---|---|
 | express | 142 | 0 | 0 | — |
 | commander | 159 | 3 | 0 | — |
 | zustand | 49 | 5 | 0 | — |
-| preact | 239 | 33 | 20 | ~100% (unused demo imports; automatic JSX runtime) |
+| preact | 239 | 33 | 20 | 16/20 verified true (unused demo imports); 4 are `export { … }` re-exports the web counts as live — CLI gap, see limitations |
 | date-fns | 1776 | 100 | 1 | 100% (1 unused variable) |
 | next-blog | 22 | 11 | 11 | 100% (unused React imports) |
-| flask | 83 | 17 | 3 | 0/3 (class attributes — see limitations) |
+| flask | 83 | 17 | 0 | — |
 | fastapi | 1237 | 71 | 0 | — |
-| requests | 37 | 33 | 5 | 2/5 (2 unused type aliases true; 3 theme attrs false) |
+| requests | 37 | 33 | 2 | 100% (2 unused type aliases) |
 | click | 91 | 2 | 0 | — |
 | axios | 261 | 90 | 0 | — |
-| typer | 645 | 43 | 5 | 5/5 (genuinely dead helpers) |
-| umami | 1520 | 1044 | 32 | ~100% sampled (dead components, unused utils) |
-| **Total** | **3836 + 2426** | **1452** | **77** | **corpus ~85%, umami ~100% sampled** |
+| typer | 645 | 43 | 3 | not re-sampled in batch 2 (was 5/5 genuinely dead at 5 SAFE) |
+| umami | 1520 | 1044 | 32 | ~100% sampled in batch 1 (dead components, unused utils) |
+| **Total** | **3836 + 2426** | **1452** | **69** | **62 of 69 verified true; 4 preact re-exports are a known CLI gap, 3 typer not re-sampled** |
 
 What fixed the bulk of it, in order: re-exports counted as uses
 (`import X as X`, `export { X }`, `# noqa: F401`, compat shims);
@@ -309,11 +313,20 @@ tsconfig `paths` aliases (`@/*` — umami's dominant family, 196 → 32);
 `.js` → `.ts` import resolution; monorepo-private packages treated as
 libraries; test files (`tests/`, `test.ts`) and intentional-unreachable
 markers (`# pragma: no cover`, `/* istanbul ignore next */`) kept.
+Batch 2 closed the last 6 corpus SAFE false positives — framework-
+consumed class attributes (Pygments theme classes, external-base
+overrides like Werkzeug's `default_mimetype`, chained-assignment
+aliases, Sphinx-documented flags) — and ported the inverted string
+index to the web checker, so web-only SAFE is now 0.
 
 Scan times (same machine): umami 1520 files 15.6 s (~97 files/s),
 fastapi 1237 files 12.9 s, date-fns 1776 files 8.6 s — the O(symbols ×
 files) string pass is now an inverted index and git is one `git log`
 per repo instead of two processes per file (umami was 173.9 s before).
+Repeat scans with `--cache` are ~8–10× faster (content-hash parse
+cache, warm findings identical to cold): fastapi cold 13.0 s → warm
+1.3 s (99% hit rate), date-fns cold ~8.5 s → warm ~0.9 s. The cache is
+off by default; `--no-cache` forces a full scan.
 
 Determinism note: a single CLI run is not ground truth on Python repos
 unless the tool version is pinned — an earlier measurement gap (flask
@@ -321,7 +334,7 @@ unless the tool version is pinned — an earlier measurement gap (flask
 mid-measurement, not nondeterminism: the current tool is byte-identical
 across 3 repeat runs on flask/requests/click.
 
-The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by `test/web-analyzer.test.js` (40 tests). On the 10-repo corpus it no longer crashes on any repo and emits no duplicate finding IDs, but its SAFE set is still larger than the CLI's (114 vs 40 — see the parity note in the limitations below) and it is slower on large Python repos.
+The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by `test/web-analyzer.test.js` (52 tests). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
 
 Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (44 findings, 0 in `src/`), which is the point of the fixtures.
 
@@ -329,9 +342,11 @@ A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) 
 
 Known limitations, stated honestly:
 
-- **Framework-consumed class attributes** (flask `sessions.py: pickle_based`, `wrappers.py: default_mimetype`; requests Pygments theme attrs; chained-assignment method aliases like `popitem = _fail`): a class attribute that a framework or a parent class reads by attribute is still flagged SAFE when nothing in-repo reads it by name. These are the 6 known SAFE false positives in the corpus above. A narrow rule for them (parent-class attribute overrides, theme-module attrs) does not exist yet — do not over-broaden by keeping all class attributes.
+- **`export { X }` re-exports in JS demo files**: the web checker counts a re-export as a use, the CLI does not yet in every shape — 4 preact demo imports (`export { createElement }` and siblings) are CLI SAFE but web REVIEW. Same family as the batch-1 re-export fixes; the CLI side is the next fix.
+- **Web multi-line `export { … } from` creates no import edge** (only single-line is parsed): a module reachable only via a multi-line re-export would look like a dead file in the web checker. No corpus case hits it yet.
+- **Web multi-line `module.exports = { … }`**: continuation lines are scanned as references, so an exported name can look same-file-used and lose its REVIEW finding in the web checker (false negative, pre-existing).
 - **Cascade is file-level only**: a symbol used only by another dead symbol in the *same live file* is not caught — only usage from dead *files* cascades. Same-file cascade needs per-definition reference scopes the parsers do not record yet.
-- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches (and vice versa on a few shapes). Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 114 vs CLI SAFE 40 — express 0, commander 12, zustand 7, preact 26, date-fns 18, next-blog 12, flask 18, fastapi 4, requests 6, click 8. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The web is also slower than the CLI on large Python repos (fastapi 214.7 s web vs 12.9 s CLI) because the inverted string index is CLI-only so far. The CLI is the reference; the web checker is a convenience.
+- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 28 vs CLI SAFE 34, web-only SAFE 0 — every web SAFE is also a CLI SAFE. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
 - **tsconfig `extends` is not followed**: `paths` must live in the local `tsconfig.json` / `jsconfig.json` — a base config that holds the paths is not read.
 - **JSX transform**: a `React` / `createElement` import in a JSX file is graded on the assumption the repo uses the automatic JSX runtime (Next.js, preact). A repo on the classic transform (JSX compiles to `React.createElement`) would see those imports flagged SAFE wrongly.
 - **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.

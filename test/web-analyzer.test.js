@@ -268,10 +268,13 @@ test('web js-string: prose mentions are not string references', () => {
   const f = loadFixture('js-string').findings;
   assert.equal(bySymbol(f, 'src/index.js', 'render').grade, 'SAFE');
   assert.equal(bySymbol(f, 'src/index.js', 'named').grade, 'SAFE');
+  // Mentioned only inside a URL-encoded token: `%70age` is not a
+  // reference to `age` (a digit before the name breaks the boundary).
+  assert.equal(bySymbol(f, 'src/index.js', 'age').grade, 'SAFE');
   assert.equal(bySymbol(f, 'src/index.js', 'handler').grade, 'REVIEW');
   assert.equal(bySymbol(f, 'src/index.js', 'wired').grade, 'REVIEW');
   const safe = f.filter((x) => x.grade === 'SAFE');
-  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named']);
+  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named', 'function:src/index.js:age']);
   for (const s of safe) {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
@@ -592,6 +595,445 @@ test('web module.exports chain, __future__, braceless return: three regex-parser
   // `from __future__ import annotations` is a compiler directive.
   assert.equal(bySymbol(f, 'app.py', 'annotations'), undefined, '__future__ imports are never flagged');
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web jsx-apostrophe: an apostrophe in JSX text does not swallow the file', () => {
+  // preact demos: `I'm memoed` / `I'm (fake) lazy loaded` / `we're` in
+  // JSX text used to open a "string" that blanked the rest of the file,
+  // so the imports looked dead and reachable code looked unreachable.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/demo.jsx',
+      content: [
+        "import { Component, memo } from 'react';",
+        '',
+        'function Foo() {',
+        "\treturn <div>I'm memoed</div>;",
+        '}',
+        '',
+        'function LazyComp() {',
+        "\treturn <div>I'm (fake) lazy loaded</div>;",
+        '}',
+        '',
+        'const Memoed = memo(Foo);',
+        'export default class Demo extends Component {',
+        '  render() { return <div><Foo /><LazyComp /><Memoed /></div>; }',
+        '}',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.js', content: "const Demo = require('./demo.jsx');\nconsole.log(Demo);\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'JSX apostrophes must not create unreachable findings');
+  assert.equal(bySymbol(r.findings, 'src/demo.jsx', 'Component'), undefined, 'Component is the base class of Demo');
+  assert.equal(bySymbol(r.findings, 'src/demo.jsx', 'memo'), undefined, 'memo wraps Foo');
+  assert.equal(bySymbol(r.findings, 'src/demo.jsx', 'Foo'), undefined, 'Foo is rendered in JSX');
+  assert.equal(bySymbol(r.findings, 'src/demo.jsx', 'LazyComp'), undefined, 'LazyComp is rendered in JSX');
+});
+
+test('web class-calls: a call line inside a class body is not a method definition', () => {
+  // commander lib/command.js: `handleOptionValue(val, ...)` and
+  // `checkForUnknownOptions()` are calls inside methods, but the old
+  // method regex recorded each call site as a phantom method — which
+  // also suppressed the real call, so the arrow-function definition
+  // looked dead (SAFE). date-fns MonthParser had the same shape with
+  // a nested `parseNumericPattern(...)` call.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/lib.js',
+      content: [
+        'class Command {',
+        '  parseOptions() {',
+        '    const handleOptionValue = (val) => { return val; };',
+        '    handleOptionValue("a");',
+        '    handleOptionValue("b");',
+        '  }',
+        '  check() {',
+        '    const checkForUnknownOptions = () => { return true; };',
+        '    checkForUnknownOptions();',
+        '    checkForUnknownOptions();',
+        '  }',
+        '  used() { return 1; }',
+        '}',
+        'module.exports = { Command };',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/parser.js',
+      content: [
+        "const { mapValue, parseNumericPattern } = require('./utils');",
+        'class MonthParser {',
+        '  parse(dateString) {',
+        '    return mapValue(',
+        '      parseNumericPattern(1, dateString),',
+        '      (v) => v,',
+        '    );',
+        '  }',
+        '}',
+        'module.exports = { MonthParser };',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/utils.js',
+      content: [
+        'function mapValue(v, fn) { return fn(v); }',
+        'function parseNumericPattern(a, b) { return a + b; }',
+        'module.exports = { mapValue, parseNumericPattern };',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.js', content: "const { Command } = require('./lib');\nconst { MonthParser } = require('./parser');\nconst c = new Command();\nconsole.log(c.used(), new MonthParser().parse('x'));\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/lib.js', 'handleOptionValue'), undefined, 'the arrow function is called in its own method');
+  assert.equal(bySymbol(r.findings, 'src/lib.js', 'checkForUnknownOptions'), undefined, 'the arrow function is called in its own method');
+  assert.equal(bySymbol(r.findings, 'src/parser.js', 'parseNumericPattern'), undefined, 'the nested call is a use of the import');
+  assert.equal(bySymbol(r.findings, 'src/parser.js', 'mapValue'), undefined, 'mapValue is called in parse()');
+  // No phantom method findings at the call lines, and no SAFE at all.
+  assert.equal(r.findings.filter((x) => x.category === 'method' && (x.symbol === 'handleOptionValue' || x.symbol === 'checkForUnknownOptions' || x.symbol === 'parseNumericPattern')).length, 0, 'call lines must not become phantom methods');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web return-continuation: a return whose expression continues on the next line does not terminate the block', () => {
+  // commander help.js (`return str` + `.split(...).map(...)`), zustand
+  // persist.ts (`return toThenable(...)` + `.then(...)`), and a return
+  // ending with an operator (`return a +`).
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/a.js',
+      content: [
+        'function styleUsage(str) {',
+        '  return str',
+        "    .split(' ')",
+        '    .map((word) => {',
+        "      if (word === '[options]') return word;",
+        "      if (word[0] === '[') return word;",
+        '      return word;',
+        '    })',
+        "    .join(' ');",
+        '}',
+        'function fetchIt(x) {',
+        '  return getIt(x)',
+        '    .then((v) => v);',
+        '}',
+        'function sum(a, b) {',
+        '  return a +',
+        '    b;',
+        '}',
+        'module.exports = { styleUsage, fetchIt, sum };',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.js', content: "const { styleUsage, fetchIt, sum } = require('./a');\nconsole.log(styleUsage('x'), fetchIt(1), sum(1, 2));\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'continued returns must not flag the following lines unreachable');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web braceless-multiline: a braceless if header spanning lines does not terminate the block', () => {
+  // commander command.js and date-fns buildMds.ts / _lib/tp/index.ts:
+  // `if (\n cond\n )` followed by a bare `return ...;` — the `)`
+  // line before the return used to defeat the braceless check, so the
+  // statement after the return was flagged unreachable.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/a.js',
+      content: [
+        'function check(x) {',
+        '  if (',
+        '    x === 1 ||',
+        '    x === 2',
+        '  )',
+        '    return false;',
+        '  return true;',
+        '}',
+        'function walk(list) {',
+        '  list.forEach((item) => {',
+        '    if (',
+        '      item === "a" ||',
+        '      item === "b"',
+        '    )',
+        '      return;',
+        '    console.log(item);',
+        '  });',
+        '}',
+        'module.exports = { check, walk };',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.js', content: "const { check, walk } = require('./a');\nconsole.log(check(1));\nwalk(['a']);\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'the statement after a braceless-if return is reachable');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web py-multiline-raise: a raise/return split over lines does not flag its continuation unreachable', () => {
+  // flask cli.py / app.py / debughelpers.py, click, fastapi: `raise
+  // NoAppException(\n ...\n ) from e` — the `) from e` line was flagged
+  // unreachable, and `return (\n ...\n ).rstrip()` the same.
+  const files = [
+    { path: 'main.py', content: 'from app import load_app, render\n\nif __name__ == "__main__":\n    print(load_app("x"), render("y"))\n' },
+    {
+      path: 'app.py',
+      content: [
+        'class NoAppException(Exception):',
+        '    pass',
+        '',
+        '',
+        'def load_app(name):',
+        '    try:',
+        '        return name',
+        '    except Exception as e:',
+        '        raise NoAppException(',
+        '            f"Failed to find {name}."',
+        '        ) from e',
+        '',
+        '',
+        'def render(value):',
+        '    return (',
+        '        value',
+        '        % {"label": "x"}',
+        '    ).rstrip()',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'a multi-line raise/return continuation is not unreachable');
+});
+
+test('web ts-type-list: names in an export type list are not phantom definitions', () => {
+  // zustand src/middleware.ts: `export {\n type DevtoolsOptions,\n
+  // type NamedSet,\n} from ...` — each list item used to become a
+  // phantom `type` definition that looked dead (SAFE).
+  const files = [
+    {
+      path: 'src/middleware.ts',
+      content: [
+        'export {',
+        '  devtools,',
+        '  type DevtoolsOptions,',
+        '  type NamedSet,',
+        "} from './devtools';",
+        'export type RealType = {',
+        '  name: string;',
+        '};',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/devtools.ts',
+      content: [
+        'export type DevtoolsOptions = { enabled: boolean };',
+        'export type NamedSet = { set: (x: number) => void };',
+        'export function devtools() { return 1; }',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.ts', content: "import { devtools, RealType } from './middleware';\nimport { DevtoolsOptions } from './devtools';\nconst x: RealType = { name: 'a' };\nconst y: DevtoolsOptions = { enabled: true };\nconsole.log(devtools(), x, y);\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/middleware.ts', 'DevtoolsOptions'), undefined, 'a type-list item is not a definition in this file');
+  assert.equal(bySymbol(r.findings, 'src/middleware.ts', 'NamedSet'), undefined, 'a type-list item is not a definition in this file');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web ts-type-import: import { type X } binds X, not "type X"', () => {
+  // date-fns: `import { type constructFromSymbol }` recorded a bogus
+  // import named `type constructFromSymbol` that could never be used,
+  // so the real import was flagged SAFE.
+  const files = [
+    {
+      path: 'src/types.ts',
+      content: [
+        'import { type constructFromSymbol } from "./constants";',
+        'export type HasSymbol = {',
+        '  [constructFromSymbol]: (v: number) => number;',
+        '};',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/constants.ts',
+      content: [
+        'export const constructFromSymbol = Symbol.for("constructDateFrom");',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.ts', content: "import { HasSymbol } from './types';\nconst h: HasSymbol | null = null;\nconsole.log(h);\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/types.ts', 'constructFromSymbol'), undefined, 'the type import is used as a computed property key');
+  assert.equal(bySymbol(r.findings, 'src/types.ts', 'type constructFromSymbol'), undefined, 'no bogus import named "type constructFromSymbol"');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web module-exports-expr: calls and arguments on a module.exports line are uses', () => {
+  // next-blog next.config.js: `module.exports =
+  // withBundleAnalyzer({...})` calls the import. date-fns buildMds.ts:
+  // `module.exports = nodes.filter(isExportNode)` passes the import as
+  // an argument. Both used to be skipped outright, so the imports were
+  // flagged SAFE. `module.exports = solo` (a bare identifier) is still
+  // an export, not a use — it grades REVIEW, never SAFE.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/index.js',
+      content: [
+        "const withBundleAnalyzer = require('@next/bundle-analyzer')({ enabled: true });",
+        'module.exports = withBundleAnalyzer({});',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/build.js',
+      content: [
+        "const { isExportNode } = require('./data');",
+        'module.exports = nodes.filter(isExportNode);',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/data.js',
+      content: [
+        'function isExportNode(n) { return n.type === "export"; }',
+        'module.exports = { isExportNode };',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/single.js',
+      content: [
+        'function solo() { return 1; }',
+        'module.exports = solo;',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/main.js', content: "require('./build');\nrequire('./single');\nconsole.log('ok');\n" },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/index.js', 'withBundleAnalyzer'), undefined, 'withBundleAnalyzer() is called on the module.exports line');
+  assert.equal(bySymbol(r.findings, 'src/build.js', 'isExportNode'), undefined, 'isExportNode is passed as an argument on the module.exports line');
+  assert.equal(bySymbol(r.findings, 'src/single.js', 'solo').grade, 'REVIEW', 'module.exports = solo exports it — REVIEW, never SAFE');
+});
+
+test('web py-noqa: a # noqa import is a re-export even though comments are stripped', () => {
+  // requests sessions.py / utils.py / models.py and flask cli.py: the
+  // `# noqa: F401` marker lives in a comment, which the stripped code
+  // blanks — so the web parser could not see it and flagged the import
+  // SAFE. The check must run on the raw statement, including the
+  // opening line of a multi-line import.
+  const files = [
+    { path: 'main.py', content: 'import sessions\n\nprint(sessions.make())\n' },
+    {
+      path: 'sessions.py',
+      content: [
+        'from .models import (  # noqa: F401',
+        '    REDIRECT_STATI,',
+        '    PreparedRequest,',
+        ')',
+        'import cryptography  # noqa: F401',
+        'import os',
+        '',
+        '',
+        'def make():',
+        '    return 1',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'models.py',
+      content: [
+        'REDIRECT_STATI = (301, 302)',
+        '',
+        '',
+        'class PreparedRequest:',
+        '    pass',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'sessions.py', 'REDIRECT_STATI'), undefined, 'a multi-line noqa import is a re-export');
+  assert.equal(bySymbol(r.findings, 'sessions.py', 'PreparedRequest'), undefined, 'a multi-line noqa import is a re-export');
+  assert.equal(bySymbol(r.findings, 'sessions.py', 'cryptography'), undefined, 'a single-line noqa import is a re-export');
+  assert.equal(bySymbol(r.findings, 'sessions.py', 'os').grade, 'SAFE', 'an unused import without noqa is still flagged');
+});
+
+test('web py-print-cls: print and cls are not keywords, so imports bound to them count as used', () => {
+  // fastapi scripts/translate.py: `from rich import print` — every
+  // `print(...)` call was skipped as a "keyword", so the import looked
+  // unused. flask app.py: `from .testing import FlaskClient as cls` —
+  // the `cls(...)` call was skipped the same way.
+  const files = [
+    { path: 'main.py', content: 'from app import make_client\nfrom translate import main\n\nif __name__ == "__main__":\n    print(make_client(), main())\n' },
+    {
+      path: 'app.py',
+      content: [
+        'from .testing import FlaskClient as cls',
+        '',
+        '',
+        'def make_client():',
+        '    return cls()',
+        '',
+      ].join('\n'),
+    },
+    { path: 'testing.py', content: 'class FlaskClient:\n    pass\n' },
+    {
+      path: 'translate.py',
+      content: [
+        'from rich import print',
+        '',
+        '',
+        'def main():',
+        '    print("translating")',
+        '    return 1',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'app.py', 'cls'), undefined, 'cls(...) calls the aliased import');
+  assert.equal(bySymbol(r.findings, 'translate.py', 'print'), undefined, 'print(...) calls the rich print import');
+});
+
+test('web string-index-digits: a token starting mid-number is not a string reference', () => {
+  // The inverted string index must mirror the \b boundary of the old
+  // per-name scan: "%5c" in a URL is not a reference to `c`, and
+  // "%70age" is not a reference to `age`.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/b.js' }) },
+    {
+      path: 'src/a.js',
+      content: [
+        'function c() { return 1; }',
+        'function age() { return 2; }',
+        'module.exports = {};',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/b.js',
+      content: [
+        'const URL = "/%5c..%5csecret.txt";',
+        'const OTHER = "?%70age=2";',
+        'console.log(URL, OTHER);',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/a.js', 'c').grade, 'SAFE', '"%5c" must not count as a use of c');
+  assert.equal(bySymbol(r.findings, 'src/a.js', 'age').grade, 'SAFE', '"%70age" must not count as a use of age');
 });
 
 test('web tests-dir: files under tests/ or test/ are KEEP at most, never SAFE', () => {

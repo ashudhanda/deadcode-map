@@ -240,12 +240,15 @@ test('js-string: prose mentions are not string references', () => {
   // Mentioned only as words in sentences (string literals, README, .txt).
   assert.equal(bySymbol(f, 'src/index.js', 'render').grade, 'SAFE');
   assert.equal(bySymbol(f, 'src/index.js', 'named').grade, 'SAFE');
+  // Mentioned only inside a URL-encoded token: `%70age` is not a
+  // reference to `age` (a digit before the name breaks the boundary).
+  assert.equal(bySymbol(f, 'src/index.js', 'age').grade, 'SAFE');
   // Mentioned as code: dotted string and whole string in config.json.
   assert.equal(bySymbol(f, 'src/index.js', 'handler').grade, 'REVIEW');
   assert.equal(bySymbol(f, 'src/index.js', 'wired').grade, 'REVIEW');
   // No other SAFE findings: nothing live is flagged, no file is dead.
   const safe = f.filter((x) => x.grade === 'SAFE');
-  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named']);
+  const expectedSafe = new Set(['function:src/index.js:render', 'function:src/index.js:named', 'function:src/index.js:age']);
   for (const s of safe) {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
@@ -437,6 +440,51 @@ test('py-pydantic: model fields, validators and overload groups are framework-in
   // A genuinely unused plain function in the same library is still REVIEW.
   assert.equal(bySymbol(f, 'models.py', 'unused_fn').grade, 'REVIEW');
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('py-class-attrs: framework-consumed class attributes are never SAFE', () => {
+  const f = findingsFor('py-class-attrs');
+  // (c) Config/theme class: a subclass of an externally-defined base
+  // whose body defines only attributes is read by the framework at
+  // runtime (the Pygments Style subclass shape) — KEEP, never SAFE.
+  for (const symbol of ['background_color', 'default_style', 'styles']) {
+    assert.equal(bySymbol(f, 'theme.py', symbol).grade, 'KEEP', `${symbol} is a config-class attribute`);
+  }
+  // (b) Override of an externally-defined parent attribute (the
+  // Werkzeug Response.default_mimetype shape): the parent source is
+  // not in the repo, so it cannot be proven dead — REVIEW, never SAFE.
+  // The class defines a method, so the config-class rule does not fire.
+  assert.equal(bySymbol(f, 'response.py', 'default_mimetype').grade, 'REVIEW');
+  // (a) Chained-assignment aliases of a method defined in the same
+  // class (the NullSession `popitem = _fail` shape): the names are one
+  // object with the method, part of the class interface — KEEP.
+  for (const symbol of ['clear', 'pop', 'popitem']) {
+    assert.equal(bySymbol(f, 'sessions.py', symbol).grade, 'KEEP', `${symbol} is an alias of the _fail method`);
+  }
+  // (d) A class attribute documented with a Sphinx `#:` comment is part
+  // of the class's documented public API (the pickle_based shape) —
+  // REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'sessions.py', 'pickle_based').grade, 'REVIEW');
+  // Negatives: genuinely dead class attributes stay SAFE. A class with
+  // no base, a subclass of a base defined in the same file, a chain
+  // ending in an imported name (not a method of the class), and a
+  // module-level chain are all ordinary candidates.
+  assert.equal(bySymbol(f, 'plain.py', 'dead_attr').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'plain.py', 'child_dead_attr').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'plain.py', 'first').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'plain.py', 'second').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'plain.py', '_first').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'plain.py', '_second').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'variable:plain.py:dead_attr', 'variable:plain.py:child_dead_attr',
+    'variable:plain.py:first', 'variable:plain.py:second',
+    'variable:plain.py:_first', 'variable:plain.py:_second',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
 });
 
 test('ts-ambient: declare module augmentation is declaration merging, never dead', () => {

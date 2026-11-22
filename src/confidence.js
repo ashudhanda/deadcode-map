@@ -343,6 +343,42 @@ function gradeFindings(ctx) {
         add({ ...common, grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : fwReasons[0] || 'framework / entry file' });
         continue;
       }
+      // Class-attribute rules (FP-6). These sit AFTER the dunder and
+      // test/config KEEP checks above on purpose: a dunder or a
+      // test-file attribute keeps its existing KEEP reason, and these
+      // rules only ever demote a finding that would otherwise be SAFE
+      // (or a REVIEW string-mention) — never a KEEP.
+      // Chained-assignment alias of a method defined in the same class
+      // (`__setitem__ = ... = popitem = _fail`): the names are aliases
+      // of one live method, part of the class's interface — never SAFE.
+      if (def.chainedAlias) {
+        add({ ...common, grade: 'KEEP', reason: `chained-assignment alias of ${def.chainedAliasOf || 'a method'} in the same class — the name is the same object as the method, part of the class interface` });
+        continue;
+      }
+      // A class that subclasses an externally-defined base and defines
+      // only attributes (no methods) is a framework-consumed config
+      // class (a Pygments Style subclass): the framework reads the
+      // attributes at runtime, so they are KEEP, never SAFE.
+      if (def.configClassAttr) {
+        add({ ...common, grade: 'KEEP', reason: 'config class: subclass of an externally-defined base that defines only attributes — the framework reads the attributes at runtime' });
+        continue;
+      }
+      // A class attribute documented with a Sphinx `#:` comment is part
+      // of the class's documented public API (an extension-facing flag):
+      // REVIEW, never SAFE.
+      if (def.documentedAttr) {
+        add({ ...common, grade: 'REVIEW', reason: 'documented class attribute (Sphinx #: comment) — part of the class public API' });
+        continue;
+      }
+      // A class attribute assigned in a subclass of an externally-defined
+      // base may override a parent attribute that parent-framework code
+      // outside this repo reads (Werkzeug's Response.default_mimetype):
+      // the parent source is not here to prove it dead, so REVIEW,
+      // never SAFE.
+      if (def.externalBase) {
+        add({ ...common, grade: 'REVIEW', reason: 'class attribute in a subclass of an externally-defined base — may override a parent attribute read by the parent framework' });
+        continue;
+      }
       if (parsed.dynamic) {
         add({ ...common, grade: 'REVIEW', reason: `0 callers, but file uses dynamic imports/reflection (${parsed.dynamicReasons[0] || 'dynamic'}) — cannot prove safe` });
         continue;

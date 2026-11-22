@@ -35,7 +35,7 @@
   "scripts": {
     "mcp": "node bin/deadcode-map-mcp.js",
     "start": "node bin/deadcode-map.js",
-    "test": "node --test test/fixtures.test.js test/cli.test.js test/mcp.test.js"
+    "test": "node --test test/fixtures.test.js test/cli.test.js test/mcp.test.js test/cache.test.js"
   },
   "type": "commonjs",
   "version": "0.1.0"
