@@ -40,6 +40,12 @@ var SKIP_DIRS = new Set([
 ]);
 var SKIP_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
+// Test-data directories: planted dead code lives here on purpose, so
+// scanning them as real code is noise. Excluded at any depth by default
+// (fixtures/, __fixtures__/, test/fixtures, tests/fixtures, ...);
+// analyzeFiles(files, { includeFixtures: true }) opts back in.
+var FIXTURE_DIRS = new Set(['fixtures', '__fixtures__']);
+
 var JS_KEYWORDS = new Set([
   'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default', 'catch',
   'try', 'finally', 'return', 'throw', 'break', 'continue', 'new', 'typeof',
@@ -412,9 +418,16 @@ function parseJs(rel, raw) {
   var rawLines = raw.split('\n');
   for (var il2 = 0; il2 < rawLines.length; il2++) {
     var rawLine = rawLines[il2];
+    // The stripped line has strings and comments blanked (positions
+    // preserved), so it is the oracle for "is this real code": an
+    // import/require inside a string literal — a test file holding code
+    // in a string, a doc example — is blanked there and must not create
+    // a phantom import edge. Specifiers still come from the raw line,
+    // because the stripped code has the string contents blanked.
+    var strippedLine = lines[il2] || '';
     var trimmedRaw = rawLine.trim();
     if (/^(\/\/|\/\*|\*)/.test(trimmedRaw)) continue; // comment line
-    if (/^\s*import\s+[^\(]/.test(rawLine)) {
+    if (/^\s*import\s+[^\(]/.test(strippedLine)) {
       var stmt = rawLine;
       var guard = 0;
       while (!/from\s+['"]/.test(stmt) && !/;\s*$/.test(stmt) && guard < 10 && il2 + 1 < rawLines.length) {
@@ -425,12 +438,13 @@ function parseJs(rel, raw) {
       if (imp) parsed.imports.push(imp);
       continue;
     }
-    if (/^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"]/.test(rawLine)) {
+    if (/^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"]/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
       var reM = rawLine.match(/export\s+(?:\*|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]/);
       if (reM) parsed.imports.push({ source: reM[1], names: [], sideEffect: false, reExport: true });
       continue;
     }
     var reqM = rawLine.match(/(?:const|let|var)\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/);
+    if (reqM && strippedLine.indexOf('require(') === -1) reqM = null; // inside a string/comment, not real code
     if (reqM) {
       var names2 = [];
       if (reqM[1]) {
@@ -444,6 +458,22 @@ function parseJs(rel, raw) {
         names2.push({ imported: reqM[2], local: reqM[2], kind: 'value' });
       }
       parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: false });
+    }
+    // Inline / bare require('...') — require('./x').fn() or a bare
+    // side-effect require('./x') — is an import edge too (matches the
+    // CLI, which records every literal require). Names are empty, so the
+    // member-use check is what keeps the called export alive: the
+    // importer's references name it, so it counts as imported.
+    // sideEffect so the dead-import check skips it.
+    var bareRe = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
+    var bareM;
+    while ((bareM = bareRe.exec(rawLine)) !== null) {
+      if (reqM && bareM[1] === reqM[3]) continue; // already recorded above
+      // Positions are preserved by stripping, so a real require sits at
+      // the same index in the stripped line; one inside a string or
+      // comment is blanked there and must not create a phantom import.
+      if (strippedLine.substr(bareM.index, 8) !== 'require(') continue;
+      parsed.imports.push({ source: bareM[1], names: [], sideEffect: true, reExport: false });
     }
   }
   // NOTE: strings are blanked in `code`, so literal-argument checks run on
@@ -477,13 +507,32 @@ function parseJs(rel, raw) {
     var l = lines[li];
     var lineNo2 = li + 1;
     if (/^\s*import\b/.test(l)) continue;
-    // Strings are blanked in `l`, so match require( without the quote.
-    if (/\brequire\s*\(/.test(l) && /^\s*(const|let|var)\b/.test(l)) continue;
+    // A const/let/var require line binds names on that line: the binding
+    // itself is not a use (otherwise no unused import could ever be
+    // flagged). But a member call on the same line IS a use —
+    // `const x = require('./util').helper()` uses `helper` — so collect
+    // the line's identifiers except the bound names, instead of skipping
+    // the whole line.
+    var boundHere = null;
+    if (/\brequire\s*\(/.test(l) && /^\s*(const|let|var)\b/.test(l)) {
+      boundHere = new Set();
+      var bm = l.match(/^\s*(?:const|let|var)\s+\{([^}]*)\}/);
+      if (bm) {
+        bm[1].split(',').forEach(function (part) {
+          var bits = part.trim().split(/\s*:\s*/);
+          if (bits[0]) boundHere.add((bits[1] || bits[0]).trim());
+        });
+      } else {
+        var sm = l.match(/^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/);
+        if (sm) boundHere.add(sm[1]);
+      }
+    }
     if (/module\.exports\s*=/.test(l)) continue;
     var declared = declaredOnLine[lineNo2] || new Set();
     identifiers(l).forEach(function (id) {
       if (JS_KEYWORDS.has(id)) return;
       if (declared.has(id)) return; // declaration site, not a use
+      if (boundHere && boundHere.has(id)) return; // import binding, not a use
       parsed.references.add(id);
     });
     var callRe = /([A-Za-z_$][\w$]*)\s*\(/g;
@@ -491,6 +540,7 @@ function parseJs(rel, raw) {
     while ((cm2 = callRe.exec(l)) !== null) {
       if (JS_KEYWORDS.has(cm2[1])) continue;
       if (declared.has(cm2[1])) continue; // `function foo(` is not a call
+      if (boundHere && boundHere.has(cm2[1])) continue;
       parsed.calls.add(cm2[1]);
     }
   }
@@ -892,6 +942,7 @@ function analyzeFiles(inputFiles, options) {
     var rel = f.path.replace(/^\.\//, '').replace(/\\/g, '/');
     var parts = rel.split('/');
     if (parts.some(function (p) { return SKIP_DIRS.has(p); })) return;
+    if (!options.includeFixtures && parts.some(function (p) { return FIXTURE_DIRS.has(p); })) return;
     if (SKIP_FILES.has(baseOf(rel))) return;
     textFiles.push({ rel: rel, content: f.content });
     if (baseOf(rel) === 'package.json' && !pkg) {
@@ -1166,16 +1217,11 @@ function analyzeFiles(inputFiles, options) {
       var usage = usageMap[def.name] || { importedBy: new Set(), calledIn: new Set(), sameFile: false };
       var importedBy = Array.from(usage.importedBy);
       var sameFileUse = usage.sameFile || usage.calledIn.has(rel);
+      // Same-file use is real use: a symbol called or referenced in its
+      // own file is alive, full stop — never a finding. (It used to be
+      // flagged REVIEW as "unexport-to-local", which turned every
+      // module's own helpers into noise.)
       if (importedBy.length === 0 && sameFileUse) {
-        if (def.exported && def.kind !== 'variable' && !isEntry) {
-          add({
-            category: categoryOf(def.kind), file: rel, symbol: def.name, grade: 'REVIEW',
-            startLine: def.startLine, endLine: def.endLine, size: 0,
-            reason: 'used only in its own file — could be unexported, not deleted',
-            evidence: { importers: 0, callers: 0, stringRefs: [], exported: true },
-            deleteDiff: 'remove "export" from ' + def.name + ' in ' + rel,
-          });
-        }
         return;
       }
       if (importedBy.length > 0) return;

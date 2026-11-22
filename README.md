@@ -32,6 +32,7 @@ deadcode-map ./my-app --update-baseline     # record current findings as baselin
 deadcode-map ./my-app --fix                 # delete SAFE findings only
 deadcode-map ./my-app --prove               # prove SAFE deletions with your tests
 deadcode-map ./my-app --prove --test-command "pytest -q"
+deadcode-map ./my-app --include-fixtures    # also scan fixtures/ test-data dirs (excluded by default)
 ```
 
 Example output:
@@ -77,7 +78,8 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 - **Dynamic use**: anything in a file that uses dynamic `import()`, `require(variable)`, `importlib`, or `getattr` is REVIEW at most — never SAFE.
 - **Public API of a published library**: exported symbols are REVIEW, never SAFE, never auto-deleted.
 - **Methods**: a method with 0 in-repo callers is REVIEW at most — it could be called via an object or a framework.
-- **Same-file-only use is not dead**: an export used only in its own file is REVIEW as "unexport-to-local", not a deletion candidate.
+- **Same-file use is alive**: a symbol called or referenced in its own file is never flagged — it is used, even if nothing else in the repo imports it.
+- **Fixture / test-data directories are not scanned by default**: `fixtures/`, `__fixtures__/` at any depth (`test/fixtures`, `tests/fixtures`, …) are excluded — planted dead code in test data is not real dead code. Use `--include-fixtures` (CLI) or the checkbox in the web checker to scan them.
 
 ## False-positive defences (in priority order)
 
@@ -105,15 +107,9 @@ Fixtures live in `fixtures/` with planted dead items and known live items. Run t
 | `js-deps` (JS, dead dependencies: README prose vs real imports) | 5 | 0 | 0 | **0%** |
 | `js-framework` (Next.js `pages/`) | 1 | 0 | 0 | **0%** |
 
-The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above, including the dead Python import in `py-imports` — verified by `test/web-analyzer.test.js` (18 tests).
+The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above, including the dead Python import in `py-imports` — verified by `test/web-analyzer.test.js` (21 tests).
 
-Dogfood — deadcode-map run on itself (49 findings, 0.5s):
-
-| | Count |
-|---|---|
-| SAFE | 6 — all in the fixtures (five dead imports, unreachable code), 0 in `src/` |
-| REVIEW | 33 — all correct: exported-but-unused, same-file-only, string-referenced |
-| KEEP | 10 — Next.js routes, Flask handlers, test functions, dunder methods, module dunders |
+Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (44 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 

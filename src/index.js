@@ -9,8 +9,8 @@ const { gradeFindings, loadFrameworks } = require('./confidence');
 const { gitInfo } = require('./git');
 const { parseCoverageXml } = require('./coverage');
 
-function scan(root) {
-  const discovery = discover(root);
+function scan(root, opts) {
+  const discovery = discover(root, opts);
   const graph = analyze(root, discovery);
   const git = gitInfo(root, discovery.codeFiles);
   const coverage = parseCoverageXml(root);

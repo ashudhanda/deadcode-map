@@ -8,7 +8,7 @@
  *                [--fail-on safe|review] [--min-confidence safe|review]
  *                [--baseline] [--update-baseline] [--show-baseline]
  *                [--fix] [--prove] [--test-command "npm test"]
- *                [--include-review] [--top N] [--no-color]
+ *                [--include-review] [--include-fixtures] [--top N] [--no-color]
  */
 
 const fs = require('fs');
@@ -42,6 +42,8 @@ Options:
   --prove              Delete SAFE findings in a scratch git worktree and run tests
   --test-command <cmd> Test command for --prove (default: "npm test" when present)
   --include-review     Let --fix / --prove act on REVIEW findings too (default: SAFE only)
+  --include-fixtures   Scan fixture/test-data directories too (fixtures/, __fixtures__/ —
+                       excluded by default, at any depth)
   --top <n>            How many findings to list in the terminal (default 10)
   --no-color           Disable coloured output
   --version            Print the version
@@ -54,7 +56,7 @@ function parseArgs(argv) {
     path: '.', json: null, map: null, failOn: null, minConfidence: null,
     baseline: false, updateBaseline: false, showBaseline: false,
     fix: false, prove: false, testCommand: null, includeReview: false,
-    top: 10, color: true,
+    includeFixtures: false, top: 10, color: true,
   };
   const args = argv.slice(2);
   for (let i = 0; i < args.length; i++) {
@@ -72,6 +74,7 @@ function parseArgs(argv) {
     else if (a === '--prove') opts.prove = true;
     else if (a === '--test-command') opts.testCommand = args[++i];
     else if (a === '--include-review') opts.includeReview = true;
+    else if (a === '--include-fixtures') opts.includeFixtures = true;
     else if (a === '--top') opts.top = parseInt(args[++i], 10) || 10;
     else if (a === '--no-color') opts.color = false;
     else if (a.startsWith('-')) { console.error(`Unknown option: ${a}\n${help()}`); process.exit(2); }
@@ -88,7 +91,7 @@ function main() {
     process.exit(2);
   }
 
-  const { graph, findings } = scan(root);
+  const { graph, findings } = scan(root, { includeFixtures: opts.includeFixtures });
   let visible = findings;
 
   // Baseline handling.
@@ -133,7 +136,7 @@ function main() {
   }
 
   if (opts.prove) {
-    const testCmd = opts.testCommand || defaultTestCommand(root, scan(root).discovery.pkg);
+    const testCmd = opts.testCommand || defaultTestCommand(root, scan(root, { includeFixtures: opts.includeFixtures }).discovery.pkg);
     console.log(`--prove: running "${testCmd || '(no test command)'}" in a scratch git worktree…`);
     const result = prove(root, graph, opts.includeReview ? visible : visible.filter((f) => f.grade === 'SAFE'), { testCommand: testCmd });
     console.log(`--prove: ${result.status} — ${result.proven || 0} proven, ${result.breaks || 0} break${result.breaks === 1 ? 's' : ''}.`);

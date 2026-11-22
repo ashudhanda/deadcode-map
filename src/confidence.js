@@ -11,7 +11,7 @@
  *    dunder / protocol methods, decorated handlers: KEEP.
  *  - Dynamic imports / reflection nearby: never SAFE.
  *  - Public API of a published library: REVIEW at best, never SAFE.
- *  - Same-file-only use: not dead — REVIEW as "unexport-to-local".
+ *  - Same-file use: alive — a symbol called in its own file is never flagged.
  *  - String reference anywhere else: REVIEW, never SAFE.
  *  - Everything else with 0 importers / 0 callers / 0 string refs: SAFE.
  */
@@ -176,25 +176,13 @@ function gradeFindings(ctx) {
       // A call from the symbol's own file is same-file use, not an external caller.
       const calledElsewhere = calledIn.filter((f) => f !== file);
       const sameFileUse = usage.sameFile || calledIn.includes(file);
-      // Same-file-only use is NOT dead — it is "unexport-to-local": the
-      // symbol is used, but only in its own file, so it need not be exported.
+      // Same-file use is real use: a symbol called or referenced in its
+      // own file is alive, full stop. It used to be flagged REVIEW as
+      // "unexport-to-local", but that turned every module's own helpers
+      // into noise (e.g. our own isGitRepo / resolveRelative /
+      // buildMapData). An export that is only used in its own file is
+      // still used — never a finding.
       if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUse) {
-        // Entry files are scripts, not libraries: their functions are entry
-        // logic, not exports to remove.
-        if (def.exported && def.kind !== 'variable' && !isEntry) {
-          const covSame = coverage
-            ? require('./coverage').coverageForSymbol(coverage, file, def.startLine, def.endLine)
-            : null;
-          add({
-            category: categoryOf(def.kind),
-            file: rel, symbol: def.name, grade: 'REVIEW',
-            startLine: def.startLine, endLine: def.endLine,
-            size: def.range.endIndex - def.range.startIndex,
-            reason: 'used only in its own file — could be unexported, not deleted',
-            evidence: { importers: 0, callers: calledElsewhere.length, stringRefs: [], exported: true, coveragePct: covSame ? covSame.pct : null, ...evidenceBase },
-            deleteDiff: `remove "export" from ${def.name} in ${rel}`,
-          });
-        }
         continue;
       }
       const isUsed = importedBy.length > 0 || calledElsewhere.length > 0;

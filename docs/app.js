@@ -25,6 +25,7 @@
 
   var repoInput = document.getElementById('repo-url');
   var tokenInput = document.getElementById('gh-token');
+  var includeFixturesInput = document.getElementById('include-fixtures');
   var analyzeBtn = document.getElementById('analyze-btn');
   var tryBtn = document.getElementById('try-btn');
   var statusEl = document.getElementById('status');
@@ -291,7 +292,7 @@
       }
 
       setStatus('Analyzing…');
-      var report = window.DeadcodeMap.analyzeFiles(files);
+      var report = window.DeadcodeMap.analyzeFiles(files, { includeFixtures: includeFixturesInput && includeFixturesInput.checked });
       setStatus('');
       renderResults(report, repo, warnings);
       setStatus('Done.');

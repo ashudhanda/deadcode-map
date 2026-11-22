@@ -57,6 +57,22 @@ test('CLI: --baseline hides grandfathered findings, --update-baseline records th
   assert.equal(r2.status, 0, `baseline should hide all findings, got: ${r2.stdout} ${r2.stderr}`);
 });
 
+test('CLI: --include-fixtures scans fixture dirs, default excludes them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-cli-fixtures-'));
+  fs.mkdirSync(path.join(dir, 'fixtures'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 't', main: 'src/index.js' }));
+  fs.writeFileSync(path.join(dir, 'src', 'index.js'), "console.log('hi');\n");
+  fs.writeFileSync(path.join(dir, 'fixtures', 'dead.js'), 'function plantedDead() { return 1; }\nmodule.exports = { plantedDead };\n');
+  const def = run(dir, ['--json', path.join(dir, 'r1.json')]);
+  assert.equal(def.status, 0, def.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'r1.json'), 'utf8')).findings.length, 0, 'fixture dirs must be excluded by default');
+  const inc = run(dir, ['--json', path.join(dir, 'r2.json'), '--include-fixtures']);
+  assert.equal(inc.status, 0, inc.stderr);
+  const findings = JSON.parse(fs.readFileSync(path.join(dir, 'r2.json'), 'utf8')).findings;
+  assert.ok(findings.some((f) => f.symbol === 'plantedDead'), 'plantedDead must be found with --include-fixtures');
+});
+
 test('CLI: --fix deletes SAFE items only and leaves live code alone', () => {
   const dir = copyFixture('js-basic');
   const r = run(dir, ['--fix']);

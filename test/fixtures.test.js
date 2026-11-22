@@ -8,6 +8,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { scan } = require('../src/index');
 
@@ -50,8 +52,9 @@ test('js-basic: planted dead items are found', () => {
   // Exported-but-never-imported is REVIEW, never SAFE.
   assert.equal(bySymbol(f, 'src/used.js', 'privateDead').grade, 'REVIEW');
   assert.equal(bySymbol(f, 'src/used.js', 'unusedExport').grade, 'REVIEW');
-  // Same-file-only use is REVIEW (unexport-to-local), not dead.
-  assert.equal(bySymbol(f, 'src/helper.js', 'sameFileOnly').grade, 'REVIEW');
+  // Same-file use is alive, not a finding: helper() calls sameFileOnly()
+  // in its own file, so it is used — never REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'src/helper.js', 'sameFileOnly'), undefined);
   // String-referenced symbol is REVIEW, never SAFE.
   assert.equal(bySymbol(f, 'src/string-ref.js', 'stringOnlyFn').grade, 'REVIEW');
   assert.equal(byCategory(f, 'src/string-ref.js', 'file').grade, 'REVIEW');
@@ -243,6 +246,28 @@ test('py-string: docstring prose is not a string reference', () => {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
   }
+});
+
+test('fixtures: fixture directories are excluded by default, includeFixtures opts back in', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-fixtures-'));
+  const write = (rel, content) => {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  };
+  write('package.json', JSON.stringify({ name: 't', main: 'src/index.js' }));
+  write('src/index.js', "const { live } = require('./live');\nconsole.log(live());\n");
+  write('src/live.js', 'function live() { return 1; }\nmodule.exports = { live };\n');
+  // Planted dead code in fixture dirs at several depths.
+  write('fixtures/dead.js', 'function plantedDead() { return 1; }\nmodule.exports = { plantedDead };\n');
+  write('test/fixtures/dead2.js', 'function plantedDead2() { return 1; }\nmodule.exports = { plantedDead2 };\n');
+  write('src/__fixtures__/dead3.js', 'function plantedDead3() { return 1; }\nmodule.exports = { plantedDead3 };\n');
+  const def = scan(dir).findings;
+  assert.equal(def.length, 0, `fixture dirs must be excluded by default, got: ${JSON.stringify(def.map((f) => `${f.file}:${f.symbol || ''}`))}`);
+  const inc = scan(dir, { includeFixtures: true }).findings;
+  assert.ok(inc.some((f) => f.symbol === 'plantedDead'), 'plantedDead must be found with includeFixtures');
+  assert.ok(inc.some((f) => f.symbol === 'plantedDead2'), 'plantedDead2 must be found with includeFixtures');
+  assert.ok(inc.some((f) => f.symbol === 'plantedDead3'), 'plantedDead3 must be found with includeFixtures');
 });
 
 test('js-deps: README-only deps are flagged, real imports are not', () => {

@@ -33,6 +33,8 @@
       <input id="gh-token" type="password" placeholder="ghp_… — only for a higher rate limit" autocomplete="off" spellcheck="false" />
       <p class="hint">Without a token, GitHub allows 60 API requests per hour. Your token is never stored — it is sent only to api.github.com, in memory, for this one check. Leave it empty to stay anonymous.</p>
 
+      <p class="hint"><label><input id="include-fixtures" type="checkbox" /> Include fixture/test-data directories (<code>fixtures/</code>, <code>__fixtures__/</code>) — off by default, they hold planted dead code on purpose.</label></p>
+
       <div class="row">
         <button id="analyze-btn" type="button">Analyze repo</button>
         <button id="try-btn" type="button" class="secondary">Try deadcode-map itself</button>

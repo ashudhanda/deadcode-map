@@ -50,15 +50,6 @@ function walk(node, fn) {
   for (let i = 0; i < node.namedChildCount; i++) walk(node.namedChild(i), fn);
 }
 
-function named(node, type) {
-  const out = [];
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const c = node.namedChild(i);
-    if (c.type === type) out.push(c);
-  }
-  return out;
-}
-
 function firstNamed(node, type) {
   for (let i = 0; i < node.namedChildCount; i++) {
     const c = node.namedChild(i);

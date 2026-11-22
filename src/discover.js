@@ -17,6 +17,13 @@ const SKIP_DIRS = new Set([
   '.pytest_cache', '.mypy_cache', '.turbo', 'vendor', 'target',
 ]);
 
+// Test-data directories: planted dead code lives here on purpose, so
+// scanning them as real code is noise — a repo's own fixtures would
+// report its own test data as dead. Excluded at any depth by default
+// (fixtures/, __fixtures__/, test/fixtures, tests/fixtures, ...);
+// --include-fixtures opts back in.
+const FIXTURE_DIRS = new Set(['fixtures', '__fixtures__']);
+
 const SKIP_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
 const CODE_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py']);
@@ -26,7 +33,7 @@ function isCodeFile(p) {
   return CODE_EXTS.has(path.extname(p).toLowerCase());
 }
 
-function walk(dir, out) {
+function walk(dir, out, includeFixtures) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -37,7 +44,8 @@ function walk(dir, out) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
       if (SKIP_DIRS.has(e.name) || e.name.startsWith('.') && e.name !== '.github') continue;
-      walk(full, out);
+      if (!includeFixtures && FIXTURE_DIRS.has(e.name)) continue;
+      walk(full, out, includeFixtures);
     } else if (e.isFile()) {
       if (SKIP_FILES.has(e.name)) continue;
       out.push(full);
@@ -118,9 +126,9 @@ function looksLikeEntry(rel, abs, pkgEntries) {
   return { entry: false, reason: '' };
 }
 
-function discover(root) {
+function discover(root, opts) {
   const absRoot = path.resolve(root);
-  const allFiles = walk(absRoot, []);
+  const allFiles = walk(absRoot, [], Boolean(opts && opts.includeFixtures));
   const codeFiles = allFiles.filter(isCodeFile);
   const textFiles = allFiles.filter((f) => ALL_EXTS.has(path.extname(f).toLowerCase()));
   const pkgPath = path.join(absRoot, 'package.json');
@@ -136,4 +144,4 @@ function discover(root) {
   return { root: absRoot, allFiles, codeFiles, textFiles, pkg, pkgEntries, isLibrary, entries };
 }
 
-module.exports = { discover, isCodeFile, CODE_EXTS, readJson };
+module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS };

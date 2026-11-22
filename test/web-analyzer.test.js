@@ -56,7 +56,9 @@ test('web js-basic: planted dead items are found', () => {
   assert.equal(byCategory(f, 'src/used.js', 'unreachable').grade, 'SAFE');
   assert.equal(bySymbol(f, 'src/used.js', 'privateDead').grade, 'REVIEW');
   assert.equal(bySymbol(f, 'src/used.js', 'unusedExport').grade, 'REVIEW');
-  assert.equal(bySymbol(f, 'src/helper.js', 'sameFileOnly').grade, 'REVIEW');
+  // Same-file use is alive, not a finding: helper() calls sameFileOnly()
+  // in its own file, so it is used — never REVIEW, never SAFE.
+  assert.equal(bySymbol(f, 'src/helper.js', 'sameFileOnly'), undefined);
   assert.equal(bySymbol(f, 'src/string-ref.js', 'stringOnlyFn').grade, 'REVIEW');
   assert.equal(byCategory(f, 'src/string-ref.js', 'file').grade, 'REVIEW');
   assert.equal(bySymbol(f, 'src/lazy-target.js', 'lazyFn').grade, 'REVIEW');
@@ -287,6 +289,65 @@ test('web py-string: docstring prose is not a string reference', () => {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
   }
+});
+
+test('web fixtures: fixture directories are excluded by default, includeFixtures opts back in', () => {
+  var files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { live } = require('./live');\nconsole.log(live());\n" },
+    { path: 'src/live.js', content: 'function live() { return 1; }\nmodule.exports = { live };\n' },
+    { path: 'fixtures/dead.js', content: 'function plantedDead() { return 1; }\nmodule.exports = { plantedDead };\n' },
+    { path: 'test/fixtures/dead2.js', content: 'function plantedDead2() { return 1; }\nmodule.exports = { plantedDead2 };\n' },
+    { path: 'src/__fixtures__/dead3.js', content: 'function plantedDead3() { return 1; }\nmodule.exports = { plantedDead3 };\n' },
+  ];
+  var def = analyzeFiles(files).findings;
+  assert.equal(def.length, 0, 'fixture dirs must be excluded by default, got: ' + JSON.stringify(def.map(function (f) { return f.file + ':' + (f.symbol || ''); })));
+  var inc = analyzeFiles(files, { includeFixtures: true }).findings;
+  assert.ok(inc.some(function (f) { return f.symbol === 'plantedDead'; }), 'plantedDead must be found with includeFixtures');
+  assert.ok(inc.some(function (f) { return f.symbol === 'plantedDead2'; }), 'plantedDead2 must be found with includeFixtures');
+  assert.ok(inc.some(function (f) { return f.symbol === 'plantedDead3'; }), 'plantedDead3 must be found with includeFixtures');
+});
+
+test('web inline require: require("./x").fn() keeps the export alive', () => {
+  var files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/main.js' }) },
+    // Member call on the same line as the binding…
+    { path: 'src/main.js', content: "const x = require('./util').helper(1);\nconst y = require('./util2').other();\nconsole.log(x, y);\n" },
+    { path: 'src/util.js', content: 'function helper(n) { return n + 1; }\nmodule.exports = { helper };\n' },
+    // …and an inline require on a continuation line (ternary), the shape
+    // src/confidence.js uses for require('./coverage').coverageForSymbol.
+    { path: 'src/util2.js', content: 'function other() { return 2; }\nmodule.exports = { other };\n' },
+  ];
+  var r = analyzeFiles(files);
+  assert.equal(bySymbol(r.findings, 'src/util.js', 'helper'), undefined, 'helper is called via inline require, must not be flagged');
+  assert.equal(byCategory(r.findings, 'src/util.js', 'file'), undefined);
+  assert.equal(bySymbol(r.findings, 'src/util2.js', 'other'), undefined, 'other is called via inline require, must not be flagged');
+  assert.equal(byCategory(r.findings, 'src/util2.js', 'file'), undefined);
+  // The bound names themselves are not phantom uses: an unused const
+  // require binding is still a dead import.
+  var files2 = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/main.js' }) },
+    { path: 'src/main.js', content: "const { unused } = require('./util');\nconsole.log('hi');\n" },
+    { path: 'src/util.js', content: 'function unused() { return 1; }\nmodule.exports = { unused };\n' },
+  ];
+  var r2 = analyzeFiles(files2);
+  assert.equal(bySymbol(r2.findings, 'src/main.js', 'unused').grade, 'SAFE', 'unused destructured require binding must still be a dead import');
+});
+
+test('web imports inside strings are not phantom imports', () => {
+  // A test file holding code in a string used to create a phantom import
+  // of './util' (and a dead-import finding for `unused`) in the web
+  // analyzer, because import parsing ran on raw lines. The CLI
+  // (tree-sitter) never had this bug.
+  var files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/main.js' }) },
+    { path: 'src/main.js', content: "console.log('hi');\n" },
+    { path: 'src/util.js', content: 'function helper(n) { return n + 1; }\nmodule.exports = { helper };\n' },
+    { path: 'test/example.test.js', content: 'const snippet = "const { unused } = require(\'./util\');";\ntest(\'x\', () => { assert.equal(snippet.length > 0, true); });\n' },
+  ];
+  var r = analyzeFiles(files);
+  assert.equal(r.findings.filter(function (f) { return f.category === 'import' && f.file === 'test/example.test.js'; }).length, 0, 'a require inside a string must not create an import');
+  assert.equal(bySymbol(r.findings, 'test/example.test.js', 'unused'), undefined);
 });
 
 test('web js-deps: README-only deps are flagged, real imports are not', () => {
