@@ -361,7 +361,7 @@ function parseJs(rel, raw) {
   }
 
   // module.exports / exports.* / export { ... } — mark definitions exported.
-  var defByName = {};
+  var defByName = Object.create(null);
   parsed.definitions.forEach(function (d) { defByName[d.name] = d; });
   var me = raw.match(/module\.exports\s*=\s*\{([^}]*)\}/);
   if (me) {
@@ -855,7 +855,7 @@ function resolvePyRelative(fromFile, source, names, level, existingFiles, files)
     var info = files[file];
     return Boolean(info && info.parsed && info.parsed.definitions.some(function (d) { return d.name === name; }));
   }
-  var byTarget = {};
+  var byTarget = Object.create(null);
   function addEdge(target, edgeNames) {
     if (!target) return;
     if (!byTarget[target]) byTarget[target] = [];
@@ -892,7 +892,7 @@ function resolvePyRelative(fromFile, source, names, level, existingFiles, files)
 /* ------------------------------------------------------------------ */
 
 function packageJsonEntries(pkg, pkgDir) {
-  var out = {};
+  var out = Object.create(null);
   if (!pkg) return out;
   function add(v) {
     if (typeof v !== 'string') return;
@@ -931,7 +931,7 @@ function looksLikeEntry(rel, abs, pkgEntries, raw) {
 
 function analyzeFiles(inputFiles, options) {
   options = options || {};
-  var files = {}; // rel path -> {rel, language, parsed, raw, size}
+  var files = Object.create(null); // rel path -> {rel, language, parsed, raw, size}
   var existingFiles = new Set();
   var textFiles = []; // {rel, content} for the string-reference pass
   var pkg = null;
@@ -959,7 +959,7 @@ function analyzeFiles(inputFiles, options) {
   });
 
   var pkgEntries = packageJsonEntries(pkg, pkgDir);
-  var entries = {}; // rel -> reason
+  var entries = Object.create(null); // rel -> reason
   Object.keys(files).forEach(function (rel) {
     var info = files[rel];
     var e = looksLikeEntry(rel, rel, pkgEntries, info.raw);
@@ -967,8 +967,8 @@ function analyzeFiles(inputFiles, options) {
   });
 
   // Import edges.
-  var importers = {}; // target rel -> Set of importer rels
-  var importsByFile = {}; // rel -> [{target, source, names}]
+  var importers = Object.create(null); // target rel -> Set of importer rels
+  var importsByFile = Object.create(null); // rel -> [{target, source, names}]
   function addImporter(target, importer) {
     if (!importers[target]) importers[target] = new Set();
     importers[target].add(importer);
@@ -1062,7 +1062,12 @@ function analyzeFiles(inputFiles, options) {
     }
     return false;
   }
-  var stringCache = {};
+  // Null-prototype cache: symbol names come from user code, so a plain {}
+  // would return inherited members for names like "constructor" or
+  // "toString" (e.g. stringCache["constructor"] === Object) and crash the
+  // .forEach call below with "stringHits.forEach is not a function".
+  // The CLI uses a Map for the same cache and never had this bug.
+  var stringCache = Object.create(null);
   function filesMentioning(name) {
     if (stringCache[name]) return stringCache[name];
     var re = mentionRegExp(name);
@@ -1090,10 +1095,10 @@ function analyzeFiles(inputFiles, options) {
   }
 
   // Per-symbol usage.
-  var symbolUsage = {}; // file -> {name -> {importedBy:Set, calledIn:Set, sameFile:bool}}
+  var symbolUsage = Object.create(null); // file -> {name -> {importedBy:Set, calledIn:Set, sameFile:bool}}
   Object.keys(files).forEach(function (rel) {
     var info = files[rel];
-    var map = {};
+    var map = Object.create(null);
     if (info.parsed) {
       info.parsed.definitions.forEach(function (d) {
         map[d.name] = { importedBy: new Set(), calledIn: new Set(), sameFile: false };
@@ -1195,7 +1200,7 @@ function analyzeFiles(inputFiles, options) {
     }
 
     // Dead symbols.
-    var usageMap = symbolUsage[rel] || {};
+    var usageMap = symbolUsage[rel] || Object.create(null);
     var importLocals = new Set();
     parsed.imports.forEach(function (imp) {
       (imp.names || []).forEach(function (n) { importLocals.add(n.local); });
