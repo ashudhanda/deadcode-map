@@ -656,14 +656,23 @@ function parseJs(rel, raw) {
   while ((m2 = re2.exec(raw)) !== null) {
     if (defByName[m2[1]]) defByName[m2[1]].exported = true;
   }
-  var ex = raw.match(/export\s*\{([^}]*)\}/);
-  if (ex) {
-    ex[1].split(',').forEach(function (part) {
+  var exRe = /export\s+(?:type\s+)?\{([^}]*)\}/g;
+  var exM;
+  while ((exM = exRe.exec(code)) !== null) {
+    // A re-export list (`export { ... } from './x'`) names the source
+    // module's symbols, not local definitions, so it marks nothing.
+    var exAfter = code.slice(exM.index + exM[0].length);
+    if (/^\s*from\s+['"]/.test(exAfter)) continue;
+    exM[1].split(',').forEach(function (part) {
+      // `export { foo as bar }` exports the LOCAL name foo under the
+      // name bar: the definition to mark is foo (bits[0]), not bar —
+      // taking the last part used to mark an unrelated local `bar`
+      // exported and leave `foo` looking unexported (SAFE).
       // `export { type Foo }` re-exports the type Foo: strip the `type`
       // modifier before looking the name up (same rule as the import
       // specifiers below).
       var bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/);
-      var name = bits[bits.length - 1].trim();
+      var name = bits[0].trim();
       if (defByName[name]) defByName[name].exported = true;
     });
   }
@@ -723,6 +732,14 @@ function parseJs(rel, raw) {
   // statement (no `from` clause within the bound) records nothing
   // and its lines are scanned like ordinary code (fail open).
   var importStmtLines = new Set();
+  // Lines of a local `export { ... }` list (no `from` clause), recorded
+  // while the statement is accumulated below: the names in the list are
+  // exports, not uses — except when a name is an imported binding being
+  // re-exported, which IS a use of the import (see the references pass).
+  // Only lines of a statement that closed cleanly are recorded; a
+  // malformed statement records nothing and its lines are scanned like
+  // ordinary code (fail open).
+  var exportListLines = new Set();
   // Multi-line require(): line number (1-based) -> binding names bound
   // on that line by a destructuring require (`const {\n a,\n b\n} =
   // require('./x')`). The references pass skips exactly those names;
@@ -773,7 +790,7 @@ function parseJs(rel, raw) {
       }
       continue;
     }
-    if (/^\s*export\s+(?:\*|\{)/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
+    if (/^\s*export\s+(?:type\s+)?(?:\*|\{)/.test(rawLine) && strippedLine.indexOf('export') >= 0) {
       // A re-export may span lines (`export {\n A,\n B,\n} from
       // './x'`): accumulate like the import branch above until the
       // `from '...'` clause appears. A local `export { ... }` list
@@ -787,7 +804,7 @@ function parseJs(rel, raw) {
       while (reGuard < IMPORT_STMT_MAX_LINES && il2 + 1 < rawLines.length) {
         if (/from\s+['"]/.test(reStmt)) break;
         if (/;\s*$/.test(reStmt)) break;
-        if (/^\s*export\s*\{/.test(reStmt)) {
+        if (/^\s*export\s+(?:type\s+)?\{/.test(reStmt)) {
           var reBal = 0;
           for (var reBi = 0; reBi < reStmt.length; reBi++) {
             if (reStmt[reBi] === '{') reBal++;
@@ -825,8 +842,27 @@ function parseJs(rel, raw) {
         for (var rl = reStmtStart; rl <= il2; rl++) importStmtLines.add(rl + 1);
         continue;
       }
-      // No `from` clause: a local `export { ... }`, not a re-export —
-      // fall through so the require scan below still sees this line.
+      // No `from` clause: a local `export { ... }` list, not a
+      // re-export. When the braces balance, the statement closed
+      // cleanly: record its lines so the references pass knows the
+      // names are exports, not uses (see exportListLines above) — a
+      // locally defined name in the list must not count as a
+      // same-file use, or it would never be flagged REVIEW. When the
+      // statement never closed (guard hit), fall through so the
+      // require scan below still sees the line (fail open).
+      var exClosed = false;
+      if (/export\s+(?:type\s+)?\{/.test(reStmt)) {
+        var exBal = 0;
+        for (var exBi = 0; exBi < reStmt.length; exBi++) {
+          if (reStmt[exBi] === '{') exBal++;
+          else if (reStmt[exBi] === '}') exBal--;
+        }
+        exClosed = exBal === 0;
+      }
+      if (exClosed) {
+        for (var el = reStmtStart; el <= il2; el++) exportListLines.add(el + 1);
+        continue;
+      }
     }
     var reqM = rawLine.match(/(?:const|let|var)\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/);
     if (reqM && strippedLine.indexOf('require(') === -1) reqM = null; // inside a string/comment, not real code
@@ -967,6 +1003,13 @@ function parseJs(rel, raw) {
       if (importLocals.has(name)) parsed.references.add(name);
     });
   }
+  // Names bound by imports in this file: a local `export { ... }` list
+  // re-exports them, so those names ARE uses (see exportListLines
+  // below); a locally defined name in the same list is not.
+  var importLocalNames = new Set();
+  parsed.imports.forEach(function (imp) {
+    (imp.names || []).forEach(function (n) { importLocalNames.add(n.local); });
+  });
   // Brace depth carried across the lines of one `module.exports = {
   // ... }` region, so the references scan below can tell a top-level
   // entry name (an export) from a nested or trailing use.
@@ -983,6 +1026,22 @@ function parseJs(rel, raw) {
     // holds binding names, not uses (see importStmtLines above) — the
     // whole line is skipped, exactly like a single-line import line.
     if (importStmtLines.has(lineNo2)) continue;
+    if (exportListLines.has(lineNo2)) {
+      // A local `export { ... }` line holds export names, not uses —
+      // except a name that is an imported binding being re-exported,
+      // which is a use of the import (matches the CLI: `export {
+      // helper }` in js-reexports keeps the import alive). The local
+      // name is the part before `as` (`export { helper as h }`
+      // re-exports the import `helper`); a `type` modifier is not a
+      // name. The line holds no calls, so nothing else is collected.
+      var expBody = l.replace(/^[^{]*\{/, '').replace(/\}.*$/, '');
+      expBody.split(',').forEach(function (part) {
+        var bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/);
+        var localName = (bits[0] || '').trim();
+        if (localName && importLocalNames.has(localName)) parsed.references.add(localName);
+      });
+      continue;
+    }
     if (inExportObj) {
       // Depth-aware scan of an export-object line: only a top-level
       // entry name is an export — a shorthand (`A,`) or a key
@@ -1234,6 +1293,32 @@ function parsePy(rel, raw) {
   var pendingDecorators = [];
   var declaredOnLine = {};
 
+  // Bracket depth at the start of each line, counted on the stripped
+  // code (strings and comments are already blanked, so brackets inside
+  // them cannot corrupt the count; f-string {...} expressions are kept
+  // as code and their braces balance). A line inside an open bracket is
+  // a continuation — a keyword argument (`replace_whitespace=False` in
+  // a multi-line call), a decorator argument, a def parameter — never a
+  // standalone assignment, so the definition pass skips it. It also
+  // guards the scope stacks: the closing line of a multi-line def/class
+  // signature (`) -> str:`) sits at the def's own indent and must not
+  // pop the scope it just opened, or the whole function body would look
+  // module-level. Depth never goes below 0 (a stray closer in broken
+  // code just clamps); if brackets never balance, later lines stay
+  // suppressed — a false negative, never a false positive.
+  var depthAtLineStart = [];
+  (function () {
+    var depth = 0;
+    for (var i = 0; i < lines.length; i++) {
+      depthAtLineStart.push(depth);
+      for (var j = 0; j < lines[i].length; j++) {
+        var ch = lines[i][j];
+        if (ch === '(' || ch === '[' || ch === '{') depth++;
+        else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+      }
+    }
+  })();
+
   function markDeclared(lineNo, name) {
     if (!declaredOnLine[lineNo]) declaredOnLine[lineNo] = new Set();
     declaredOnLine[lineNo].add(name);
@@ -1249,8 +1334,11 @@ function parsePy(rel, raw) {
     var trimmed = line.trim();
     if (trimmed === '') continue;
     var indent = indentOf(line);
-    while (classStack.length && indent <= classStack[classStack.length - 1].indent) classStack.pop();
-    while (funcStack.length && indent <= funcStack[funcStack.length - 1].indent) funcStack.pop();
+    // A scope never ends in the middle of a bracketed statement: the
+    // suite (and its dedent) only starts after the brackets close.
+    var lineDepth = depthAtLineStart[ln];
+    while (lineDepth === 0 && classStack.length && indent <= classStack[classStack.length - 1].indent) classStack.pop();
+    while (lineDepth === 0 && funcStack.length && indent <= funcStack[funcStack.length - 1].indent) funcStack.pop();
 
     if (/^@/.test(trimmed)) {
       pendingDecorators.push(trimmed);
@@ -1295,13 +1383,21 @@ function parsePy(rel, raw) {
     // dunder rule. A class attribute inside a Pydantic BaseModel /
     // @dataclass is a framework-populated model field (KEEP, never
     // SAFE); other class attributes and function locals are not module
-    // definitions and are skipped.
+    // definitions and are skipped. A name bound inside a plain block
+    // (`if TYPE_CHECKING:`, `try:`, a version guard) IS a module
+    // definition at any indent — the CLI's tree-sitter parser records
+    // it the same way, with the enclosing block as the parent — so it
+    // is recorded here too, as an unexported variable.
     var am = line.match(/^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^=]/);
     // A field is directly in the class body (not inside a method: a
     // local inside a method sits deeper than the enclosing def).
     var inFunction = funcStack.length > 0 && indent > funcStack[funcStack.length - 1].indent;
-    var enclosingModel = !inFunction && classStack.length > 0 && indent > classStack[classStack.length - 1].indent && classStack[classStack.length - 1].model;
-    if (am && (indent === 0 || enclosingModel)) {
+    var inClassBody = classStack.length > 0 && indent > classStack[classStack.length - 1].indent;
+    var enclosingModel = !inFunction && inClassBody && classStack[classStack.length - 1].model;
+    // lineDepth === 0: a continuation line inside a call, decorator or
+    // def signature (`replace_whitespace=False`, a def parameter) looks
+    // like an assignment but is a keyword argument, not a binding.
+    if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel)) {
       parsed.definitions.push({
         name: am[2], kind: 'variable', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: [],

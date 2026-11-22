@@ -396,6 +396,22 @@ test('js-reexports: export { X } re-exports an import, and .js imports resolve t
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });
 
+test('js-export-list: local export { ... } lists do not count as uses, but re-exporting an import does', () => {
+  const f = findingsFor('js-export-list');
+  // A locally defined name in a local `export { ... }` list is a public
+  // export, not a use: it grades REVIEW (exported but never imported),
+  // never invisible and never SAFE. This holds for a single-line list,
+  // an `as` alias (the LOCAL name is the definition), and a multi-line
+  // list. A name imported by the entry point has no finding, and the
+  // unexported dead function is SAFE.
+  assert.equal(bySymbol(f, 'src/lib.js', 'onlyExported').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'aliasedFn').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'multiExported').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'deadFn').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/lib.js', 'importedFn'), undefined, 'importedFn is imported and called by the entry point');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 1);
+});
+
 test('js-alias: tsconfig paths aliases (@/* and exact @util) resolve to real files', () => {
   const f = findingsFor('js-alias');
   // Both the star alias and the exact alias import helper from util.ts.

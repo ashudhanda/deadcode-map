@@ -500,6 +500,36 @@ test('web py-decorated: decorated methods, bare annotations, TypeAlias strings, 
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });
 
+test('web py-typechecking: unreferenced type aliases inside if blocks are SAFE', () => {
+  // Regression test for the requests _types.py gap: aliases bound
+  // inside `if TYPE_CHECKING:` (CookiesType, ProxiesType) were missed
+  // entirely because the parser only recorded assignments at indent 0.
+  // A name bound inside a plain block is a module definition at any
+  // indent — the CLI's tree-sitter parser records it the same way.
+  const f = loadFixture('py-typechecking').findings;
+  assert.equal(bySymbol(f, 'aliases.py', 'DeadType').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'aliases.py', 'OtherDeadType').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'aliases.py', 'LegacyType').grade, 'SAFE');
+  // SAFE false-positive rate is 0%: every other SAFE finding would be
+  // a live symbol flagged dead.
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['variable:aliases.py:DeadType', 'variable:aliases.py:OtherDeadType', 'variable:aliases.py:LegacyType']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-typechecking: used aliases, class attributes and function locals stay unflagged', () => {
+  const f = loadFixture('py-typechecking').findings;
+  assert.equal(bySymbol(f, 'aliases.py', 'NameType'), undefined, 'NameType is used by a string annotation in aliases.py and main.py');
+  assert.equal(bySymbol(f, 'aliases.py', 'format_name'), undefined, 'format_name is called from main.py');
+  assert.equal(bySymbol(f, 'main.py', 'show'), undefined, 'show is called in its own file');
+  assert.equal(bySymbol(f, 'aliases.py', 'retries'), undefined, 'a plain class attribute is not a module definition');
+  assert.equal(bySymbol(f, 'aliases.py', 'timeout'), undefined, 'a function local is not a module definition');
+  assert.equal(bySymbol(f, 'aliases.py', 'make_config').grade, 'REVIEW', 'an exported but never imported function is REVIEW, never SAFE');
+});
+
 test('web py-reexports: redundant aliases, noqa imports and compat shims are re-exports', () => {
   const f = loadFixture('py-reexports').findings;
   assert.equal(bySymbol(f, 'pkg/helpers.py', 'assist'), undefined, 'helpers.assist is used through the package');
@@ -530,6 +560,22 @@ test('web js-reexports: export { X } re-exports an import, and .js imports resol
   assert.equal(byCategory(f, 'src/runner.ts', 'file'), undefined);
   assert.equal(byCategory(f, 'src/lib.ts', 'file'), undefined);
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web js-export-list: local export { ... } lists do not leak names into references', () => {
+  const f = loadFixture('js-export-list').findings;
+  // Before the fix the names in a local `export { ... }` list leaked
+  // into the references pass, so every exported-but-unimported function
+  // looked used and had no finding at all. Now they grade REVIEW like
+  // the CLI (single-line list, `as` alias, and multi-line list), the
+  // unexported dead function is SAFE, and the imported function has no
+  // finding. Only the dead function is SAFE.
+  assert.equal(bySymbol(f, 'src/lib.js', 'onlyExported').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'aliasedFn').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'multiExported').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/lib.js', 'deadFn').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/lib.js', 'importedFn'), undefined, 'importedFn is imported and called by the entry point');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 1);
 });
 
 test('web py-pydantic: model fields, validators and overload groups are framework-invoked', () => {
