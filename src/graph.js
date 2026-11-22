@@ -12,9 +12,11 @@ const fs = require('fs');
 const path = require('path');
 const { parseJsTs } = require('./parse-js');
 const { parsePy } = require('./parse-py');
+const { parseJava } = require('./parse-java');
 
 const JS_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
 const PY_EXTS = ['.py'];
+const JAVA_EXTS = ['.java'];
 
 const WORD_CHAR = 'A-Za-z0-9_';
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -207,15 +209,19 @@ function analyze(root, discovery) {
     try { src = fs.readFileSync(f, 'utf8'); } catch (_) { continue; }
     let parsed;
     try {
-      parsed = JS_EXTS.includes(ext) ? parseJsTs(f, src, ext) : parsePy(f, src);
+      // A file whose parse contains ERROR / MISSING nodes is treated as
+      // unparsed (parse-java.js sets hasErrors and returns no
+      // definitions): its own findings are skipped, but its string
+      // literals still protect the same names elsewhere.
+      parsed = JS_EXTS.includes(ext) ? parseJsTs(f, src, ext) : JAVA_EXTS.includes(ext) ? parseJava(f, src) : parsePy(f, src);
     } catch (e) {
       // A parse failure must never kill the whole run; the file is skipped
       // with a warning and treated as live (never flagged).
       parsed = null;
     }
     files.set(f, {
-      rel: path.relative(root, f), language: parsed ? parsed.language : (ext === '.py' ? 'py' : 'js'),
-      parsed, src, size: src.length, ext, parseError: parsed ? null : 'parse failed',
+      rel: path.relative(root, f), language: parsed ? parsed.language : (ext === '.py' ? 'py' : ext === '.java' ? 'java' : 'js'),
+      parsed, src, size: src.length, ext, parseError: parsed ? (parsed.hasErrors ? 'parse errors' : null) : 'parse failed',
     });
   }
 
@@ -348,8 +354,23 @@ function analyze(root, discovery) {
   // never execute, so they never count. Config / template files
   // (.json, .yaml, .html, ...) keep the raw-text match, because a value
   // there can wire a handler by name ({"handler": "stringOnlyFn"}).
+  //
+  // Coverage reports are tool output, not references: a Cobertura
+  // coverage.xml lists every file it measured (filename="dead.py"),
+  // so without this exclusion every covered file would look
+  // string-referenced and the coverage demotion would never fire.
+  // Same rule as src/coverage.js auto-discovery: coverage*.xml /
+  // lcov*.info (and the exact names coverage.xml / lcov.info).
+  const isCoverageReport = (f) => {
+    const base = path.basename(f);
+    return (base.startsWith('coverage') || base.startsWith('lcov')) && /\.(xml|info)$/.test(base);
+  };
   const PROSE_EXTS = new Set(['.md', '.txt']);
-  const RAW_MATCH_EXTS = new Set(['.json', '.yaml', '.yml', '.toml', '.html', '.vue', '.css']);
+  // Config files that wire code by name: Spring XML, MyBatis mapper
+  // XML, application.properties — a member name in one of these is a
+  // real reference (Java string-mention downgrade), so they match raw
+  // text like .json / .yaml do. Prose files (.md, .txt) never count.
+  const RAW_MATCH_EXTS = new Set(['.json', '.yaml', '.yml', '.toml', '.html', '.vue', '.css', '.xml', '.properties']);
 
   /** True when `name` appears in a string literal as code, not as a word in a sentence. */
   function codeLikeStringMention(literal, name) {
@@ -413,7 +434,8 @@ function analyze(root, discovery) {
     for (const f of discovery.textFiles) {
       const ext = path.extname(f).toLowerCase();
       if (PROSE_EXTS.has(ext)) continue; // prose never executes
-      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext)) {
+      if (isCoverageReport(f)) continue; // tool output, not a reference
+      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext) || JAVA_EXTS.includes(ext)) {
         const info = files.get(f);
         if (info && info.parsed) {
           for (const s of info.parsed.strings || []) addLiteral(s, f, true);
@@ -438,7 +460,8 @@ function analyze(root, discovery) {
     for (const f of discovery.textFiles) {
       const ext = path.extname(f).toLowerCase();
       if (PROSE_EXTS.has(ext)) continue; // prose never executes
-      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext)) {
+      if (isCoverageReport(f)) continue; // tool output, not a reference
+      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext) || JAVA_EXTS.includes(ext)) {
         const info = files.get(f);
         if (info && info.parsed) {
           // String literals only — comments and sentences in docstrings

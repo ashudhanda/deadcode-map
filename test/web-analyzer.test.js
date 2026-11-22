@@ -1386,3 +1386,262 @@ test('web multi-line import: a comment inside the specifier list is not a name',
   assert.deepEqual(p.imports[0].names.map((n) => n.local), ['usedFn', 'deadFn']);
   assert.equal(p.references.has('deadFn'), false);
 });
+
+test('web keyword-imports: of/from/get/set imports count as used when called', () => {
+  // WP-1: RxJS `of` / `from` (and lodash `get` / `set`) collide with JS
+  // keywords, so the use-counter used to skip their calls and flag the
+  // imports SAFE even though they are called (nestjs hello.controller:
+  // `of` called at :23, `from` called in streaming.module).
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/index.js',
+      content: [
+        "const { HelloController } = require('./hello.controller');",
+        'const c = new HelloController();',
+        'console.log(c.streamGreeting(), c.loadAll(), c.update({}));',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: 'src/hello.controller.js',
+      content: [
+        "import { of } from 'rxjs';",
+        "import { from } from 'rxjs';",
+        "import { get, set } from 'lodash';",
+        "import { neverCalled } from 'rxjs';",
+        'export class HelloController {',
+        '  streamGreeting() {',
+        '    return of(this.greeting());',
+        '  }',
+        '  loadAll() {',
+        '    return from([1, 2]).pipe(get);',
+        '  }',
+        '  greeting() { return "hi"; }',
+        '  update(obj) { set(obj, "a", 1); return obj; }',
+        '}',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const f = analyzeFiles(files).findings;
+  for (const name of ['of', 'from', 'get', 'set']) {
+    assert.equal(bySymbol(f, 'src/hello.controller.js', name), undefined, `${name} is called in its own file and must not be flagged`);
+  }
+  // The control: an unused keyword-colliding import is still flagged.
+  assert.equal(bySymbol(f, 'src/hello.controller.js', 'neverCalled').grade, 'SAFE');
+  assert.deepEqual(
+    f.filter((x) => x.grade === 'SAFE').map((x) => `${x.category}:${x.file}:${x.symbol || ''}`),
+    ['import:src/hello.controller.js:neverCalled'],
+  );
+});
+
+test('web keyword-imports: a local named from/get used only in ${} is live', () => {
+  // The sveltekit write_types shape: `const from = ...` is used only
+  // inside `` `${from}` ``, and `get()` only by a same-file call — both
+  // used to look unused because `from` / `get` are JS keywords.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { build } = require('./build');\nconsole.log(build('x'));\n" },
+    {
+      path: 'src/build.js',
+      content: [
+        'function build(path) {',
+        "  const from = './proxy' + path;",
+        "  const type = `typeof import('${from}').load`;",
+        '  return type;',
+        '}',
+        'function get() { return 1; }',
+        'function caller() { return get(); }',
+        'module.exports = { build, caller };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/build.js', 'from'), undefined, 'from is used in the ${} interpolation');
+  assert.equal(bySymbol(f, 'src/build.js', 'get'), undefined, 'get() is called by caller()');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web unreachable-template: ${} lines inside a template literal after return are not unreachable', () => {
+  // WP-2: adapter-netlify generates edge-function source in a template
+  // literal after `return `...`` — the ${...} expression lines inside
+  // it are part of the return statement, not new statements after it.
+  // The genuinely unreachable return in dead() is still flagged.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { build } = require('./build');\nconsole.log(build('x'));\n" },
+    {
+      path: 'src/build.js',
+      content: [
+        'function build(name) {',
+        '  return `\\',
+        '${name}',
+        'export default async (request) => {',
+        '  return name;',
+        '};',
+        '`;',
+        '}',
+        'function dead() {',
+        '  return 1;',
+        '  return 2;',
+        '}',
+        'module.exports = { build, dead };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  const unreach = r.findings.filter((x) => x.category === 'unreachable');
+  assert.equal(unreach.length, 1, 'only the genuinely unreachable return is flagged: ' + JSON.stringify(unreach));
+  assert.equal(unreach[0].file, 'src/build.js');
+  assert.equal(unreach[0].startLine, 11, 'the second return in dead()');
+});
+
+test('web template-continuation: line numbers after a backslash-newline template stay aligned', () => {
+  // A `\` + newline inside a template literal used to eat the newline
+  // in the stripped code, so every later definition's startLine drifted
+  // (adapter-netlify findings pointed at the wrong lines).
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    {
+      path: 'src/a.js',
+      content: [
+        'const s = `a\\',
+        'b`;',
+        'function afterTemplate() { return 1; }',
+        'module.exports = { afterTemplate };',
+        '',
+      ].join('\n'),
+    },
+    { path: 'src/index.js', content: "require('./a');\nconsole.log('hi');\n" },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/a.js', 'afterTemplate').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/a.js', 'afterTemplate').startLine, 3, 'the definition sits on raw line 3, not the drifted line 2');
+});
+
+test('web dedupe: same-name definitions in one file emit one finding, one per unreachable block', () => {
+  // Django's 114 `Meta` classes / 52 `http_options` variables all
+  // used to emit one finding per definition / per line. The hoisted
+  // functions in outer() are reachable (FP-12) and emit nothing; the
+  // genuinely unreachable block in dead() emits exactly one finding.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { A, B } = require('./lib');\nconsole.log(new A(), new B());\n" },
+    {
+      path: 'src/lib.js',
+      content: [
+        'class A {',
+        '  neverCalled() { return 1; }',
+        '}',
+        'class B {',
+        '  neverCalled() { return 2; }',
+        '}',
+        'function outer() {',
+        '  return 1;',
+        '  function hoistedA() { return 2; }',
+        '  function hoistedB() { return 3; }',
+        '}',
+        'function dead() {',
+        '  return 1;',
+        '  console.log(1);',
+        '  console.log(2);',
+        '}',
+        'module.exports = { A, B, outer, dead };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const f = analyzeFiles(files).findings;
+  const methods = f.filter((x) => x.category === 'method' && x.symbol === 'neverCalled');
+  assert.equal(methods.length, 1, 'one finding for both neverCalled methods: ' + JSON.stringify(methods));
+  assert.equal(methods[0].startLine, 2, 'the first definition wins');
+  const unreach = f.filter((x) => x.category === 'unreachable');
+  assert.equal(unreach.length, 1, 'one finding for the genuinely unreachable block: ' + JSON.stringify(unreach));
+  assert.equal(unreach[0].startLine, 14, 'the block starts at the first dead statement in dead()');
+});
+
+test('web unreachable-hoisted: function declarations after return are reachable (FP-12)', () => {
+  // SvelteKit shape: get_data_type / apply_handle / create_leaf_loader
+  // are function declarations after `return` in the same scope — they
+  // hoist, so they and their bodies are reachable. A const after the
+  // same return still never runs (temporal dead zone) and is flagged.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { outer } = require('./lib');\nconsole.log(outer());\n" },
+    {
+      path: 'src/lib.js',
+      content: [
+        'function outer() {',
+        '  const x = getData();',
+        '  return x;',
+        '  function getData() {',
+        '    return 42;',
+        '  }',
+        '  async function load() { return 1; }',
+        '  function* gen() { yield 1; }',
+        '  const afterReturn = 1;',
+        '}',
+        'module.exports = { outer };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const f = analyzeFiles(files).findings;
+  const unreach = f.filter((x) => x.category === 'unreachable');
+  assert.equal(unreach.length, 1, 'only the const after return is unreachable: ' + JSON.stringify(unreach));
+  assert.equal(unreach[0].startLine, 9, 'the const line, not the hoisted functions');
+});
+
+test('web template-import: a name used only in a dynamic import() template is live', () => {
+  // The pydantic-core wasm-preview worker.js shape: PYODIDE_VERSION is
+  // used only inside `import(`https://...v${PYODIDE_VERSION}/...`)` —
+  // the references pass used to skip every line starting with `import`,
+  // including dynamic import() lines, so the name looked unused.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { load } = require('./worker');\nconsole.log(load());\n" },
+    {
+      path: 'src/worker.js',
+      content: [
+        "const PYODIDE_VERSION = '314.0.7';",
+        'async function load() {',
+        '  const [m] = await Promise.all([',
+        '    import(`https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/pyodide.mjs`),',
+        '  ]);',
+        '  return m;',
+        '}',
+        'module.exports = { load };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(bySymbol(f, 'src/worker.js', 'PYODIDE_VERSION'), undefined, 'PYODIDE_VERSION is interpolated into the dynamic import URL');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web return-as-cast: a return ending in as continues on the next line', () => {
+  // The nestjs standard-schema-validation.pipe.ts shape: `return x as`
+  // with the type on the next line is one statement, not a completed
+  // return followed by unreachable code.
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { validate } = require('./pipe');\nconsole.log(validate(1));\n" },
+    {
+      path: 'src/pipe.ts',
+      content: [
+        'function validate(value) {',
+        '  return value as',
+        '    string;',
+        '}',
+        'module.exports = { validate };',
+        '',
+      ].join('\n'),
+    },
+  ];
+  const r = analyzeFiles(files);
+  assert.equal(r.findings.filter((x) => x.category === 'unreachable').length, 0, 'the type on the next line is part of the return');
+});

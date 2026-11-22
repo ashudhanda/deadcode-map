@@ -89,6 +89,13 @@ function parsePy(filePath, src) {
   };
 
   const pendingDecorators = new Map();
+  // Attribute-lookup names (`obj.name`, `self.name`), recorded
+  // separately from bare references: the confidence engine's cross-file
+  // attribute rule (FP-6) credits a class attribute when another file
+  // reads it as an attribute. Kept as a Set here and converted to a
+  // sorted array before the result leaves parsePy, so the cache (plain
+  // JSON) round-trips it unchanged.
+  const attributeRefSet = new Set();
   // Reference occurrences with positions, for per-definition scopes
   // (same-file cascade) — see parse-js.js pass 4. `references` stays
   // the flat file-level set; occurrences are the positioned twin used
@@ -116,21 +123,37 @@ function parsePy(filePath, src) {
     let scope = node.parent;
     while (scope && (scope.type === 'expression_statement' || scope.type === 'decorated_definition' || scope.type === 'assignment')) scope = scope.parent;
     const parentType = scope ? scope.type : 'module';
+    // The enclosing class, if any: walk up past statement wrappers and
+    // grouping statements (`if` / `try` / `with` / `for` blocks inside a
+    // class body — Django's psycopg3-only `adapt_integerfield_value`
+    // and `integerfield_type_map` sit under `if is_psycopg3:` in the
+    // class body, and are still a method / an attribute of that class).
+    // The walk stops at a function boundary (a nested function is not a
+    // method of the outer class) or the module, and starts at
+    // node.parent so a definition never counts as its own enclosing
+    // class. A decorated method (@contextmanager, @property) sits under
+    // a decorated_definition, so node.parent is never the class block —
+    // the walk handles that too.
+    let enclosingClass = null;
+    {
+      let a = node.parent;
+      while (a) {
+        if (a.type === 'class_definition') { enclosingClass = a; break; }
+        if (a.type === 'function_definition' || a.type === 'module') break;
+        a = a.parent;
+      }
+    }
     // A function defined inside a class body is a method, not a module
-    // function. The check uses the walked scope, not node.parent: a
-    // decorated method (@contextmanager, @property) sits under a
-    // decorated_definition, so node.parent is never the class block.
+    // function.
     let finalKind = kind;
-    if (kind === 'function' && scope && scope.type === 'block'
-      && scope.parent && scope.parent.type === 'class_definition') {
+    if (kind === 'function' && enclosingClass) {
       finalKind = 'method';
     }
-    // A class attribute: a variable assigned directly in a class body.
-    // The enclosing class node is recorded so the post-pass below can
+    // A class attribute: a variable assigned in a class body. The
+    // enclosing class node is recorded so the post-pass below can
     // resolve which base class the attribute belongs to.
-    const inClassBody = kind === 'variable' && scope && scope.type === 'block'
-      && scope.parent && scope.parent.type === 'class_definition';
-    const classNode = inClassBody ? scope.parent : null;
+    const inClassBody = kind === 'variable' && Boolean(enclosingClass);
+    const classNode = inClassBody ? enclosingClass : null;
     // A Sphinx `#:` comment block directly above a class attribute
     // documents it as part of the class's public API (an
     // extension-facing flag, a mixin default): the comment is the
@@ -206,10 +229,11 @@ function parsePy(filePath, src) {
   // import as intentional: a re-export the author knows is unused in
   // this file. The comment may sit on any line of a multi-line import,
   // so check the whole span plus the line above. Line-based, so it
-  // does not depend on position units.
+  // does not depend on position units. Linters accept the marker in
+  // either case (`# NOQA` in Django), so the match is case-insensitive.
   const hasNoqa = (node) => {
     const lines = srcLines.slice(Math.max(0, node.startPosition.row - 1), node.endPosition.row + 1);
-    return lines.some((line) => /#\s*noqa\b/.test(line));
+    return lines.some((line) => /#\s*noqa\b/i.test(line));
   };
   // A re-export / backwards-compatibility comment marks ONE name, not
   // the whole statement: requests' sessions.py imports REDIRECT_STATI
@@ -232,10 +256,25 @@ function parsePy(filePath, src) {
       && new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(above));
   };
 
+  // True when the statement sits inside a `try:` block: an import
+  // there is often an availability probe (`try: import numpy`,
+  // `try: from PIL import Image`) whose purpose is the import itself.
+  // The flag travels on the import record; confidence.js grades it.
+  const inTryExcept = (node) => {
+    let a = node.parent;
+    while (a) {
+      if (a.type === 'try_statement') return true;
+      if (a.type === 'module') return false;
+      a = a.parent;
+    }
+    return false;
+  };
+
   // --- pass 1: structure ---
   walk(root, (node) => {
     switch (node.type) {
       case 'import_statement': {
+        const inTry = inTryExcept(node);
         for (let i = 0; i < node.namedChildCount; i++) {
           const c = node.namedChild(i);
           if (c.type === 'dotted_name') {
@@ -244,7 +283,7 @@ function parsePy(filePath, src) {
             // code uses it as a.b.c.foo(). Recording `c` made the
             // binding unfindable and hid genuinely unused dotted imports.
             const local = full.split('.')[0];
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) });
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, inTryExcept: inTry, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) });
           } else if (c.type === 'aliased_import') {
             const nameNode = childByField(c, 'name');
             const aliasNode = childByField(c, 'alias');
@@ -255,7 +294,7 @@ function parsePy(filePath, src) {
             // API). A plain `import X` defaults local to X and is NOT
             // a re-export, so only an explicitly written alias counts.
             const redundantAlias = Boolean(aliasNode) && text(aliasNode, src) === full;
-            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) || redundantAlias });
+            result.imports.push({ names: [{ imported: full, local, kind: 'named' }], source: full, range: rangeOf(node), sideEffect: false, inTryExcept: inTry, reExport: isPackageInit || isCompatShim || hasNoqa(node) || nameHasKeepComment(node, c, [local, full], true) || redundantAlias });
           }
         }
         break;
@@ -307,7 +346,7 @@ function parsePy(filePath, src) {
         for (const n of names) n.kept = nameHasKeepComment(node, n.child, n.candidates, singleName);
         const keptNames = names.filter((n) => n.kept).map(strip);
         const restNames = names.filter((n) => !n.kept).map(strip);
-        const base = { source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true };
+        const base = { source, level, range: rangeOf(node), sideEffect: false, relative: Boolean(rel), fromImport: true, inTryExcept: inTryExcept(node) };
         if (keptNames.length > 0 && restNames.length > 0) {
           result.imports.push({ ...base, names: keptNames, reExport: true });
           result.imports.push({ ...base, names: restNames, reExport: stmtReExport });
@@ -396,11 +435,15 @@ function parsePy(filePath, src) {
           let top = node;
           while (top.parent && top.parent.type === 'assignment') top = top.parent;
           let terminal = childByField(top, 'right');
-          let chainLen = 1;
-          while (terminal && terminal.type === 'assignment') { chainLen += 1; terminal = childByField(terminal, 'right'); }
-          const isChain = chainLen > 1 || top !== node;
+          while (terminal && terminal.type === 'assignment') terminal = childByField(terminal, 'right');
           const kind = right && (right.type === 'lambda') ? 'function' : 'variable';
-          addDef(text(left, src), kind, node, (isChain && terminal && terminal.type === 'identifier') ? { chainedAliasOf: text(terminal, src) } : undefined);
+          // The right-hand side, when it is a bare name: a class-body
+          // assignment `x = method` — or a chain `a = b = method`
+          // ending in one — aliases a method of the same class. The
+          // post-pass below keeps it only when the name really is one
+          // of the enclosing class's own methods, so `x = imported_fn`
+          // and `x = module_global` stay ordinary candidates.
+          addDef(text(left, src), kind, node, (terminal && terminal.type === 'identifier') ? { chainedAliasOf: text(terminal, src) } : undefined);
         }
         break;
       }
@@ -447,7 +490,32 @@ function parsePy(filePath, src) {
     return parts.map((p) => (p.trim().match(/^[A-Za-z_][A-Za-z0-9_]*/) || [])[0]).filter(Boolean);
   };
   for (const info of classInfos) {
-    info.externalBase = baseNamesOf(info.node).some((b) => externalImportLocals.has(b));
+    const nameNode = childByField(info.node, 'name');
+    info.name = nameNode ? text(nameNode, src) : null;
+    info.bases = baseNamesOf(info.node);
+    info.externalBase = info.bases.some((b) => externalImportLocals.has(b));
+    // Methods of this class, by range containment: a method defined
+    // under `if` / `try` in the class body is still a method of the
+    // class (the member inventory above only sees direct body
+    // statements, so it would miss it). A method belongs to its
+    // innermost containing class, so a method of a nested class never
+    // counts as a method of the outer class.
+    info.methods = new Set();
+  }
+  for (const d of result.definitions) {
+    if (d.kind !== 'method') continue;
+    let best = null;
+    for (const info of classInfos) {
+      if (d.range.startIndex >= info.startIndex && d.range.endIndex <= info.endIndex) {
+        if (!best || (info.endIndex - info.startIndex) < (best.endIndex - best.startIndex)) best = info;
+      }
+    }
+    if (best) best.methods.add(d.name);
+  }
+  for (const info of classInfos) {
+    // A class with only `if`-nested methods still has methods: the
+    // direct inventory above misses them, the range pass does not.
+    if (info.methods.size > 0) info.hasMethod = true;
   }
   for (const d of result.definitions) {
     // NB: a class at offset 0 has _classStart === 0, which is falsy —
@@ -455,13 +523,17 @@ function parsePy(filePath, src) {
     if (d._classStart == null) { delete d._classStart; continue; }
     const info = classInfos.find((c) => c.startIndex === d._classStart);
     if (!info) { delete d._classStart; continue; }
-    // A chained-assignment alias is live only when the aliased name is
-    // defined in the same class (`popitem = _fail`, where _fail is the
-    // class's own method): the names are one object, part of the
-    // class's interface. A chain ending in any other name is an
-    // ordinary alias and stays a candidate.
-    if (d.chainedAliasOf && info.members.has(d.chainedAliasOf)) d.chainedAlias = true;
+    // An assignment whose value is a method of the same class (`x =
+    // method`, or a chain ending in one: `popitem = _fail`, where _fail
+    // is the class's own method) aliases that method: the names are one
+    // object, part of the class's interface. An assignment ending in
+    // any other name is an ordinary alias and stays a candidate.
+    if (d.chainedAliasOf && info.methods.has(d.chainedAliasOf)) d.chainedAlias = true;
     d.externalBase = info.externalBase;
+    // The enclosing class name travels on the definition: the
+    // confidence engine's override rules (FP-6) resolve the class
+    // hierarchy from it.
+    d.className = info.name;
     // A subclass of an externally-defined base whose body defines only
     // attributes (no methods) is a framework-consumed config class (a
     // Pygments Style subclass): the framework reads the attributes at
@@ -469,6 +541,12 @@ function parsePy(filePath, src) {
     d.configClassAttr = info.externalBase && !info.hasMethod;
     delete d._classStart;
   }
+  // Class inventory for the confidence engine's override rules (FP-6):
+  // per class, its name, direct bases (bare names as written), and
+  // range. Plain JSON, so the cache round-trips it unchanged.
+  result.classes = classInfos.map((info) => ({
+    name: info.name, bases: info.bases || [], range: rangeOf(info.node),
+  }));
 
   // __all__ = [...] (or (...) — typer's _typing.py uses a tuple, and
   // either form may span lines) makes names public exports, and a name
@@ -584,7 +662,19 @@ function parsePy(filePath, src) {
       }
     } else if (node.type === 'attribute') {
       const attr = childByField(node, 'attribute');
-      if (attr && !insideDecorator(node)) addRef(text(attr, src), attr);
+      // Attribute-lookup names (`obj.name`, `self.name`) are recorded
+      // separately from bare references: the confidence engine's
+      // cross-file attribute rule (FP-6) credits a class attribute
+      // when another file reads it as an attribute — a bare-name match
+      // elsewhere is not the same evidence. A decorator argument IS an
+      // attribute read (`@register(Tags.async_support)` evaluates
+      // Tags.async_support), so it counts for that rule — but never as
+      // a bare reference, because a decorator's own attribute is a
+      // member of the decorator object, not a same-named local.
+      if (attr) {
+        if (!insideDecorator(node)) addRef(text(attr, src), attr);
+        attributeRefSet.add(text(attr, src));
+      }
     } else if (node.type === 'string' || node.type === 'string_content') {
       result.strings.push(text(node, src));
       // String annotations are uses: `ctx: "Context"`,
@@ -691,6 +781,7 @@ function parsePy(filePath, src) {
   }
   for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
   result.topLevelUses = [...topLevelUses].sort();
+  result.attributeRefs = [...attributeRefSet].sort();
 
   return result;
 }

@@ -43,7 +43,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const FORMAT_VERSION = 2; // v2: parse results carry per-definition `uses` / `topLevelUses` scopes (batch 3) — v1 caches lack them
+const FORMAT_VERSION = 3; // v3: parse results carry Java fields plus Python class inventory / attributeRefs (batch 6) — v2 caches lack them
 const DOTFILE_NAME = '.deadcode-map-cache.json';
 const NODE_MODULES_CACHE_REL = path.join('node_modules', '.cache', 'deadcode-map', 'cache.json');
 
@@ -58,7 +58,7 @@ function toolVersion() {
 function parserVersion() {
   try {
     const versionOf = (name) => require(`${name}/package.json`).version;
-    return ['tree-sitter', 'tree-sitter-javascript', 'tree-sitter-typescript', 'tree-sitter-python']
+    return ['tree-sitter', 'tree-sitter-javascript', 'tree-sitter-typescript', 'tree-sitter-python', 'tree-sitter-java']
       .map((name) => `${name}@${versionOf(name)}`)
       .join('+');
   } catch (_) {
@@ -267,6 +267,10 @@ function createCacheContext({ root, location, configHash }) {
     parsePy(file, src, origParsePy) {
       const rel = path.relative(path.resolve(root), file);
       return wrapParse(rel, src, () => origParsePy(file, src));
+    },
+    parseJava(file, src, origParseJava) {
+      const rel = path.relative(path.resolve(root), file);
+      return wrapParse(rel, src, () => origParseJava(file, src));
     },
     /** Persist entries for files seen in this scan; drop deleted files. */
     save() {

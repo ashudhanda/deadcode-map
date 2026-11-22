@@ -63,7 +63,10 @@ function prove(root, graph, findings, opts) {
         results.push({ cluster: rel, status: 'skipped', reason: 'fix made no change', findings: items.length });
         continue;
       }
-      const test = run(testCmd, worktree, opts.timeoutMs);
+      // JVM builds download dependencies and compile on the first run:
+      // Maven / Gradle get a longer timeout than the JS/Python path.
+      const timeoutMs = opts.timeoutMs || (/^(mvn|gradle|\.\/gradlew)\b/.test(testCmd || '') ? 900000 : 300000);
+      const test = run(testCmd, worktree, timeoutMs);
       if (test.ok) {
         results.push({ cluster: rel, status: 'proven', reason: `tests pass without ${items.length} SAFE finding(s)`, findings: items.length });
       } else {
@@ -73,7 +76,7 @@ function prove(root, graph, findings, opts) {
         let provenAny = false;
         for (const f of items) {
           applyFix(worktree, wtGraph, wtFindings.filter((x) => x.id === f.id));
-          const single = run(testCmd, worktree, opts.timeoutMs);
+          const single = run(testCmd, worktree, timeoutMs);
           if (single.ok) {
             results.push({ cluster: `${rel}:${f.symbol || f.category}`, status: 'proven', reason: 'tests pass without this item alone', findings: 1 });
             provenAny = true;

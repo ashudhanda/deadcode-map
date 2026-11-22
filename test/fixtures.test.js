@@ -813,3 +813,186 @@ test('js-manual-scripts: files under scripts/ and tools/ are hand-run entries, s
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
   }
 });
+
+test('js-hoisted: function declarations after return are hoisted, never unreachable', () => {
+  const f = findingsFor('js-hoisted');
+  // SvelteKit FP-12: `get_data_type`, `apply_handle`,
+  // `create_leaf_loader` / `create_layout_loader` are all declared
+  // below a `return` in the same function and called above it. A
+  // function declaration hoists, so the declaration itself always runs
+  // (at function entry) — it is not unreachable code.
+  assert.equal(byCategory(f, 'src/hoisted.js', 'unreachable'), undefined, 'hoisted helpers after return must not be unreachable');
+  for (const symbol of ['build', 'runWithThrow', 'makeAsync', 'makeGen']) {
+    assert.equal(bySymbol(f, 'src/hoisted.js', symbol), undefined, `${symbol} must not be flagged`);
+  }
+  // The detector still works: a plain statement after `return` is
+  // genuinely unreachable and stays SAFE.
+  assert.equal(byCategory(f, 'src/still-dead.js', 'unreachable').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['unreachable:src/still-dead.js']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('js-hoisted: class and const declarations after return do NOT hoist, still unreachable', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-hoisted-neg-'));
+  const write = (rel, content) => {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  };
+  write('package.json', JSON.stringify({ name: 't', main: 'src/index.js' }));
+  write('src/index.js', "const { run } = require('./lib');\nconsole.log(run());\n");
+  write('src/lib.js', [
+    'function run() { return 1; }',
+    'function deadClass() {',
+    '  return 1;',
+    '  class Hidden {}',
+    '}',
+    'function deadConst() {',
+    '  return 1;',
+    '  const x = 2;',
+    '}',
+    'module.exports = { run, deadClass, deadConst };',
+    '',
+  ].join('\n'));
+  const f = scan(dir).findings;
+  // A class declaration sits in the temporal dead zone until its line
+  // runs, and a const initializer never runs after a return — unlike a
+  // function declaration, neither is hoisted into usable code.
+  const unreachable = f.filter((x) => x.category === 'unreachable' && x.file.endsWith('src/lib.js'));
+  assert.equal(unreachable.length, 2, 'class + const after return are both unreachable');
+  for (const u of unreachable) assert.equal(u.grade, 'SAFE');
+});
+
+test('ts-e2e-spec: *.e2e-spec.ts / *.e2e-spec.js files are test files — KEEP, never SAFE', () => {
+  const f = findingsFor('ts-e2e-spec');
+  // NestJS FP-14: 22 `sample/*/e2e/*.e2e-spec.ts` files were graded SAFE
+  // although each sample runs them via its own vitest.config.e2e.mts
+  // (`include: ['e2e/**/*.e2e-spec.ts']`, `test:e2e` script). The
+  // `.e2e-spec.` suffix is a test-file marker like `.spec.` / `.test.`.
+  for (const file of ['e2e/cats/cats.e2e-spec.ts', 'e2e/cats/cats.e2e-spec.js']) {
+    // A test file is an entry point, so it is reachable and never gets
+    // a file finding at all — the same as `*.spec.ts` / `*.test.ts`.
+    assert.equal(byCategory(f, file, 'file'), undefined, `${file} is a test entry point, never a dead file`);
+    assert.equal(bySymbol(f, file, 'unusedHelper').grade, 'KEEP', 'unused import in a test file is kept');
+  }
+  // The specs are entries, so the modules they import stay live.
+  assert.equal(byCategory(f, 'src/cats/cats.module.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/cats/cats.service.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/cats/unused-helper.ts', 'file'), undefined);
+  // The fix is filename-based, not directory-based: a non-spec file
+  // under e2e/ and a plain unimported file are still dead.
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['file:e2e/helpers/seed-data.ts', 'file:src/orphan.ts']);
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}`)), expectedSafe);
+});
+
+test('py-probe: an uppercase `# NOQA` import-as-probe is intentional, never SAFE', () => {
+  const f = findingsFor('py-probe');
+  // Django FP-13: `from PIL import Image  # NOQA` inside try/except in
+  // db/models/fields/files.py exists to test whether Pillow is
+  // installed; the import IS the use. The noqa marker was missed
+  // because the check was case-sensitive (`noqa` but not `NOQA`).
+  assert.equal(bySymbol(f, 'checks.py', 'Image'), undefined, 'uppercase # NOQA probe import must not be flagged');
+  assert.equal(bySymbol(f, 'checks.py', '_Image2'), undefined, 'lowercase # noqa: F401 probe import must not be flagged');
+  // Control: a genuinely unused import with no marker is still SAFE.
+  assert.equal(bySymbol(f, 'checks.py', 'os').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'checks.py', 'os').category, 'import');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:checks.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('py-attr-overrides: framework-consumed class attributes via override family and attribute lookup (FP-6)', () => {
+  const f = findingsFor('py-attr-overrides');
+  // (R1b) An attribute that overrides one defined on an ancestor class
+  // is part of the inherited interface (Django's GIS `arity`, read as
+  // `self.arity` by the base Func): REVIEW, never SAFE. Area reaches
+  // Func.arity through its grandparent GeoFunc, so the resolution is
+  // transitive, not direct-base only.
+  for (const [file, symbol] of [
+    ['funcs.py', 'arity'],
+    ['funcs.py', 'template'],
+    ['funcs.py', 'supports_x'],
+  ]) {
+    const hit = f.filter((x) => x.file.endsWith(file) && x.symbol === symbol);
+    assert.ok(hit.length > 0, `${file}:${symbol} must be flagged`);
+    assert.equal(hit[0].grade, 'REVIEW', `${file}:${symbol} overrides an ancestor attribute`);
+  }
+  assert.equal(bySymbol(f, 'funcs.py', 'arity').grade, 'REVIEW');
+  // (R1a) The base side of the same family: an attribute a subclass
+  // overrides is part of the class interface (Django's
+  // `BaseDatabaseFeatures.supports_*`, overridden per backend).
+  assert.equal(bySymbol(f, 'base.py', 'supports_x').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'base.py', 'template').grade, 'REVIEW');
+  // (R2) An attribute read as `obj.<name>` in another file is live
+  // through attribute lookup, even when the defining file is never
+  // imported for it (Django's `connection.features.supports_y`).
+  assert.equal(bySymbol(f, 'base.py', 'supports_y').grade, 'REVIEW');
+  // A class-body assignment aliasing a method of the same class is one
+  // object with that method (Django's `IE_sanitize =
+  // sanitize_file_name`): KEEP. An assignment whose value is a
+  // builtin, not a same-class method, stays a candidate.
+  assert.equal(bySymbol(f, 'alias.py', 'clean_name').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'alias.py', 'other').grade, 'SAFE');
+  // A class body under `if` still belongs to the class (Django's
+  // psycopg3-only `integerfield_type_map` / `adapt_integerfield_value`
+  // under `if is_psycopg3:`): the attribute read by the conditional
+  // method is live, and the conditional attribute with no reader stays
+  // a candidate.
+  assert.equal(bySymbol(f, 'ops.py', 'data_map'), undefined, 'data_map is read by the conditional method');
+  assert.equal(bySymbol(f, 'ops.py', 'dead_cond_attr').grade, 'SAFE');
+  // Scope guard: the attribute rule is class attributes only. A
+  // module-level variable that shares its name with an attribute read
+  // elsewhere (`obj._timeout`) is still SAFE.
+  assert.equal(bySymbol(f, 'globals_mod.py', '_timeout').grade, 'SAFE');
+  // Negatives: genuinely dead class attributes stay SAFE — a base
+  // attribute no subclass overrides and nothing reads, a feature flag
+  // with no override and no reader, and a subclass attribute of the
+  // same shape.
+  assert.equal(bySymbol(f, 'base.py', 'dead_base_attr').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'base.py', 'dead_feature').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'funcs.py', 'dead_sub_attr').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'variable:base.py:dead_base_attr',
+    'variable:base.py:dead_feature',
+    'variable:funcs.py:dead_sub_attr',
+    'variable:ops.py:dead_cond_attr',
+    'variable:alias.py:other',
+    'variable:globals_mod.py:_timeout',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), expectedSafe);
+});
+
+test('py-try-import: an unused import inside try/except is an availability probe (FP-13)', () => {
+  const f = findingsFor('py-try-import');
+  // Django FP-13: `try: import numpy` (contrib/gis/shortcuts.py) and
+  // `try: from PIL import Image` (db/models/fields/files.py) exist to
+  // test whether the dependency is installed; the import IS the use.
+  // Without a `# NOQA` marker they are REVIEW, never SAFE — a leftover
+  // optional import in a try block looks identical, so a human checks.
+  assert.equal(bySymbol(f, 'probe.py', 'numpy').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'probe.py', 'Image').grade, 'REVIEW');
+  // A try-wrapped import that IS referenced afterwards is live.
+  assert.equal(bySymbol(f, 'probe.py', 'usedlib'), undefined, 'used try-wrapped import must not be flagged');
+  // Control: a plain unused import with no try and no marker is SAFE.
+  assert.equal(bySymbol(f, 'probe.py', 'deadlib').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:probe.py:deadlib']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), expectedSafe);
+});

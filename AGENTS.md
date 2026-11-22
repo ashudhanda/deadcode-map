@@ -5,7 +5,7 @@ Guide for CLI agents (human or AI) working in this repo.
 ## What this repo is
 
 deadcode-map finds dead code, proves it is dead, and shows it on a map.
-JS / TypeScript and Python. Every finding is graded `SAFE` / `REVIEW` / `KEEP`
+JS / TypeScript, Python, and Java (private-only SAFE). Every finding is graded `SAFE` / `REVIEW` / `KEEP`
 and carries its evidence (importers, callers, string mentions, git age, coverage).
 `--fix` / `--prove` act on SAFE only. The map is a single self-contained HTML file.
 
@@ -47,7 +47,7 @@ node bin/deadcode-map.js .
 
 It must report **0 findings**. If your change introduces a finding, fix the
 code (or the analyzer) — do not add a baseline to hide it. With
-`--include-fixtures` the planted fixture data still reports (128 findings,
+`--include-fixtures` the planted fixture data still reports (250 findings,
 0 in `src/`); that is expected.
 
 ## Rules for changes

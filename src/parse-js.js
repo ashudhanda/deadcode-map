@@ -569,6 +569,17 @@ function parseJsTs(filePath, src, ext) {
         if (stmt.type === 'comment') continue; // a trailing comment is not code
         if (terminated) {
           const t = text(stmt, src).trim();
+          // Function declarations hoist to the top of their enclosing
+          // function (or block), so a helper declared textually after
+          // a `return` is still callable before it — SvelteKit's
+          // `get_data_type` / `apply_handle` / `create_*_loader`
+          // helpers are declared this way and called above the return.
+          // Async functions share the `function_declaration` node;
+          // generators are `generator_function_declaration`. Other
+          // declarations do not hoist into usable code (a class sits
+          // in the temporal dead zone, a const initializer never runs),
+          // so they stay unreachable.
+          const isHoistedFn = stmt.type === 'function_declaration' || stmt.type === 'generator_function_declaration';
           // Intentional unreachable code, marked `/* istanbul ignore
           // next */` (or a `# pragma: no cover` in embedded code): the
           // author knows it never runs, so it is not dead code to delete.
@@ -581,7 +592,7 @@ function parseJsTs(filePath, src, ext) {
             return /istanbul ignore/.test(a) || /istanbul ignore/.test(b)
               || /pragma:\s*no cover/.test(a) || /pragma:\s*no cover/.test(b);
           };
-          if (t && t !== '}' && t.length > 0 && !checkIgnored(stmt.startPosition.row) && !checkIgnored(terminatedLine)) {
+          if (!isHoistedFn && t && t !== '}' && t.length > 0 && !checkIgnored(stmt.startPosition.row) && !checkIgnored(terminatedLine)) {
             result.unreachable.push({ range: rangeOf(stmt), line: stmt.startPosition.row + 1, reason: 'code after return/throw/break/continue', snippet: t.slice(0, 120) });
           }
         }

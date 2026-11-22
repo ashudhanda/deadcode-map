@@ -26,8 +26,8 @@ const FIXTURE_DIRS = new Set(['fixtures', '__fixtures__']);
 
 const SKIP_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
-const CODE_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py']);
-const ALL_EXTS = new Set([...CODE_EXTS, '.json', '.md', '.txt', '.yaml', '.yml', '.toml', '.html', '.css', '.vue']);
+const CODE_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.java']);
+const ALL_EXTS = new Set([...CODE_EXTS, '.json', '.md', '.txt', '.yaml', '.yml', '.toml', '.html', '.css', '.vue', '.xml', '.properties']);
 
 function isCodeFile(p) {
   return CODE_EXTS.has(path.extname(p).toLowerCase());
@@ -152,7 +152,8 @@ const ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//, // framework route directories
   /(^|\/)examples\//, // example scripts are standalone entry points, run directly
   /(^|\/)(scripts|tools)\//, // manually-run tools: invoked by hand, never imported (see isManualScriptPath)
-  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
+  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
+  /Test\.java$/, // JUnit test class (src/test/java or *Test.java)
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
   /\/migrations\//, /\/seeds?\//,
@@ -194,6 +195,8 @@ function looksLikeEntry(rel, abs, pkgEntries) {
   if (src.startsWith('#!')) return { entry: true, reason: 'has a shebang (CLI script)' };
   if (/__name__\s*==\s*['"]__main__['"]/.test(src)) return { entry: true, reason: 'runnable script (if __name__ == "__main__")' };
   if (/require\.main\s*===\s*module/.test(src)) return { entry: true, reason: 'runnable script (require.main === module)' };
+  // Java: a public static void main(String[]) method is the entry point.
+  if (/public\s+static\s+void\s+main\s*\(\s*String\s*\[/.test(src)) return { entry: true, reason: 'has a main() method (Java entry point)' };
   return { entry: false, reason: '' };
 }
 

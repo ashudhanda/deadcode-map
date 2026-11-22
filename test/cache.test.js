@@ -26,6 +26,7 @@ const BIN = path.join(ROOT, 'bin', 'deadcode-map.js');
 const { scan } = require('../src/index');
 const { parseJsTs } = require('../src/parse-js');
 const {
+  FORMAT_VERSION,
   computeConfigHash,
   deserializeParsed,
   exportSetOf,
@@ -132,14 +133,15 @@ test('cache: corrupt / missing / stale cache files fail open', () => {
   const corrupt = loadCache(loc, expected);
   assert.equal(corrupt.entries.size, 0);
   assert.match(corrupt.warning, /corrupt/);
-  fs.writeFileSync(loc, JSON.stringify({ format: 2, toolVersion: '9.9.9', parserVersion: 'p', configHash: 'c', entries: {} }));
+  fs.writeFileSync(loc, JSON.stringify({ format: FORMAT_VERSION, toolVersion: '9.9.9', parserVersion: 'p', configHash: 'c', entries: {} }));
   const stale = loadCache(loc, expected);
   assert.equal(stale.entries.size, 0);
   assert.match(stale.warning, /tool version/);
   // A v1 cache file (written before per-definition scopes existed) is
   // rejected as unsupported format, never silently reused: its parses
   // lack `uses` / `topLevelUses`, so reusing them would silently
-  // disable the same-file cascade.
+  // disable the same-file cascade. (A v2 file is rejected the same way:
+  // it lacks the Java fields and Python class inventory batch 6 added.)
   fs.writeFileSync(loc, JSON.stringify({ format: 1, toolVersion: '0.1.0', parserVersion: 'p', configHash: 'c', entries: {} }));
   const oldFormat = loadCache(loc, expected);
   assert.equal(oldFormat.entries.size, 0);

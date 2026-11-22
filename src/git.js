@@ -3,6 +3,7 @@
 /** Git evidence: last-touch age + churn per file. Best effort, never fatal. */
 
 const { execFileSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 function isGitRepo(root) {
@@ -62,7 +63,28 @@ function defaultTestCommand(root, pkg) {
   if (pkg && pkg.scripts && pkg.scripts.test && pkg.scripts.test !== 'echo "Error: no test specified" && exit 1') {
     return 'npm test';
   }
+  // Java: Maven or Gradle, when the build tool is actually installed.
+  // A missing mvn/gradle must never be reported as a test failure, so
+  // the command is only offered when the tool exists. Gradle Wrapper
+  // downloads its own Gradle, but still needs a Java runtime.
+  if (hasCommand('java')) {
+    if (fs.existsSync(path.join(root, 'pom.xml')) && hasCommand('mvn')) return 'mvn -q test';
+    if (fs.existsSync(path.join(root, 'gradlew'))) return './gradlew test';
+    if (fs.existsSync(path.join(root, 'build.gradle')) || fs.existsSync(path.join(root, 'build.gradle.kts'))) {
+      if (hasCommand('gradle')) return 'gradle test';
+    }
+  }
   return null;
+}
+
+// True when `cmd` resolves on PATH (via the shell builtin `command -v`).
+function hasCommand(cmd) {
+  try {
+    const { spawnSync } = require('child_process');
+    return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore', timeout: 5000 }).status === 0;
+  } catch (_) {
+    return false;
+  }
 }
 
 module.exports = { isGitRepo, gitInfo, defaultTestCommand };

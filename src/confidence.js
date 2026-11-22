@@ -21,6 +21,7 @@ const path = require('path');
 const { mentionRegExp } = require('./graph');
 const { coverageForSymbol, coverageForSymbolBody } = require('./coverage');
 const { isManualScriptPath } = require('./discover');
+const { FRAMEWORK_CLASS_ANNOTATIONS } = require('./parse-java');
 
 function loadFrameworks(dir) {
   const packs = [];
@@ -63,7 +64,10 @@ function frameworkKeepSymbol(rel, name, decorators, packs) {
   return reasons;
 }
 
-const TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
+// `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
+// runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
+// test entry point like `.spec.` / `.test.`, never a dead file.
+const TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
 // A file literally named test.ts / test.tsx (date-fns) holds type-test
 // functions whose bodies ARE the assertions — the declarations are the
 // test, so the file is test code: KEEP at most, never SAFE.
@@ -90,6 +94,152 @@ function gradeFindings(ctx) {
     if (prev && prev.grade === f.grade) return prev;
     findingsById.set(f.id, f);
     return f;
+  };
+
+  // ---- FP-6 cross-file class-attribute indexes (built once) ----
+  // Frameworks consume class attributes via attribute lookup, not via
+  // a code reference to the defining file — so the import graph alone
+  // cannot see the use. Two narrow, binding-aware signals recover it:
+  //  (R1) the override family: the attribute overrides one defined on
+  //  an ancestor class, or a subclass overrides it. The override
+  //  proves the attribute is part of the inherited interface.
+  //  (R2) the attribute name is read as `obj.<name>` / `self.<name>`
+  //  in another file. Only attribute syntax counts, and only to
+  //  REVIEW: the same name can exist on an unrelated object.
+  // Both signals are computed from the parsers' class inventories
+  // (parse-py `classes`, per-definition `className`) and import edges
+  // — no bare-name matching across files, no "all class attributes
+  // are KEEP" widening. Files without a class inventory (JS/TS) simply
+  // yield no matches: fail-open, never a new SAFE.
+  const attrReaders = new Map(); // attr name -> Set<abs file> reading it as obj.name
+  const classesByFile = new Map(); // abs file -> Map<className, {name, bases, file}>
+  const classAttrs = new Map(); // "file\0class" -> Set<attr name defined in that class>
+  for (const [gfile, ginfo] of graph.files) {
+    if (!ginfo.parsed) continue;
+    for (const n of ginfo.parsed.attributeRefs || []) {
+      if (!attrReaders.has(n)) attrReaders.set(n, new Set());
+      attrReaders.get(n).add(gfile);
+    }
+    const byName = new Map();
+    for (const c of ginfo.parsed.classes || []) byName.set(c.name, { name: c.name, bases: c.bases || [], file: gfile });
+    if (byName.size > 0) classesByFile.set(gfile, byName);
+    for (const d of ginfo.parsed.definitions || []) {
+      if (!d.className || d.kind !== 'variable') continue;
+      const key = `${gfile}\0${d.className}`;
+      if (!classAttrs.has(key)) classAttrs.set(key, new Set());
+      classAttrs.get(key).add(d.name);
+    }
+  }
+  // Resolve a base-class name to the class that defines it: the same
+  // file first, then an import edge of the importing file — following
+  // re-exports through package __init__ files, e.g. `from
+  // django.db.models import Func` reaches expressions.py. Dotted bases
+  // (`mod.Base`) are recorded by their leading name and do not resolve:
+  // a known gap, fail-open. Only successful resolutions are cached; a
+  // miss is recomputed, so a resolution that failed only because of a
+  // cycle guard is never frozen in.
+  const classDefCache = new Map();
+  const resolveClass = (fromFile, name, seen) => {
+    const key = `${fromFile}\0${name}`;
+    if (classDefCache.has(key)) return classDefCache.get(key);
+    let found = null;
+    const local = classesByFile.get(fromFile);
+    if (local && local.has(name)) found = { file: fromFile, name };
+    if (!found) {
+      const nextSeen = new Set(seen || []);
+      nextSeen.add(key);
+      const edges = graph.importsByFile ? graph.importsByFile.get(fromFile) : null;
+      for (const e of edges || []) {
+        const hit = (e.names || []).find((n) => n.local === name);
+        if (!hit || hit.kind === 'namespace') continue;
+        const targetClasses = classesByFile.get(e.target);
+        if (targetClasses && targetClasses.has(hit.imported)) { found = { file: e.target, name: hit.imported }; break; }
+        if (!nextSeen.has(`${e.target}\0${hit.imported}`)) {
+          const via = resolveClass(e.target, hit.imported, nextSeen);
+          if (via) { found = via; break; }
+        }
+      }
+    }
+    if (found) classDefCache.set(key, found);
+    return found;
+  };
+  // Transitive ancestors of a class, as "file\0name" -> {file, name}.
+  const ancestorsCache = new Map();
+  const ancestorsOf = (file, name) => {
+    const key = `${file}\0${name}`;
+    if (ancestorsCache.has(key)) return ancestorsCache.get(key);
+    const out = new Map();
+    const cls = classesByFile.get(file) ? classesByFile.get(file).get(name) : null;
+    const queue = (cls ? cls.bases : []).map((b) => ({ fromFile: file, base: b }));
+    const seen = new Set([key]);
+    while (queue.length > 0) {
+      const { fromFile, base } = queue.pop();
+      const parent = resolveClass(fromFile, base);
+      if (!parent) continue;
+      const pkey = `${parent.file}\0${parent.name}`;
+      if (seen.has(pkey)) continue;
+      seen.add(pkey);
+      out.set(pkey, parent);
+      const pcls = classesByFile.get(parent.file) ? classesByFile.get(parent.file).get(parent.name) : null;
+      for (const b of pcls ? pcls.bases : []) queue.push({ fromFile: parent.file, base: b });
+    }
+    ancestorsCache.set(key, out);
+    return out;
+  };
+  // Transitive descendants, via the inverted parent links.
+  const childrenOf = new Map(); // "file\0class" -> Set<"file\0class">
+  for (const [cfile, byName] of classesByFile) {
+    for (const cls of byName.values()) {
+      for (const b of cls.bases) {
+        const parent = resolveClass(cfile, b);
+        if (!parent) continue;
+        const pkey = `${parent.file}\0${parent.name}`;
+        if (!childrenOf.has(pkey)) childrenOf.set(pkey, new Set());
+        childrenOf.get(pkey).add(`${cfile}\0${cls.name}`);
+      }
+    }
+  }
+  const descendantsCache = new Map();
+  const descendantsOf = (file, name) => {
+    const key = `${file}\0${name}`;
+    if (descendantsCache.has(key)) return descendantsCache.get(key);
+    const out = new Set();
+    const queue = [...(childrenOf.get(key) || [])];
+    const seen = new Set([key]);
+    while (queue.length > 0) {
+      const cur = queue.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      out.add(cur);
+      for (const next of childrenOf.get(cur) || []) if (!seen.has(next)) queue.push(next);
+    }
+    descendantsCache.set(key, out);
+    return out;
+  };
+  const attrsOfClass = (file, name) => classAttrs.get(`${file}\0${name}`) || new Set();
+  const overrideCache = new Map(); // "file\0class\0attr" -> {fromAncestor, bySubclass} | null
+  const classAttrOverride = (file, className, attr) => {
+    const key = `${file}\0${className}\0${attr}`;
+    if (overrideCache.has(key)) return overrideCache.get(key);
+    let result = null;
+    const fromAncestor = [...ancestorsOf(file, className).values()].find((a) => attrsOfClass(a.file, a.name).has(attr)) || null;
+    let bySubclass = null;
+    for (const dkey of descendantsOf(file, className)) {
+      const sep = dkey.indexOf('\0');
+      const d = { file: dkey.slice(0, sep), name: dkey.slice(sep + 1) };
+      if (attrsOfClass(d.file, d.name).has(attr)) { bySubclass = d; break; }
+    }
+    if (fromAncestor || bySubclass) result = { fromAncestor, bySubclass };
+    overrideCache.set(key, result);
+    return result;
+  };
+  // Other files (relative paths) that read `attr` as an attribute,
+  // excluding files already graded SAFE-dead: dead code citing dead
+  // code does not keep an attribute alive.
+  const attrReadElsewhere = (file, attr) => {
+    const readers = attrReaders.get(attr);
+    if (!readers) return [];
+    return [...readers].filter((f) => f !== file && !deadFiles.has(f)).map((f) => path.relative(root, f)).sort();
   };
 
   // Cascade fixpoint (deadcode 2.7.0 shipped this shape): one run cannot
@@ -167,7 +317,12 @@ function gradeFindings(ctx) {
     // the only importer of B is dead file A, B is dead in the same run.
     const liveImporters = [...(importers.get(file) || new Set())].filter((f) => !deadFiles.has(f));
     const importerCount = liveImporters.length;
-    if (!reachable.has(file) && importerCount === 0) {
+    // Java files are never dead-file candidates in this landing: there
+    // is no Java import resolution yet, so no file can be proven
+    // unimported (whole dead classes are out of scope). Symbol
+    // findings inside Java files still apply.
+    const isJavaFile = info.parsed && info.parsed.language === 'java';
+    if (!isJavaFile && !reachable.has(file) && importerCount === 0) {
       if (keepFile) {
         // KEEP findings are recorded but hidden by default.
         add({
@@ -280,6 +435,11 @@ function gradeFindings(ctx) {
     // as a use of it (a false negative, never a false SAFE).
     const scopes = Array.isArray(parsed.topLevelUses);
     let sameFileLive = null;
+    // Java arity channel: the set of definition names whose bodies can
+    // keep a private method alive, and the (name, arity) liveness test
+    // for a private method / constructor. See the assignment below.
+    let javaLiveScopeNames = null;
+    let javaArityIsLive = null;
     if (scopes) {
       const defUses = new Map(); // name -> Set<used names>
       for (const d of parsed.definitions) {
@@ -345,11 +505,17 @@ function gradeFindings(ctx) {
       // a model field, declaration merging, an overload group, a dunder,
       // or exported public API. Methods are added by keepDef below,
       // once their enclosing class is known to be live.
+      // Java: a method with any annotation (@PostConstruct, @Scheduled,
+      // ...) runs by framework dispatch, an @Override method runs when
+      // the supertype method is invoked, and a method of an anonymous
+      // class (Runnable.run, ActionListener.actionPerformed) runs by
+      // interface dispatch, never by name — all three are conduits.
       const baseKeepDef = (d) => keepSymbols
         || frameworkKeepSymbol(rel, d.name, d.decorators, packs).length > 0
         || d.frameworkField || d.ambient || overloadedNames.has(d.name)
         || (parsed.dunder && parsed.dunder.has(d.name))
         || (d.kind === 'method' && d.name.startsWith('__'))
+        || (parsed.language === 'java' && d.kind === 'method' && ((d.annotations || []).length > 0 || d.anonymousClass === true))
         || (d.exported && (kind === 'library' || kind === 'unknown' || (reExportedFiles && reExportedFiles.has(file))));
       const baseKeepNames = new Set();
       for (const d of parsed.definitions) if (baseKeepDef(d)) baseKeepNames.add(d.name);
@@ -371,12 +537,64 @@ function gradeFindings(ctx) {
         if (live.has(d.name) || baseKeepNames.has(d.name) || viaBaseKept.has(d.name)) liveClassNames.add(d.name);
       }
       const keepDef = (d) => baseKeepDef(d)
-        || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d))));
+        || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d)))
+          // Java private methods are NOT conduits: a helper called only
+          // by a dead private method is dead too (same-file cascade for
+          // private methods). An annotated private method is already
+          // base-kept above, so only unannotated private methods lose
+          // conduit status here. Public / protected / package-private
+          // methods of a live class stay conduits, as before.
+          && !(parsed.language === 'java' && d.visibility === 'private' && !(d.annotations || []).length));
       const keepNames = new Set();
       for (const d of parsed.definitions) if (keepDef(d)) keepNames.add(d.name);
       const viaKept = bfs(keepNames);
       sameFileLive = new Set([...live, ...viaKept]);
       for (const name of keepNames) if (!live.has(name)) sameFileLive.delete(name);
+      // Java: a private method is live only when live code calls it
+      // with a matching (name, arity). The name-based sameFileLive
+      // cannot tell format/1 from format/2, so private methods get
+      // their own arity-aware test over the same live-scope names:
+      // calls from a definition whose name is reachable from a live
+      // root or a kept definition, plus top-level (class-level) calls.
+      // A method reference has no visible arity and counts for every
+      // overload of the name; a varargs method matches any call with
+      // arity >= its fixed arity; a call from the candidate itself
+      // (pure recursion, or a dead overload's self-call) never rescues
+      // it — the candidate's own (name, arity) key is excluded.
+      // Constructors match by (name, arity, class): `new Foo()` and
+      // `this()` carry the class, `super()` carries none and matches
+      // nothing in this file.
+      if (parsed.language === 'java') {
+        javaLiveScopeNames = new Set([...live, ...viaKept]);
+        javaArityIsLive = (def) => {
+          const key = def.isConstructor
+            ? `constructor/${def.arity}@${def.className || 'super'}`
+            : `${def.name}/${def.arity}`;
+          const calls = new Set(parsed.topLevelUsesArity || []);
+          for (const d of parsed.definitions) {
+            if (!javaLiveScopeNames.has(d.name)) continue;
+            if (d.kind === 'method') {
+              const dKey = d.isConstructor
+                ? `constructor/${d.arity}@${d.className || 'super'}`
+                : `${d.name}/${d.arity}`;
+              if (dKey === key) continue;
+            }
+            for (const u of d.usesArity || []) calls.add(u);
+          }
+          if (def.isConstructor) {
+            return calls.has(key) || calls.has(`constructor/*@${def.className || 'super'}`);
+          }
+          if (calls.has(`${def.name}/*`)) return true;
+          if (calls.has(`${def.name}/${def.arity}`)) return true;
+          if (def.varargs) {
+            for (const c of calls) {
+              const m = c.match(/^(.+)\/(\d+)$/);
+              if (m && m[1] === def.name && parseInt(m[2], 10) >= (def.fixedArity || 0)) return true;
+            }
+          }
+          return false;
+        };
+      }
     }
     for (const def of parsed.definitions) {
       if (importLocals.has(def.name)) continue;
@@ -413,13 +631,21 @@ function gradeFindings(ctx) {
       const sameFileUse = def.local
         ? (usage.sameFile || calledIn.includes(file))
         : (scopes ? sameFileLive.has(def.name) : (usage.sameFile || calledIn.includes(file)));
+      // Java private methods need arity-aware liveness, not the
+      // name-based same-file flag: format/2 is dead even when format/1
+      // is called from live code. The Java branch below decides with
+      // (name, arity), so the name-based flag must not skip it here.
+      // (Private fields keep the name-based flag: their reads are
+      // already read-only occurrences, so it is exact for them.)
+      const javaPrivateMethod = parsed.language === 'java' && def.kind === 'method' && def.visibility === 'private';
+      const sameFileUseEffective = javaPrivateMethod ? false : sameFileUse;
       // Same-file use is real use: a symbol called or referenced in its
       // own file is alive, full stop. It used to be flagged REVIEW as
       // "unexport-to-local", but that turned every module's own helpers
       // into noise (e.g. our own isGitRepo / resolveRelative /
       // buildMapData). An export that is only used in its own file is
       // still used — never a finding.
-      if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUse) {
+      if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUseEffective) {
         continue;
       }
       const isUsed = importedBy.length > 0 || calledElsewhere.length > 0;
@@ -502,11 +728,12 @@ function gradeFindings(ctx) {
       // test-file attribute keeps its existing KEEP reason, and these
       // rules only ever demote a finding that would otherwise be SAFE
       // (or a REVIEW string-mention) — never a KEEP.
-      // Chained-assignment alias of a method defined in the same class
-      // (`__setitem__ = ... = popitem = _fail`): the names are aliases
-      // of one live method, part of the class's interface — never SAFE.
+      // Alias of a method defined in the same class (`x = method`, or
+      // a chained assignment `__setitem__ = ... = popitem = _fail`):
+      // the names are one object with a live method, part of the
+      // class's interface — never SAFE.
       if (def.chainedAlias) {
-        add({ ...common, grade: 'KEEP', reason: `chained-assignment alias of ${def.chainedAliasOf || 'a method'} in the same class — the name is the same object as the method, part of the class interface` });
+        add({ ...common, grade: 'KEEP', reason: `alias of ${def.chainedAliasOf || 'a method'} in the same class — the name is the same object as the method, part of the class interface` });
         continue;
       }
       // A class that subclasses an externally-defined base and defines
@@ -516,6 +743,40 @@ function gradeFindings(ctx) {
       if (def.configClassAttr) {
         add({ ...common, grade: 'KEEP', reason: 'config class: subclass of an externally-defined base that defines only attributes — the framework reads the attributes at runtime' });
         continue;
+      }
+      // Class-attribute override family (FP-6). A class attribute that
+      // overrides one defined on an ancestor class, or that a subclass
+      // overrides, is part of the inherited class interface: the
+      // framework reads it via attribute lookup on instances
+      // (`connection.features.supports_x`, `self.arity`), not via a
+      // code reference to the defining file. REVIEW, never SAFE. This
+      // sits AFTER the config-class rule above on purpose: a config
+      // class attribute is KEEP (the framework reads the whole class),
+      // and these rules only ever demote a finding that would otherwise
+      // be SAFE — never a KEEP.
+      if (def.className && def.kind === 'variable') {
+        const ovr = classAttrOverride(file, def.className, def.name);
+        if (ovr && ovr.fromAncestor) {
+          add({ ...common, grade: 'REVIEW', reason: `class attribute overrides ${def.name} defined on ancestor class ${ovr.fromAncestor.name} (${path.relative(root, ovr.fromAncestor.file)}) — part of the inherited interface, read via attribute lookup` });
+          continue;
+        }
+        if (ovr && ovr.bySubclass) {
+          add({ ...common, grade: 'REVIEW', reason: `class attribute overridden by subclass ${ovr.bySubclass.name} (${path.relative(root, ovr.bySubclass.file)}) — part of the class interface, read via attribute lookup` });
+          continue;
+        }
+        // Cross-file attribute read (FP-6): another file reads this
+        // name as an attribute (`obj.<name>` / `self.<name>`). Only
+        // attribute syntax counts — a bare-name match elsewhere is not
+        // the same evidence — and the grade is REVIEW, never KEEP: the
+        // same attribute name can exist on an unrelated object (a
+        // coincidental match is possible), so a human still checks, but
+        // the attribute is never auto-deleted. Reads from files already
+        // graded SAFE-dead do not count (dead code citing dead code).
+        const readers = attrReadElsewhere(file, def.name);
+        if (readers.length > 0) {
+          add({ ...common, grade: 'REVIEW', reason: `read as .${def.name} in ${readers.length} other file${readers.length === 1 ? '' : 's'} (${readers.slice(0, 3).join(', ')}${readers.length > 3 ? ', ...' : ''}) — attribute lookup, not a code reference`, evidence: { ...common.evidence, attrReaders: readers } });
+          continue;
+        }
       }
       // A class attribute documented with a Sphinx `#:` comment is part
       // of the class's documented public API (an extension-facing flag):
@@ -535,6 +796,98 @@ function gradeFindings(ctx) {
       }
       if (parsed.dynamic) {
         add({ ...common, grade: 'REVIEW', reason: `0 callers, but file uses dynamic imports/reflection (${parsed.dynamicReasons[0] || 'dynamic'}) — cannot prove safe` });
+        continue;
+      }
+      // ---- Java: private-only SAFE scope ----
+      // Public / protected / package-private Java members can be
+      // reached from outside this file (another class, another
+      // package, a framework), and whole dead classes are out of
+      // scope: REVIEW at most, never SAFE. Private members are
+      // provable in-file, and only they can be SAFE.
+      //
+      // This branch sits BEFORE the generic string-mention check
+      // below on purpose: a local or parameter cannot be invoked by
+      // name from another file, so a string that happens to contain
+      // its name (single-letter names match everywhere) must not
+      // demote it — locals grade on binding-resolved reads alone.
+      // Non-local members still get the string check, inside the
+      // branch, after the more specific annotation / framework
+      // reasons.
+      if (parsed.language === 'java') {
+        // Locals and parameters grade on binding-resolved reads, not
+        // on the file-level reference set: a same-named field read
+        // elsewhere must not keep a local alive, and a local's own
+        // reads resolve to the binding, not the name.
+        if (def.local) {
+          if ((def.readCount || 0) > 0) continue; // read somewhere: live, no finding
+          if (def.isParameter) {
+            // An unused parameter is never SAFE: deleting it changes
+            // the method's arity, so every call site would break, and
+            // --fix only deletes the declaration. A human removes the
+            // parameter and updates its call sites together.
+            add({ ...common, grade: 'REVIEW', reason: def.privateMethod ? 'unused parameter of a private method — removing it requires updating its call sites' : 'unused parameter of a non-private method — changing a public/protected signature is an API break, and removing it requires updating its call sites' });
+            continue;
+          }
+          if ((def.writeCount || 0) > 0) {
+            add({ ...common, grade: 'REVIEW', reason: 'local variable assigned but never read — deleting the declaration would leave the assignments behind' });
+            continue;
+          }
+          add(withCascade({ ...common, grade: 'SAFE', reason: 'unused local variable — never read or written' }));
+          continue;
+        }
+        if (def.kind === 'class') {
+          add({ ...common, grade: 'REVIEW', reason: 'Java class — whole dead classes are out of scope for this tool' });
+          continue;
+        }
+        if (def.kind !== 'method' && def.kind !== 'variable') {
+          add({ ...common, grade: 'REVIEW', reason: 'Java member — REVIEW at most, never SAFE' });
+          continue;
+        }
+        if (def.visibility !== 'private') {
+          add({ ...common, grade: 'REVIEW', reason: `${def.visibility === 'package' ? 'package-private' : def.visibility} Java ${def.isConstructor ? 'constructor' : def.kind === 'method' ? 'method' : 'field'} — reachable from outside this file` });
+          continue;
+        }
+        // Private member from here on.
+        if ((def.annotations || []).length > 0) {
+          add({ ...common, grade: 'KEEP', reason: `annotated @${def.annotations[0]} — framework-invoked, never auto-deleted` });
+          continue;
+        }
+        if (def.native) {
+          add({ ...common, grade: 'KEEP', reason: 'native method — implemented outside Java, never called from Java source' });
+          continue;
+        }
+        if (def.name === 'serialVersionUID') {
+          add({ ...common, grade: 'KEEP', reason: 'serialVersionUID — read by Java serialization, never auto-deleted' });
+          continue;
+        }
+        const fwClassAnn = (def.classAnnotations || []).find((a) => FRAMEWORK_CLASS_ANNOTATIONS.has(a));
+        if (fwClassAnn) {
+          add({ ...common, grade: 'REVIEW', reason: `enclosing class is annotated @${fwClassAnn} — the framework may invoke this member` });
+          continue;
+        }
+        if (def.stringMention) {
+          add({ ...common, grade: 'REVIEW', reason: 'referenced by name in a string literal in this file — possible reflective use' });
+          continue;
+        }
+        if (stringElsewhere.length > 0) {
+          add({ ...common, grade: 'REVIEW', reason: '0 callers, but referenced by name as a string elsewhere' });
+          continue;
+        }
+        if (def.kind === 'variable') {
+          if ((def.writeCount || 0) > 0) {
+            add({ ...common, grade: 'REVIEW', reason: 'private field written but never read — deleting the declaration would leave the assignments behind' });
+            continue;
+          }
+          add(withCascade({ ...common, grade: 'SAFE', reason: 'private field, never read or written, 0 string mentions' }));
+          continue;
+        }
+        // Private method / constructor: arity-aware liveness.
+        if (!javaArityIsLive) {
+          add({ ...common, grade: 'REVIEW', reason: 'private method with 0 name-based callers, but arity data is unavailable (stale parse) — cannot prove safe' });
+          continue;
+        }
+        if (javaArityIsLive(def)) continue; // called from live code: no finding
+        add(withCascade({ ...common, grade: 'SAFE', reason: def.isConstructor ? 'private constructor, never called with this arity, 0 string mentions' : 'private method, no live callers by (name, arity), 0 string mentions' }));
         continue;
       }
       if (stringElsewhere.length > 0) {
@@ -596,11 +949,17 @@ function gradeFindings(ctx) {
         if (n.kind === 'namespace') continue; // import * as ns — usage is via ns.x
         if (!parsed.references.has(n.local) && !parsed.calls.some((c) => c.name === n.local)) {
           const isTestFile = isTest;
+          // Import-as-probe (FP-13): an unused import inside try/except
+          // exists to test whether the dependency is installed (Django's
+          // `try: import numpy` flag, `try: from PIL import Image`); the
+          // import IS the use. REVIEW, never SAFE — a leftover optional
+          // import in a try block looks identical, so a human checks.
+          const grade = isTestFile ? 'KEEP' : imp.inTryExcept ? 'REVIEW' : 'SAFE';
           add({
-            category: 'import', file: rel, symbol: n.local, grade: isTestFile ? 'KEEP' : 'SAFE',
+            category: 'import', file: rel, symbol: n.local, grade,
             startLine: imp.range.startLine, endLine: imp.range.endLine,
             size: imp.range.endIndex - imp.range.startIndex,
-            reason: isTestFile ? 'unused import in a test file (kept)' : `imported "${n.imported}" from "${imp.source}" but never referenced in this file`,
+            reason: isTestFile ? 'unused import in a test file (kept)' : imp.inTryExcept ? `imported "${n.imported}" from "${imp.source}" inside try/except but never referenced — the import itself may be the availability probe` : `imported "${n.imported}" from "${imp.source}" but never referenced in this file`,
             evidence: { importers: 0, callers: 0, stringRefs: [], exported: false, coveragePct: null, ...evidenceBase },
             deleteDiff: `remove "${n.local}" from import of "${imp.source}" in ${rel}`,
           });

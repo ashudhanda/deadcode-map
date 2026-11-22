@@ -234,11 +234,26 @@ function isExportEntryName(line, index, len) {
  * their ${...} expressions as code.
  * When `collect` is given, every string literal's raw text (with quotes)
  * is pushed into it, for the string-reference pass.
+ * When `spans` is given, `spans.templateLines` (a Set) is filled with
+ * the 1-based lines inside multi-line template literals (interior lines
+ * plus the closing line, not the opening line), for the unreachable
+ * detector — those lines hold generated code, not real statements.
  */
-function stripJs(code, collect) {
+function stripJs(code, collect, spans) {
   var out = '';
   var i = 0;
   var n = code.length;
+  var curLine = 1; // 1-based line of the character about to be consumed
+  // Blank out an escape sequence (`\x`, two chars). An escaped newline
+  // (a line continuation inside a string or template literal) must keep
+  // its newline in the output: without it the stripped code loses a
+  // line, every later line number drifts from the raw source, and
+  // findings point at the wrong lines.
+  function blankEscape() {
+    if (code[i + 1] === '\n') { out += ' \n'; curLine++; }
+    else out += '  ';
+    i += 2;
+  }
   while (i < n) {
     var c = code[i];
     var next = code[i + 1] || '';
@@ -247,6 +262,7 @@ function stripJs(code, collect) {
     } else if (c === '/' && next === '*') {
       out += '  '; i += 2;
       while (i < n && !(code[i] === '*' && code[i + 1] === '/')) {
+        if (code[i] === '\n') curLine++;
         out += code[i] === '\n' ? '\n' : ' ';
         i++;
       }
@@ -268,10 +284,11 @@ function stripJs(code, collect) {
         out += ' '; i++;
         var inClass = false;
         while (i < n) {
-          if (code[i] === '\\') { out += '  '; i += 2; continue; }
+          if (code[i] === '\\') { blankEscape(); continue; }
           if (code[i] === '[') inClass = true;
           else if (code[i] === ']') inClass = false;
           else if (code[i] === '/' && !inClass) break;
+          if (code[i] === '\n') curLine++;
           out += code[i] === '\n' ? '\n' : ' ';
           i++;
         }
@@ -309,7 +326,8 @@ function stripJs(code, collect) {
       var start = i;
       out += ' '; i++;
       while (i < n && code[i] !== q) {
-        if (code[i] === '\\') { out += '  '; i += 2; continue; }
+        if (code[i] === '\\') { blankEscape(); continue; }
+        if (code[i] === '\n') curLine++;
         out += code[i] === '\n' ? '\n' : ' ';
         i++;
       }
@@ -317,9 +335,10 @@ function stripJs(code, collect) {
       if (collect) collect.push(code.slice(start, i));
     } else if (c === '`') {
       var startT = i;
+      var startLineT = curLine;
       out += ' '; i++;
       while (i < n && code[i] !== '`') {
-        if (code[i] === '\\') { out += '  '; i += 2; continue; }
+        if (code[i] === '\\') { blankEscape(); continue; }
         if (code[i] === '$' && code[i + 1] === '{') {
           // Keep the ${...} expression as code.
           out += '${'; i += 2;
@@ -327,17 +346,26 @@ function stripJs(code, collect) {
           while (i < n && depth > 0) {
             if (code[i] === '{') depth++;
             else if (code[i] === '}') depth--;
-            if (depth > 0) { out += code[i]; i++; }
+            if (depth > 0) { if (code[i] === '\n') curLine++; out += code[i]; i++; }
           }
           if (i < n) { out += '}'; i++; }
           continue;
         }
+        if (code[i] === '\n') curLine++;
         out += code[i] === '\n' ? '\n' : ' ';
         i++;
       }
       if (i < n) { out += ' '; i++; }
       if (collect) collect.push(code.slice(startT, i));
+      // A multi-line template literal's interior lines (and its closing
+      // line) hold generated code, not real statements: the unreachable
+      // detector must ignore them (WP-2). The opening line is NOT
+      // recorded — it holds the real statement (`return `...``).
+      if (spans && spans.templateLines && curLine > startLineT) {
+        for (var tl = startLineT + 1; tl <= curLine; tl++) spans.templateLines.add(tl);
+      }
     } else {
+      if (c === '\n') curLine++;
       out += c; i++;
     }
   }
@@ -435,7 +463,8 @@ function stripPy(code, collect) {
 
 function parseJs(rel, raw) {
   var strings = [];
-  var code = stripJs(raw, strings);
+  var templateLines = new Set();
+  var code = stripJs(raw, strings, { templateLines: templateLines });
   var lines = code.split('\n');
   // A file contains JSX when the stripped code (strings and comments
   // blanked, positions preserved) has a JSX element: `<Tag ...>`,
@@ -1010,6 +1039,15 @@ function parseJs(rel, raw) {
   parsed.imports.forEach(function (imp) {
     (imp.names || []).forEach(function (n) { importLocalNames.add(n.local); });
   });
+  // Names that collide with JS keywords but are real bindings in this
+  // file: an imported `of` / `from` (RxJS) or a local definition named
+  // `get`, `set`, `from`. `return of(...)` calls the RxJS `of` import,
+  // it is not the for-of keyword, and `` `${from}` `` uses the local
+  // `from` — so the keyword skip in the references pass below must not
+  // drop them (WP-1). A name that is neither imported nor defined here
+  // is still skipped: a bare `of` in a for-of header is not a use.
+  var keywordUseNames = new Set(importLocals);
+  parsed.definitions.forEach(function (d) { keywordUseNames.add(d.name); });
   // Brace depth carried across the lines of one `module.exports = {
   // ... }` region, so the references scan below can tell a top-level
   // entry name (an export) from a nested or trailing use.
@@ -1021,7 +1059,11 @@ function parseJs(rel, raw) {
     var inExportObj = exportObjLines.has(lineNo2);
     if (inExportObj && !exportObjPrev) exportObjDepth = 0; // fresh region
     exportObjPrev = inExportObj;
-    if (/^\s*import\b/.test(l)) continue;
+    // A static import statement is not a use — but a dynamic import()
+    // line IS: `import(`...v${PYODIDE_VERSION}/...`)` uses the name in
+    // its template interpolation, so only skip the line when `import`
+    // is not followed by `(`.
+    if (/^\s*import\b(?!\s*\()/.test(l)) continue;
     // A line belonging to a multi-line import or re-export statement
     // holds binding names, not uses (see importStmtLines above) — the
     // whole line is skipped, exactly like a single-line import line.
@@ -1057,7 +1099,7 @@ function parseJs(rel, raw) {
       var regionIdM;
       while ((regionIdM = regionIdRe.exec(l)) !== null) {
         var regionId = regionIdM[0];
-        if (JS_KEYWORDS.has(regionId)) continue;
+        if (JS_KEYWORDS.has(regionId) && !keywordUseNames.has(regionId)) continue;
         if (regionDeclared.has(regionId)) continue;
         if (regionSkipIds && regionSkipIds.has(regionId)) continue;
         var regionDepth = regionDepthStart;
@@ -1073,7 +1115,7 @@ function parseJs(rel, raw) {
       var regionCallRe = /([A-Za-z_$][\w$]*)\s*\(/g;
       var regionCm;
       while ((regionCm = regionCallRe.exec(l)) !== null) {
-        if (JS_KEYWORDS.has(regionCm[1])) continue;
+        if (JS_KEYWORDS.has(regionCm[1]) && !keywordUseNames.has(regionCm[1])) continue;
         if (regionDeclared.has(regionCm[1])) continue;
         if (regionSkipIds && regionSkipIds.has(regionCm[1])) continue;
         parsed.calls.add(regionCm[1]);
@@ -1148,7 +1190,7 @@ function parseJs(rel, raw) {
       }
     }
     identifiers(l).forEach(function (id) {
-      if (JS_KEYWORDS.has(id)) return;
+      if (JS_KEYWORDS.has(id) && !keywordUseNames.has(id)) return;
       if (declared.has(id)) return; // declaration site, not a use
       if (boundHere && boundHere.has(id)) return; // import binding, not a use
       if (skipExportsIds && skipExportsIds.has(id)) return; // the `module.exports` tokens themselves
@@ -1158,7 +1200,7 @@ function parseJs(rel, raw) {
     var callRe = /([A-Za-z_$][\w$]*)\s*\(/g;
     var cm2;
     while ((cm2 = callRe.exec(l)) !== null) {
-      if (JS_KEYWORDS.has(cm2[1])) continue;
+      if (JS_KEYWORDS.has(cm2[1]) && !keywordUseNames.has(cm2[1])) continue;
       if (declared.has(cm2[1])) continue; // `function foo(` is not a call
       if (boundHere && boundHere.has(cm2[1])) continue;
       if (decChain.has(cm2[1])) continue;
@@ -1183,15 +1225,49 @@ function parseJs(rel, raw) {
   var depth = 0;
   var terminatedAt = null; // brace depth where the block was terminated
   var terminatedLineU = -1; // line of the return/throw/break/continue
+  var hoistedSkipDepth = null; // brace depth at a hoisted function declaration after a terminator (FP-12)
   var rawLinesU = raw.split('\n');
   for (var ui = 0; ui < lines.length; ui++) {
     var ul = lines[ui];
     var dBefore = depth;
     depth += (ul.match(/\{/g) || []).length - (ul.match(/\}/g) || []).length;
+    // Lines inside a multi-line template literal hold generated code,
+    // not real statements: a `${...}` expression line after a
+    // `return `...`` is part of the return statement, never a new
+    // unreachable statement (WP-2). The depth update above still runs
+    // — a ${...} expression's braces are real — but the line itself
+    // neither terminates a block nor counts as unreachable.
+    if (templateLines.has(ui + 1)) continue;
     if (terminatedAt !== null && depth < terminatedAt) { terminatedAt = null; terminatedLineU = -1; }
     var trimmed = ul.trim();
+    // FP-12: a function declaration after return/throw is hoisted, so
+    // the declaration and its whole body are reachable — never flag
+    // them. (A class / const / let after a terminator still never runs,
+    // so those are still flagged.) Skip lines until the function's
+    // closing brace brings the depth back to the declaration depth.
+    if (hoistedSkipDepth !== null) {
+      // The closing brace of the hoisted function is not a statement
+      // and does not end the terminated outer block: clear the skip
+      // and keep terminatedAt set, so later statements are still
+      // flagged. (Falling through to the `}` handler below would clear
+      // terminatedAt and hide genuinely unreachable code after the
+      // hoisted function.)
+      if (trimmed.startsWith('}') && depth <= hoistedSkipDepth) hoistedSkipDepth = null;
+      continue;
+    }
+    if (terminatedAt !== null && dBefore >= terminatedAt
+      && /^\s*(export\s+(default\s+)?)?(async\s+)?function\s*\*?\s*[A-Za-z_$][\w$]*\s*\(/.test(ul)) {
+      var fnOpens = (ul.match(/\{/g) || []).length;
+      var fnCloses = (ul.match(/\}/g) || []).length;
+      // A multi-line function opens more braces than it closes; a
+      // brace-on-the-next-line declaration opens none yet. A single-line
+      // `function f() {}` opens and closes on the same line, so no skip
+      // state is needed for it.
+      if (fnOpens > fnCloses || fnOpens === 0) hoistedSkipDepth = dBefore;
+      continue; // the declaration line itself is reachable too
+    }
     if (/^\s*if\s*\(\s*false\s*\)/.test(ul)) {
-      parsed.unreachable.push({ line: ui + 1, reason: 'if (false) branch is never taken', snippet: trimmed.slice(0, 120) });
+      parsed.unreachable.push({ line: ui + 1, blockLine: ui + 1, reason: 'if (false) branch is never taken', snippet: trimmed.slice(0, 120) });
       continue;
     }
     // A line that closes a block opens a new one: `} catch`, `} else`,
@@ -1218,7 +1294,10 @@ function parseJs(rel, raw) {
           || /pragma:\s*no cover/.test(a) || /pragma:\s*no cover/.test(b);
       };
       if (!isContinuation && !checkIgnoredU(ui) && !checkIgnoredU(terminatedLineU)) {
-        parsed.unreachable.push({ line: ui + 1, reason: 'code after return/throw/break/continue', snippet: trimmed.slice(0, 120) });
+        // blockLine is the terminating statement's line: every line of
+        // one unreachable block shares it, so the findings pass emits
+        // one finding per block instead of one per line.
+        parsed.unreachable.push({ line: ui + 1, blockLine: terminatedLineU + 1, reason: 'code after return/throw/break/continue', snippet: trimmed.slice(0, 120) });
       }
       continue;
     }
@@ -1246,7 +1325,13 @@ function parseJs(rel, raw) {
       var opens = (ul.match(/[\{\(\[]/g) || []).length;
       var closes = (ul.match(/[\}\)\]]/g) || []).length;
       var rawLineU = rawLinesU[ui] || '';
-      var bt = (rawLineU.match(/`/g) || []).length;
+      // Count only unescaped backticks: `\`` inside a template literal
+      // does not open or close it, so it must not flip the parity
+      // check below.
+      var bt = 0;
+      for (var bti = 0; bti < rawLineU.length; bti++) {
+        if (rawLineU[bti] === '`' && rawLineU[bti - 1] !== '\\') bt++;
+      }
       var headerLines = [];
       var parenDepthU = 0;
       for (var pi = ui - 1; pi >= 0 && headerLines.length < 10; pi--) {
@@ -1261,7 +1346,11 @@ function parseJs(rel, raw) {
       }
       var headerU = headerLines.join('\n');
       var braceless = /^\s*\}?\s*else\s*$/.test(headerU) || /^\s*(if|else\s+if|for|while)\b[^;{]*\)\s*$/.test(headerU);
-      var endsWithOperator = /[({[,&|?:+\-*/%=<>!]$/.test(trimmed);
+      // A return ending in `as` continues on the next line (`return x as
+      // \n Type;`) — `as` is a binary operator that needs its right-hand
+      // type, so the statement is not complete (standard-schema-
+      // validation.pipe.ts:199).
+      var endsWithOperator = /[({[,&|?:+\-*/%=<>!]$/.test(trimmed) || /\bas$/.test(trimmed);
       var nextTrimmed = '';
       for (var ni = ui + 1; ni < lines.length; ni++) {
         if (lines[ni].trim() !== '') { nextTrimmed = lines[ni].trim(); break; }
@@ -1691,7 +1780,10 @@ function parsePy(rel, raw) {
         return /pragma:\s*no cover/.test(a) || /pragma:\s*no cover/.test(b);
       };
       if (checkPragmaPy(ui2) || checkPragmaPy(terminatedLinePy)) continue;
-      parsed.unreachable.push({ line: ui2 + 1, reason: 'code after return/raise/break/continue', snippet: t2.slice(0, 120) });
+      // blockLine is the terminating statement's line: every line of one
+      // unreachable block shares it, so the findings pass emits one
+      // finding per block instead of one per line.
+      parsed.unreachable.push({ line: ui2 + 1, blockLine: terminatedLinePy + 1, reason: 'code after return/raise/break/continue', snippet: t2.slice(0, 120) });
       continue;
     }
     if (/^\s*(return|raise|break|continue)\b/.test(ul2)) {
@@ -2277,6 +2369,12 @@ function analyzeFiles(inputFiles, options) {
   // Grading, mirroring the CLI confidence engine.
   var findings = [];
   var seenFindings = new Set();
+  // One finding per key: the same name can be defined many times in one
+  // file (Django's 114 `Meta` classes, 52 `http_options` variables),
+  // and each definition used to emit its own finding. Unreachable
+  // findings dedupe per block instead (see blockLine): a hoisted-
+  // function block after a return fires once per line without this.
+  var seenKeys = new Set();
   function add(f) {
     f.id = f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0);
     // The same finding must never repeat: a symbol can be reached by
@@ -2284,6 +2382,11 @@ function analyzeFiles(inputFiles, options) {
     // duplicated finding used to repeat up to 444x on real repos.
     if (seenFindings.has(f.id)) return null;
     seenFindings.add(f.id);
+    var key = f.category === 'unreachable'
+      ? 'unreachable:' + f.file + ':' + (f.blockLine || f.startLine || 0)
+      : f.category + ':' + f.file + ':' + (f.symbol || '');
+    if (seenKeys.has(key)) return null;
+    seenKeys.add(key);
     findings.push(f);
     return f;
   }
@@ -2494,7 +2597,7 @@ function analyzeFiles(inputFiles, options) {
     (parsed.unreachable || []).forEach(function (u) {
       add({
         category: 'unreachable', file: rel, symbol: null, grade: isTest ? 'KEEP' : 'SAFE',
-        startLine: u.line, endLine: u.line, size: u.snippet ? u.snippet.length : 0,
+        startLine: u.line, endLine: u.line, blockLine: u.blockLine, size: u.snippet ? u.snippet.length : 0,
         reason: isTest ? 'unreachable code in a test file (kept)' : u.reason,
         evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
         deleteDiff: u.snippet || '',

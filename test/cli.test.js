@@ -256,3 +256,33 @@ test('CLI: --update-baseline does not change the next scan (baseline file is not
   assert.equal(hidden.findings.length, 0, 'baseline findings must be hidden with --baseline');
   assert.equal(hidden.meta.baselineHidden, baseFindings.length);
 });
+
+test('CLI: hoisted function declarations after return are not unreachable', () => {
+  const dir = copyFixture('js-hoisted');
+  const jsonPath = path.join(dir, 'report.json');
+  const r = run(dir, ['--json', jsonPath]);
+  assert.equal(r.status, 0, r.stderr);
+  const findings = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).findings;
+  assert.equal(findings.filter((f) => f.category === 'unreachable' && f.file.endsWith('src/hoisted.js')).length, 0,
+    'hoisted helpers after return must not be reported unreachable');
+  assert.ok(findings.some((f) => f.category === 'unreachable' && f.file.endsWith('src/still-dead.js') && f.grade === 'SAFE'),
+    'a plain statement after return must still be reported unreachable');
+});
+
+test('CLI: *.e2e-spec.ts files are test files, kept like other test files', () => {
+  const dir = copyFixture('ts-e2e-spec');
+  const jsonPath = path.join(dir, 'report.json');
+  const r = run(dir, ['--json', jsonPath]);
+  assert.equal(r.status, 0, r.stderr);
+  const findings = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).findings;
+  for (const file of ['e2e/cats/cats.e2e-spec.ts', 'e2e/cats/cats.e2e-spec.js']) {
+    // A test file is an entry point, so it is reachable and never gets
+    // a file finding at all — the same as `*.spec.ts` / `*.test.ts`.
+    assert.equal(findings.find((f) => f.category === 'file' && f.file.endsWith(file)), undefined,
+      `${file} must never be reported as a dead file`);
+    assert.ok(findings.some((f) => f.category === 'import' && f.file.endsWith(file) && f.grade === 'KEEP'),
+      `unused import in ${file} must be kept as a test-file import`);
+  }
+  assert.ok(findings.some((f) => f.category === 'file' && f.file.endsWith('src/orphan.ts') && f.grade === 'SAFE'),
+    'a plain unimported file must still be SAFE');
+});

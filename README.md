@@ -8,7 +8,7 @@ Most dead-code tools print a list and walk away. deadcode-map does three things 
 2. **The map is the product.** `deadcode-map --map` writes a single self-contained HTML file (no CDN, no server — open it by double-clicking). Dead nodes are red, review is amber, live is green. Click a node for why it was flagged, who doesn't call it, its git age, coverage, and the exact delete diff.
 3. **Prove, don't just list.** `deadcode-map --prove` deletes SAFE candidates in an isolated git worktree, runs your test suite once per file-cluster, and reports `proven` / `breaks` / `skipped`. It bisects only if a cluster fails.
 
-JS / TypeScript and Python in v1, one command, one mental model. Java (private-only) is next.
+JS / TypeScript and Python in v1, one command, one mental model. Java (private-only) is supported too — see "Java scope" below.
 
 ## The map
 
@@ -369,12 +369,13 @@ across 3 repeat runs on flask/requests/click.
 
 The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by the web test suite (70 tests). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). Batch 4 fixed web multi-line `import`/`require`/re-export handling (continuation lines no longer leak into the references pass) and decided the JSX-pragma rule (see "False-positive defences" above); measured on the same clones, web SAFE is 2 vs CLI SAFE 4, at full parity on preact (1 = 1) and next-blog (0 = 0) — the only remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
 
-Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (128 findings, 0 in `src/`), which is the point of the fixtures.
+Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (250 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 
 Known limitations, stated honestly:
 
+- **Java scope (private-only)**: SAFE applies only to private methods (including `private static`), private fields, private constructors, unused imports (never on-demand `import foo.*`), and unused locals of private methods. Unused parameters are REVIEW, never SAFE: deleting one changes the method's arity, so every call site would break, and `--fix` only deletes the declaration. Everything else in Java — public, protected, and package-private members, whole classes — is REVIEW at most, never SAFE, and Java files are never dead-file candidates (there is no Java import resolution yet, so a file cannot be proven unimported). Overloads are told apart by (name, arity) only: same-name, same-arity overloads (`process(int)` vs `process(String)`) are one unit — a call to one keeps both alive. A varargs method matches any call with arity >= its fixed arity. Any annotation on a private member keeps it (`@PostConstruct`, `@JsonProperty`, `@Autowired`, ...), as does a framework stereotype on its enclosing class (Spring, JPA, Lombok), `native`, and `serialVersionUID`. A name mentioned in any string — Java source, Spring/MyBatis XML, `application.properties`, YAML — downgrades to REVIEW; names built by string concatenation (`"by" + "NameOnly"`) are undetectable and remain a documented caveat. Test sources (`src/test/java`, `*Test.java`) are KEEP at most, never SAFE. `--prove` runs `mvn -q test` / `./gradlew test` (15-minute timeout) when Maven/Gradle is installed. The web checker does not support Java (CLI only). Fixtures are validated with tree-sitter (0 ERROR nodes), not `javac`.
 - **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 2 vs CLI SAFE 4, web-only SAFE 0 — every web SAFE is also a CLI SAFE. The remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
 - **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
 
@@ -388,7 +389,7 @@ discover  →  parse (tree-sitter)  →  import/call graph  →  confidence + ev
 ```
 
 - `src/discover.js` — file walk + entry-point detection.
-- `src/parse-js.js`, `src/parse-py.js` — tree-sitter parsers (imports, exports, definitions, calls, dynamic imports, unreachable code, decorators).
+- `src/parse-js.js`, `src/parse-py.js`, `src/parse-java.js` — tree-sitter parsers (imports, exports, definitions, calls, dynamic imports, unreachable code, decorators).
 - `src/graph.js` — import resolution (relative, ESM, CommonJS `require`, dynamic `import()`, Python sibling modules), reachability from entry points, per-symbol usage.
 - `src/confidence.js` — SAFE / REVIEW / KEEP grading with evidence.
 - `src/git.js`, `src/coverage.js` — git age/churn and Cobertura coverage evidence.
@@ -400,7 +401,7 @@ discover  →  parse (tree-sitter)  →  import/call graph  →  confidence + ev
 ## Roadmap
 
 - v0.1.0 (shipped): MCP server + Claude Code plugin + AI-tool configs (see "Use with AI tools").
-- v1.1: Java, private methods/fields/classes only (public Java is REVIEW-only — it cannot be proven statically).
+- v1.1: Java (private-only SAFE — private methods/fields/constructors, unused imports, unused locals on private methods; parameters are REVIEW — removing one needs call-site updates; public Java is REVIEW-only — it cannot be proven statically).
 - Framework packs: Django, Angular, Spring, pytest (more), Vue, Svelte.
 - `--diff` / `--since` for PRs: "what did *this PR* leave dead?"
 - Inline ignore comments (`// deadcode-map-ignore-next`).

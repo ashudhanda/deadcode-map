@@ -36,16 +36,20 @@ function analyzeWithCache(root, discovery, cacheCtx) {
   delete require.cache[graphPath];
   const jsMod = require('./parse-js');
   const pyMod = require('./parse-py');
+  const javaMod = require('./parse-java');
   const origJs = jsMod.parseJsTs;
   const origPy = pyMod.parsePy;
+  const origJava = javaMod.parseJava;
   jsMod.parseJsTs = (file, src, ext) => cacheCtx.parseJs(file, src, ext, origJs);
   pyMod.parsePy = (file, src) => cacheCtx.parsePy(file, src, origPy);
+  javaMod.parseJava = (file, src) => cacheCtx.parseJava(file, src, origJava);
   let freshGraph;
   try {
     freshGraph = require('./graph');
   } finally {
     jsMod.parseJsTs = origJs;
     pyMod.parsePy = origPy;
+    javaMod.parseJava = origJava;
   }
   try {
     return freshGraph.analyze(root, discovery);
@@ -64,6 +68,7 @@ function analyzeWithCache(root, discovery, cacheCtx) {
 /** Manifest files whose contents feed the config hash (see cache.js). */
 const CONFIG_MANIFEST_NAMES = new Set([
   'package.json', 'pyproject.toml', 'tsconfig.json', 'jsconfig.json', 'setup.py', 'setup.cfg',
+  'pom.xml', 'build.gradle', 'build.gradle.kts',
 ]);
 
 function manifestHashes(discovery) {
