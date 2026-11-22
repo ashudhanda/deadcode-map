@@ -132,13 +132,13 @@ test('MCP: scan_repo findings match the CLI scan on the same repo', async () => 
     assert.equal(result.isError, undefined, c.toolText(result));
     const payload = JSON.parse(c.toolText(result));
     assert.equal(payload.root, dir);
-    assert.equal(payload.summary.byGrade.SAFE, 4);
-    assert.equal(payload.summary.byGrade.REVIEW, 9);
+    assert.equal(payload.summary.byGrade.SAFE, 5);
+    assert.equal(payload.summary.byGrade.REVIEW, 8);
     assert.equal(payload.total, cliFindings.length);
     assert.deepEqual(payload.findings.map((f) => f.id).sort(), cliFindings);
     // minGrade SAFE narrows to SAFE only.
     const safeOnly = JSON.parse(c.toolText(await c.callTool('scan_repo', { path: dir, minGrade: 'SAFE' })));
-    assert.equal(safeOnly.total, 4);
+    assert.equal(safeOnly.total, 5);
     assert.ok(safeOnly.findings.every((f) => f.grade === 'SAFE'));
   });
 });
@@ -201,10 +201,11 @@ test('MCP: fix_safe with confirm:true deletes SAFE only, in a scratch git repo',
     const result = await c.callTool('fix_safe', { path: dir, confirm: true });
     assert.equal(result.isError, undefined, c.toolText(result));
     const payload = JSON.parse(c.toolText(result));
-    assert.equal(payload.removed, 4);
+    assert.equal(payload.removed, 5);
     assert.ok(payload.deletedFiles.includes('src/dead-file.js'));
     assert.ok(!fs.existsSync(path.join(dir, 'src', 'dead-file.js')), 'dead file should be deleted');
     assert.ok(!fs.existsSync(path.join(dir, 'src', 'dynamic.js')), 'dynamic.js (SAFE file) should be deleted');
+    assert.ok(!fs.existsSync(path.join(dir, 'src', 'lazy-target.js')), 'lazy-target.js (cascade SAFE file) should be deleted');
     const used = fs.readFileSync(path.join(dir, 'src', 'used.js'), 'utf8');
     assert.ok(used.includes('usedFn'), 'live function must survive fix_safe');
     assert.ok(used.includes('privateDead'), 'REVIEW export must survive fix_safe');
@@ -221,7 +222,7 @@ test('MCP: get_map returns a summary and the map resource serves full HTML', asy
     const summary = JSON.parse(c.toolText(await c.callTool('get_map', { path: dir })));
     assert.ok(summary.nodes > 0);
     assert.ok(summary.edges >= 0);
-    assert.equal(summary.summary.byGrade.SAFE, 4);
+    assert.equal(summary.summary.byGrade.SAFE, 5);
     assert.match(summary.mapResource, /^deadcode:\/\/map\//);
     const res = await c.request('resources/read', { uri: summary.mapResource });
     assert.equal(res.contents.length, 1);
@@ -236,7 +237,7 @@ test('MCP: status returns counts, baseline presence, git flag and test command',
   const dir = copyFixture('js-basic');
   await withClient(MCP_BIN, [], async (c) => {
     const before = JSON.parse(c.toolText(await c.callTool('status', { path: dir })));
-    assert.equal(before.summary.byGrade.SAFE, 4);
+    assert.equal(before.summary.byGrade.SAFE, 5);
     assert.equal(before.baseline.present, false);
     assert.equal(before.gitRepo, false);
     assert.equal(before.filesScanned, 7);

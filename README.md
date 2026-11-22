@@ -239,7 +239,9 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 ## What is never flagged SAFE
 
 - **Entry points**: `package.json` main/bin/exports, `src/index` / `src/main`, `if __name__ == "__main__"` scripts, shebang CLI scripts, framework routes (`pages/`, `app/`), tests, stories, config, migrations.
-- **Framework magic**: route handlers (`@app.route`, Next.js `getServerSideProps`), decorators, dunder / protocol methods (`__init__`, `__str__`), module dunder variables (`__version__`, `__author__`, `__all__` — read by the import system / packaging tooling), `__init__.py` re-exports. Framework rules live in `frameworks/*.json` and are loaded by default.
+- **Framework magic**: route handlers (`@app.route`, Next.js `getServerSideProps`), decorators, dunder / protocol methods (`__init__`, `__str__`), module dunder variables (`__version__`, `__author__`, `__all__` — read by the import system / packaging tooling), `__init__.py` re-exports. Framework rules live in `frameworks/*.json` and are loaded by default. Pydantic / dataclass / TypedDict model fields, `@overload` groups, `@model_validator` / `@field_validator`, `declare module` augmentation, and decorated methods (`@contextmanager`, `@property`) are framework-invoked — KEEP, never SAFE.
+- **Re-exports are uses**: `import X as X`, `export { X }`, `# noqa: F401` imports, and compat-shim modules (`compat.py`, `_compat/`) are public API — their contents are REVIEW at most, never SAFE. A `tsconfig` / `jsconfig` `paths` alias (`@/*`) resolves like a relative import.
+- **Test code and intentional dead code**: files under `tests/` / `test/` / `__tests__/` and files literally named `test.ts` / `test.tsx` are KEEP at most, never SAFE — and so is unreachable code marked `# pragma: no cover` or `/* istanbul ignore next */`.
 - **Dynamic use**: anything in a file that uses dynamic `import()`, `require(variable)`, `importlib`, or `getattr` is REVIEW at most — never SAFE.
 - **Public API of a published library**: exported symbols are REVIEW, never SAFE, never auto-deleted.
 - **Methods**: a method with 0 in-repo callers is REVIEW at most — it could be called via an object or a framework.
@@ -258,7 +260,7 @@ repos only. For full accuracy, `--prove`, and `--fix`, use the CLI above.
 
 ## Measured results (checkable, not marketing)
 
-Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test`.
+Fixtures live in `fixtures/` with planted dead items and known live items. Run them with `npm test` (56 CLI tests) and `node --test test/web-analyzer.test.js test/web-prototype-names.test.js` (39 web tests). New fixtures in this batch: `ts-types`, `py-annotations`, `js-app`, `js-library`, `js-cascade`, `py-typer`, `js-methods`, `py-reexports`, `js-reexports`, `py-pydantic`, `ts-ambient`, `ts-testfile`, `py-decorated`, `js-alias` — every live symbol in them is never flagged SAFE, every planted dead item is found at SAFE or REVIEW.
 
 | Fixture | Files | SAFE found | SAFE false positives | SAFE FP rate |
 |---|---|---|---|---|
@@ -272,13 +274,67 @@ Fixtures live in `fixtures/` with planted dead items and known live items. Run t
 | `js-deps` (JS, dead dependencies: README prose vs real imports) | 5 | 0 | 0 | **0%** |
 | `js-framework` (Next.js `pages/`) | 1 | 0 | 0 | **0%** |
 
-The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above, including the dead Python import in `py-imports` — verified by `test/web-analyzer.test.js` (21 tests).
+### Real-repo benchmark (10 public repos + 3 diagnosis repos, CLI)
+
+Measured 2026-11-22 with the current tool (commit `aa038d6` for the
+re-export/framework fixes, plus the alias fix below — re-measure with
+`node ~/workspace/bench-repos/bench-run.js`). Before = the tool at the
+start of this batch (corpus scan B / diagnosis numbers); after = now.
+SAFE precision is hand-sampled per repo, not asserted from the count.
+
+| Repo | Files | SAFE before | SAFE after | Sampled SAFE precision after |
+|---|---|---|---|---|
+| express | 142 | 0 | 0 | — |
+| commander | 159 | 3 | 0 | — |
+| zustand | 49 | 5 | 0 | — |
+| preact | 239 | 33 | 20 | ~100% (unused demo imports; automatic JSX runtime) |
+| date-fns | 1776 | 100 | 1 | 100% (1 unused variable) |
+| next-blog | 22 | 11 | 11 | 100% (unused React imports) |
+| flask | 83 | 17 | 3 | 0/3 (class attributes — see limitations) |
+| fastapi | 1237 | 71 | 0 | — |
+| requests | 37 | 33 | 5 | 2/5 (2 unused type aliases true; 3 theme attrs false) |
+| click | 91 | 2 | 0 | — |
+| axios | 261 | 90 | 0 | — |
+| typer | 645 | 43 | 5 | 5/5 (genuinely dead helpers) |
+| umami | 1520 | 1044 | 32 | ~100% sampled (dead components, unused utils) |
+| **Total** | **3836 + 2426** | **1452** | **77** | **corpus ~85%, umami ~100% sampled** |
+
+What fixed the bulk of it, in order: re-exports counted as uses
+(`import X as X`, `export { X }`, `# noqa: F401`, compat shims);
+framework-invoked declarations kept live (Pydantic/dataclass/TypedDict
+model fields, `@overload` groups, `@model_validator`, `declare module`
+augmentation, decorated methods); type-position references (TS type
+annotations, Python string annotations, TypeAlias values, `__all__`);
+tsconfig `paths` aliases (`@/*` — umami's dominant family, 196 → 32);
+`.js` → `.ts` import resolution; monorepo-private packages treated as
+libraries; test files (`tests/`, `test.ts`) and intentional-unreachable
+markers (`# pragma: no cover`, `/* istanbul ignore next */`) kept.
+
+Scan times (same machine): umami 1520 files 15.6 s (~97 files/s),
+fastapi 1237 files 12.9 s, date-fns 1776 files 8.6 s — the O(symbols ×
+files) string pass is now an inverted index and git is one `git log`
+per repo instead of two processes per file (umami was 173.9 s before).
+
+Determinism note: a single CLI run is not ground truth on Python repos
+unless the tool version is pinned — an earlier measurement gap (flask
+39 vs 17 SAFE across runs) turned out to be a tool-version change
+mid-measurement, not nondeterminism: the current tool is byte-identical
+across 3 repeat runs on flask/requests/click.
+
+The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by `test/web-analyzer.test.js` (40 tests). On the 10-repo corpus it no longer crashes on any repo and emits no duplicate finding IDs, but its SAFE set is still larger than the CLI's (114 vs 40 — see the parity note in the limitations below) and it is slower on large Python repos.
 
 Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (44 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 
-Known limitation, stated honestly: a name that appears as a whole string or a code-delimited string still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
+Known limitations, stated honestly:
+
+- **Framework-consumed class attributes** (flask `sessions.py: pickle_based`, `wrappers.py: default_mimetype`; requests Pygments theme attrs; chained-assignment method aliases like `popitem = _fail`): a class attribute that a framework or a parent class reads by attribute is still flagged SAFE when nothing in-repo reads it by name. These are the 6 known SAFE false positives in the corpus above. A narrow rule for them (parent-class attribute overrides, theme-module attrs) does not exist yet — do not over-broaden by keeping all class attributes.
+- **Cascade is file-level only**: a symbol used only by another dead symbol in the *same live file* is not caught — only usage from dead *files* cascades. Same-file cascade needs per-definition reference scopes the parsers do not record yet.
+- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches (and vice versa on a few shapes). Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 114 vs CLI SAFE 40 — express 0, commander 12, zustand 7, preact 26, date-fns 18, next-blog 12, flask 18, fastapi 4, requests 6, click 8. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The web is also slower than the CLI on large Python repos (fastapi 214.7 s web vs 12.9 s CLI) because the inverted string index is CLI-only so far. The CLI is the reference; the web checker is a convenience.
+- **tsconfig `extends` is not followed**: `paths` must live in the local `tsconfig.json` / `jsconfig.json` — a base config that holds the paths is not read.
+- **JSX transform**: a `React` / `createElement` import in a JSX file is graded on the assumption the repo uses the automatic JSX runtime (Next.js, preact). A repo on the classic transform (JSX compiles to `React.createElement`) would see those imports flagged SAFE wrongly.
+- **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
 
 ## How it works
 

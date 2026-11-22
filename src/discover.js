@@ -74,6 +74,7 @@ function packageJsonEntries(root, pkg) {
   add(pkg.main);
   add(pkg.module);
   add(pkg.types);
+  add(pkg.typings);
   if (pkg.bin) {
     if (typeof pkg.bin === 'string') add(pkg.bin);
     else Object.values(pkg.bin).forEach(add);
@@ -85,16 +86,71 @@ function packageJsonEntries(root, pkg) {
     };
     collect(pkg.exports);
   }
+  // package.json `imports` (subpath imports, e.g. "#utils": "./src/utils.js")
+  // are entries too: code resolves them by name, never by relative path.
+  if (pkg.imports) {
+    const collect = (v) => {
+      if (typeof v === 'string') add(v);
+      else if (v && typeof v === 'object') Object.values(v).forEach(collect);
+    };
+    collect(pkg.imports);
+  }
+  return out;
+}
+
+// File paths named in package.json scripts are entries: the script runs
+// them directly (migrations, seeds, codegen, `tsx scripts/build.ts`).
+// Tokens are resolved against the manifest's own directory, not the repo
+// root — a workspace script must not resolve against the wrong package.
+function scriptEntries(manifestDir, pkg) {
+  const out = new Set();
+  if (!pkg || !pkg.scripts) return out;
+  for (const script of Object.values(pkg.scripts)) {
+    if (typeof script !== 'string') continue;
+    for (const token of script.split(/[\s'"]+/)) {
+      if (!token || !/\.(js|jsx|ts|tsx|mjs|cjs|py)$/.test(token)) continue;
+      if (/^https?:\/\//.test(token)) continue;
+      const p = path.resolve(manifestDir, token);
+      if (fs.existsSync(p)) out.add(p);
+    }
+  }
+  return out;
+}
+
+// Config files name the scripts they load: MkDocs `extra_javascript`,
+// plugin hooks (`scripts/agent_banner.py` under `markdown_extensions`
+// or `plugins`), and similar. Any token ending in a code extension
+// that resolves to a real file next to the config is an entry — and so
+// is a dotted module reference (`scripts.mkdocs_hook` -> the file
+// `scripts/mkdocs_hook.py`), which is how MkDocs names Python plugins.
+function configFileEntries(configPath) {
+  const out = new Set();
+  let text;
+  try { text = fs.readFileSync(configPath, 'utf8'); } catch (_) { return out; }
+  const dir = path.dirname(configPath);
+  for (const m of text.matchAll(/[\w./-]+\.(js|jsx|ts|tsx|mjs|cjs|py)\b/g)) {
+    const p = path.resolve(dir, m[0]);
+    if (fs.existsSync(p)) out.add(p);
+  }
+  for (const m of text.matchAll(/[A-Za-z_][\w]*(?:\.[\w]+)+/g)) {
+    const dotted = m[0];
+    if (/\.(js|jsx|ts|tsx|mjs|cjs|py)$/.test(dotted)) continue; // handled above
+    for (const ext of ['.py', '.js', '.ts']) {
+      const p = path.resolve(dir, dotted.replace(/\./g, '/') + ext);
+      if (fs.existsSync(p)) { out.add(p); break; }
+    }
+  }
   return out;
 }
 
 const ENTRY_BASENAMES = new Set([
   'index', 'main', 'app', 'server', 'cli', 'bin', 'entry', 'setup',
-  'wsgi', 'asgi', 'manage', '__main__',
+  'wsgi', 'asgi', 'manage', '__main__', 'gulpfile', 'gruntfile',
 ]);
 
 const ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//, // framework route directories
+  /(^|\/)examples\//, // example scripts are standalone entry points, run directly
   /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
@@ -111,19 +167,39 @@ function looksLikeEntry(rel, abs, pkgEntries) {
   for (const re of ENTRY_PATTERNS) {
     if (re.test(rel) || re.test(abs)) return { entry: true, reason: `matches entry pattern ${re}` };
   }
-  // Shebang / executable CLI script.
-  try {
-    const head = fs.readFileSync(abs, 'utf8').slice(0, 200);
-    if (head.startsWith('#!')) return { entry: true, reason: 'has a shebang (CLI script)' };
-  } catch (_) { /* ignore */ }
-  // Runnable scripts: `if __name__ == "__main__":` (Python) or
-  // `if (require.main === module)` (Node) — the file is run directly.
-  try {
-    const src = fs.readFileSync(abs, 'utf8');
-    if (/__name__\s*==\s*['"]__main__['"]/.test(src)) return { entry: true, reason: 'runnable script (if __name__ == "__main__")' };
-    if (/require\.main\s*===\s*module/.test(src)) return { entry: true, reason: 'runnable script (require.main === module)' };
-  } catch (_) { /* ignore */ }
+  // Shebang / executable CLI script, or a runnable script
+  // (`if __name__ == "__main__":` in Python,
+  // `if (require.main === module)` in Node) — the file is run directly.
+  // One read serves all three checks.
+  let src = '';
+  try { src = fs.readFileSync(abs, 'utf8'); } catch (_) { return { entry: false, reason: '' }; }
+  if (src.startsWith('#!')) return { entry: true, reason: 'has a shebang (CLI script)' };
+  if (/__name__\s*==\s*['"]__main__['"]/.test(src)) return { entry: true, reason: 'runnable script (if __name__ == "__main__")' };
+  if (/require\.main\s*===\s*module/.test(src)) return { entry: true, reason: 'runnable script (require.main === module)' };
   return { entry: false, reason: '' };
+}
+
+const APP_FRAMEWORK_DEPS = new Set([
+  'next', 'nuxt', 'gatsby', 'astro', '@angular/core', '@sveltejs/kit',
+  '@remix-run/node', 'ember-source',
+]);
+
+function readText(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch (_) { return null; }
+}
+
+// A pyproject.toml with a [project] name is a published package.
+function pyprojectHasProjectName(text) {
+  if (!text || !text.includes('[project]')) return false;
+  const section = text.slice(text.indexOf('[project]'));
+  return /^\s*name\s*=\s*["'][^"']+["']/m.test(section);
+}
+
+// setup.py / setup.cfg naming a package: a published package too.
+function setupHasName(file, text) {
+  if (!text) return false;
+  if (file.endsWith('setup.py')) return /\bname\s*=\s*["'][^"']+["']/.test(text);
+  return /\[metadata\][\s\S]*?^\s*name\s*=\s*\S/m.test(text);
 }
 
 function discover(root, opts) {
@@ -133,15 +209,92 @@ function discover(root, opts) {
   const textFiles = allFiles.filter((f) => ALL_EXTS.has(path.extname(f).toLowerCase()));
   const pkgPath = path.join(absRoot, 'package.json');
   const pkg = fs.existsSync(pkgPath) ? readJson(pkgPath) : null;
-  const pkgEntries = packageJsonEntries(absRoot, pkg);
+
+  // Every manifest in the tree, not just the root: workspaces and
+  // sub-packages have their own entries, scripts, and library/app kind.
+  const jsManifests = new Map(); // dir -> { hasExports, isPrivate, hasMain, isAppFramework, hasAppDir }
+  const pyManifests = new Map(); // dir -> { isLibrary }
+  const manageDirs = new Set(); // dirs containing manage.py (Django app)
+  const pkgEntries = new Set();
+  for (const f of allFiles) {
+    const base = path.basename(f);
+    const dir = path.dirname(f);
+    if (base === 'package.json') {
+      const manifest = readJson(f);
+      if (!manifest) continue;
+      for (const p of packageJsonEntries(dir, manifest)) pkgEntries.add(p);
+      for (const p of scriptEntries(dir, manifest)) pkgEntries.add(p);
+      const deps = { ...(manifest.dependencies || {}), ...(manifest.devDependencies || {}) };
+      jsManifests.set(dir, {
+        hasExports: Boolean(manifest.exports),
+        isPrivate: manifest.private === true,
+        hasMain: typeof manifest.main === 'string' || typeof manifest.module === 'string',
+        isAppFramework: [...APP_FRAMEWORK_DEPS].some((d) => d in deps),
+        hasAppDir: fs.existsSync(path.join(dir, 'app')) || fs.existsSync(path.join(dir, 'src', 'app')),
+      });
+    } else if (base === 'pyproject.toml') {
+      pyManifests.set(dir, { isLibrary: pyprojectHasProjectName(readText(f)) });
+    } else if (base === 'setup.py' || base === 'setup.cfg') {
+      if (setupHasName(f, readText(f))) pyManifests.set(dir, { isLibrary: true });
+    } else if (base === 'manage.py') {
+      manageDirs.add(dir);
+    } else if (/^mkdocs.*\.ya?ml$/.test(base)) {
+      // MkDocs loads scripts and JS assets named in its config.
+      for (const p of configFileEntries(f)) pkgEntries.add(p);
+    }
+  }
   const isLibrary = Boolean(pkg && pkg.exports);
+
+  // Library vs app, per file, from the nearest manifest above it.
+  // Libraries keep public API at REVIEW; apps may grade exported but
+  // uncalled app-internal symbols SAFE (see confidence.js). Unknown
+  // (no manifest signal either way) keeps the old behaviour: REVIEW.
+  // The rule is deliberately narrow so fixtures and plain packages do
+  // not flip: a package.json with only `main` and no app signal is
+  // unknown, not an app.
+  const kindCache = new Map(); // abs file -> 'library' | 'app' | 'unknown'
+  function fileKind(abs) {
+    if (kindCache.has(abs)) return kindCache.get(abs);
+    let kind = 'unknown';
+    const ext = path.extname(abs).toLowerCase();
+    let dir = path.dirname(abs);
+    // A `private: true` manifest does not decide the kind by itself:
+    // in a monorepo the sub-packages are private (published through the
+    // root package) while the root has `exports` — preact's compat/ and
+    // hooks/ sub-packages were graded 'app' and their exported symbols
+    // went SAFE. So a private manifest is skipped and the walk continues
+    // up; only a chain of nothing but private manifests is an app.
+    let sawPrivate = false;
+    let exhausted = false; // the walk ran out of ancestors without a decisive manifest
+    while (true) {
+      if (ext === '.py') {
+        if (pyManifests.has(dir)) {
+          kind = pyManifests.get(dir).isLibrary ? 'library' : 'unknown';
+          break;
+        }
+        if (manageDirs.has(dir)) { kind = 'app'; break; }
+      } else if (jsManifests.has(dir)) {
+        const m = jsManifests.get(dir);
+        if (m.hasExports) { kind = 'library'; break; }
+        if (m.isAppFramework || (!m.hasMain && m.hasAppDir)) { kind = 'app'; break; }
+        if (m.isPrivate) { sawPrivate = true; }
+        else { kind = 'unknown'; break; }
+      }
+      if (dir === absRoot || path.dirname(dir) === dir) { exhausted = true; break; }
+      dir = path.dirname(dir);
+    }
+    if (kind === 'unknown' && sawPrivate && exhausted) kind = 'app';
+    kindCache.set(abs, kind);
+    return kind;
+  }
+
   const entries = new Map(); // abs path -> reason
   for (const f of codeFiles) {
     const rel = path.relative(absRoot, f);
     const r = looksLikeEntry(rel, f, pkgEntries);
     if (r.entry) entries.set(f, r.reason);
   }
-  return { root: absRoot, allFiles, codeFiles, textFiles, pkg, pkgEntries, isLibrary, entries };
+  return { root: absRoot, allFiles, codeFiles, textFiles, pkg, pkgEntries, isLibrary, entries, fileKind };
 }
 
 module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS };

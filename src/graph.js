@@ -34,15 +34,88 @@ function mentionRegExp(name, flags) {
   return new RegExp(start + esc + end, flags);
 }
 
-function resolveRelative(fromFile, source, existingFiles) {
-  if (!source.startsWith('.')) return null;
-  const base = path.resolve(path.dirname(fromFile), source);
+function resolveFromBase(base, existingFiles) {
   const candidates = [];
   if (path.extname(base)) candidates.push(base);
+  // TypeScript ESM style: source files import `./x.js` but the file on
+  // disk is `x.ts` (tsc rewrites the extension at build time). Without
+  // this, every `.js`-suffixed import in a TS repo missed its edge and
+  // the target's exports looked dead (umami's seed scripts, date-fns).
+  if (base.endsWith('.js')) {
+    for (const ext of ['.ts', '.tsx', '.d.ts', '.mts', '.cts']) candidates.push(base.slice(0, -3) + ext);
+  }
   for (const ext of [...JS_EXTS, ...PY_EXTS]) candidates.push(base + ext);
   for (const ext of [...JS_EXTS, ...PY_EXTS]) candidates.push(path.join(base, 'index' + ext));
   candidates.push(path.join(base, '__init__.py'));
   for (const c of candidates) if (existingFiles.has(c)) return c;
+  return null;
+}
+
+function resolveRelative(fromFile, source, existingFiles) {
+  if (!source.startsWith('.')) return null;
+  return resolveFromBase(path.resolve(path.dirname(fromFile), source), existingFiles);
+}
+
+/**
+ * tsconfig / jsconfig `paths` aliases (`@/*` -> `./src/*`), the
+ * standard Next.js / Vite / monorepo import style. Without this, every
+ * `@/lib/...` import missed its edge and the target's exports looked
+ * dead (umami: most of its 196 SAFE findings were `@/` imports).
+ *
+ * `extends` is NOT followed yet: paths must live in the local
+ * tsconfig/jsconfig. A base config that holds the paths is a known gap.
+ */
+function loadTsAliases(discovery) {
+  const out = [];
+  for (const f of discovery.textFiles || []) {
+    const base = path.basename(f);
+    if (base !== 'tsconfig.json' && base !== 'jsconfig.json') continue;
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { continue; }
+    const opts = (cfg && cfg.compilerOptions) || {};
+    if (!opts.paths || typeof opts.paths !== 'object') continue;
+    const dir = path.dirname(f);
+    const baseUrl = opts.baseUrl ? path.resolve(dir, opts.baseUrl) : dir;
+    const paths = [];
+    for (const [pattern, targets] of Object.entries(opts.paths)) {
+      if (!Array.isArray(targets)) continue;
+      const star = pattern.indexOf('*');
+      paths.push({
+        prefix: star < 0 ? pattern : pattern.slice(0, star),
+        suffix: star < 0 ? '' : pattern.slice(star + 1),
+        hasStar: star >= 0,
+        targets: targets.filter((t) => typeof t === 'string'),
+      });
+    }
+    if (paths.length) out.push({ dir, baseUrl, paths });
+  }
+  return out;
+}
+
+function resolveAlias(fromFile, source, aliases, existingFiles) {
+  // Nearest config to the importing file wins: monorepo packages can
+  // each have their own tsconfig with their own paths.
+  let best = null;
+  for (const a of aliases) {
+    if (fromFile === a.dir || fromFile.startsWith(a.dir + path.sep)) {
+      if (!best || a.dir.length > best.dir.length) best = a;
+    }
+  }
+  if (!best) return null;
+  for (const p of best.paths) {
+    let rest = null;
+    if (p.hasStar) {
+      if (!source.startsWith(p.prefix) || !source.endsWith(p.suffix)) continue;
+      rest = source.slice(p.prefix.length, source.length - p.suffix.length);
+    } else if (source === p.prefix) {
+      rest = '';
+    } else continue;
+    for (const t of p.targets) {
+      const mapped = p.hasStar ? t.replace('*', rest) : t;
+      const target = resolveFromBase(path.resolve(best.baseUrl, mapped), existingFiles);
+      if (target) return target;
+    }
+  }
   return null;
 }
 
@@ -125,6 +198,7 @@ function resolvePyModule(fromFile, source, existingFiles, root) {
 
 function analyze(root, discovery) {
   const existingFiles = new Set(discovery.codeFiles);
+  const tsAliases = loadTsAliases(discovery);
   const files = new Map(); // abs -> { rel, language, parsed, src, size }
 
   for (const f of discovery.codeFiles) {
@@ -159,7 +233,7 @@ function analyze(root, discovery) {
       // is not a JS-style relative path.
       if (imp.fromImport && imp.relative) {
         for (const t of resolvePyRelative(f, imp.source, imp.names, imp.level || 1, existingFiles, files)) {
-          edges.push({ target: t.target, source: imp.source, names: t.names, range: imp.range });
+          edges.push({ target: t.target, source: imp.source, names: t.names, range: imp.range, reExport: Boolean(imp.reExport) });
           if (!importers.has(t.target)) importers.set(t.target, new Set());
           importers.get(t.target).add(f);
         }
@@ -175,13 +249,18 @@ function analyze(root, discovery) {
           if (!externalDeps.has(imp.source)) externalDeps.set(imp.source, new Set());
           externalDeps.get(imp.source).add(f);
         }
-      } else if (imp.source) {
-        // Bare specifier: external dependency (JS) or stdlib/third-party (Python).
-        if (!externalDeps.has(imp.source)) externalDeps.set(imp.source, new Set());
-        externalDeps.get(imp.source).add(f);
+      } else if (info.language !== 'py' && imp.source) {
+        // tsconfig/jsconfig `paths` aliases (`@/lib/...`): the standard
+        // Next.js / Vite / monorepo import style. A bare specifier that
+        // is not an alias is an external dependency (npm package).
+        target = resolveAlias(f, imp.source, tsAliases, existingFiles);
+        if (!target) {
+          if (!externalDeps.has(imp.source)) externalDeps.set(imp.source, new Set());
+          externalDeps.get(imp.source).add(f);
+        }
       }
       if (target) {
-        edges.push({ target, source: imp.source, names: imp.names, range: imp.range });
+        edges.push({ target, source: imp.source, names: imp.names, range: imp.range, reExport: Boolean(imp.reExport) });
         if (!importers.has(target)) importers.set(target, new Set());
         importers.get(target).add(f);
         if (info.language === 'py' && imp.fromImport) {
@@ -195,7 +274,7 @@ function analyze(root, discovery) {
             if (n.imported === '*' || defined.has(n.imported)) continue;
             const sub = pyModuleFile(path.join(targetDir, n.imported), existingFiles);
             if (sub && sub !== target) {
-              edges.push({ target: sub, source: imp.source, names: [n], range: imp.range });
+              edges.push({ target: sub, source: imp.source, names: [n], range: imp.range, reExport: Boolean(imp.reExport) });
               if (!importers.has(sub)) importers.set(sub, new Set());
               importers.get(sub).add(f);
             }
@@ -204,9 +283,11 @@ function analyze(root, discovery) {
       }
     }
     // Dynamic import() targets are real edges too — a file loaded only
-    // via import() is live, not dead.
+    // via import() is live, not dead. Aliases apply here as well.
     for (const dyn of info.parsed.dynamicImports || []) {
-      const target = resolveRelative(f, dyn, existingFiles);
+      const target = dyn.startsWith('.')
+        ? resolveRelative(f, dyn, existingFiles)
+        : resolveAlias(f, dyn, tsAliases, existingFiles);
       if (target) {
         edges.push({ target, source: dyn, names: [], range: null, dynamic: true });
         if (!importers.has(target)) importers.set(target, new Set());
@@ -214,6 +295,38 @@ function analyze(root, discovery) {
       }
     }
     importsByFile.set(f, edges);
+  }
+
+  // --- re-exported modules ---
+  // A module bound by name through a re-export — Python
+  // `from . import colors as colors` in `__init__.py`, JS
+  // `export * as ns from './x'` — is public API of its package, and
+  // users reach its contents through the package (`import typer` then
+  // `typer.colors.RED`), not through a direct import edge to the module
+  // file. reExports maps a re-exporting file to module name -> target
+  // file; reExportedFiles is the set of those target files (public API,
+  // REVIEW at most — see confidence.js).
+  const moduleStem = (f) => {
+    const base = path.basename(f, path.extname(f));
+    return base === '__init__' ? path.basename(path.dirname(f)) : base;
+  };
+  const reExports = new Map(); // file -> Map<moduleName, targetFile>
+  const reExportedFiles = new Set();
+  for (const [f, edges] of importsByFile) {
+    for (const e of edges) {
+      if (!e.reExport) continue;
+      for (const n of e.names || []) {
+        // Namespace re-export binds the alias (`export * as ns`);
+        // a named re-export binds the module when the imported name is
+        // the module's own name (`from . import colors`).
+        const modName = n.kind === 'namespace' ? n.local : (n.imported || '').split('.').pop();
+        if (!modName || modName === '*') continue;
+        if (n.kind !== 'namespace' && modName !== moduleStem(e.target)) continue;
+        if (!reExports.has(f)) reExports.set(f, new Map());
+        reExports.get(f).set(modName, e.target);
+        reExportedFiles.add(e.target);
+      }
+    }
   }
 
   // --- reachability from entry points ---
@@ -259,8 +372,59 @@ function analyze(root, discovery) {
   }
 
   const textCache = new Map();
-  function filesMentioning(name) {
-    if (textCache.has(name)) return textCache.get(name);
+  // Inverted string index, built once per scan (lazily, on first use).
+  // The old filesMentioning scanned every text file per symbol —
+  // O(symbols x files) — which collapsed throughput past ~1000 files
+  // (umami: 25 -> 8.7 files/s). The index maps each code-like token to
+  // the files mentioning it, so a lookup is a hash hit, not a scan.
+  // Tokenisation mirrors codeLikeStringMention: in code files a token
+  // only counts when it sits in code (delimited by non-space characters),
+  // so words inside sentences do not count; in raw config files any
+  // whole-word token counts, matching the old raw-text regex. Names with
+  // non-word characters (scoped deps, hyphenated names) are rare and
+  // keep the old per-name scan via scanFilesMentioning below.
+  let stringIndex = null; // Map<token, Set<file>> | null
+  function buildStringIndex() {
+    const index = new Map(); // token -> Set<abs file>
+    const addToken = (token, file) => {
+      if (!index.has(token)) index.set(token, new Set());
+      index.get(token).add(file);
+    };
+    const addLiteral = (literal, file, codeLike) => {
+      const re = /[A-Za-z_][A-Za-z0-9_]*/g;
+      let m;
+      while ((m = re.exec(literal)) !== null) {
+        if (codeLike) {
+          const before = m.index === 0 ? '' : literal[m.index - 1];
+          const after = m.index + m[0].length >= literal.length ? '' : literal[m.index + m[0].length];
+          if ((before !== '' && /\s/.test(before)) || (after !== '' && /\s/.test(after))) continue;
+        }
+        addToken(m[0], file);
+      }
+    };
+    for (const f of discovery.textFiles) {
+      const ext = path.extname(f).toLowerCase();
+      if (PROSE_EXTS.has(ext)) continue; // prose never executes
+      if (JS_EXTS.includes(ext) || PY_EXTS.includes(ext)) {
+        const info = files.get(f);
+        if (info && info.parsed) {
+          for (const s of info.parsed.strings || []) addLiteral(s, f, true);
+          continue;
+        }
+        // Unparseable code file: fall back to a raw-text match rather
+        // than risk hiding a real reference.
+      } else if (!RAW_MATCH_EXTS.has(ext)) {
+        continue; // unknown text extension — do not guess
+      }
+      try {
+        addLiteral(fs.readFileSync(f, 'utf8'), f, false);
+      } catch (_) { /* binary / unreadable */ }
+    }
+    stringIndex = index;
+  }
+  // The old per-name scan, kept for names the index cannot answer
+  // (scoped / hyphenated / dotted names with non-word characters).
+  function scanFilesMentioning(name) {
     const re = mentionRegExp(name);
     const hits = new Set();
     for (const f of discovery.textFiles) {
@@ -283,6 +447,17 @@ function analyze(root, discovery) {
         const content = fs.readFileSync(f, 'utf8');
         if (re.test(content)) hits.add(f);
       } catch (_) { /* binary / unreadable */ }
+    }
+    return hits;
+  }
+  function filesMentioning(name) {
+    if (textCache.has(name)) return textCache.get(name);
+    let hits;
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      if (!stringIndex) buildStringIndex();
+      hits = stringIndex.get(name) || new Set();
+    } else {
+      hits = scanFilesMentioning(name);
     }
     textCache.set(name, hits);
     return hits;
@@ -338,13 +513,46 @@ function analyze(root, discovery) {
         for (const [name, u] of targetMap) {
           if (importerInfo.parsed.references.has(name)) u.importedBy.add(f);
         }
+        // Re-exported modules: an importer that reaches a package
+        // through its __init__ (`import typer`, `from typer import
+        // colors`) and then uses `typer.colors.RED` touches colors.py's
+        // RED, even though the import edge points at __init__.py, not
+        // colors.py. Same shape for JS namespace re-exports.
+        const reExp = reExports.get(e.target);
+        if (reExp) {
+          for (const [modName, subFile] of reExp) {
+            const reachesModule = (e.names || []).some((n) => n.imported === modName || n.local === modName)
+              || importerInfo.parsed.references.has(modName);
+            if (!reachesModule) continue;
+            const subMap = symbolUsage.get(subFile);
+            if (!subMap) continue;
+            for (const [name, u] of subMap) {
+              if (importerInfo.parsed.references.has(name)) u.importedBy.add(f);
+            }
+          }
+        }
+      }
+    }
+    // Constructor calls across files: `new Client()` in an importer
+    // that imports Client from another file calls that file's
+    // `constructor` method. Same-file construction is already covered
+    // by the same-file calls loop above.
+    const importerInfo = files.get(f);
+    if (importerInfo && importerInfo.parsed) {
+      for (const call of importerInfo.parsed.calls || []) {
+        if (call.name !== 'constructor' || !call.forClass) continue;
+        for (const e of edges) {
+          if (!(e.names || []).some((n) => n.local === call.forClass || n.imported === call.forClass)) continue;
+          const targetMap = symbolUsage.get(e.target);
+          if (targetMap && targetMap.has('constructor')) targetMap.get('constructor').calledIn.add(f);
+        }
       }
     }
   }
 
   return {
     files, importers, importsByFile, externalDeps, reachable,
-    filesMentioning, symbolUsage,
+    filesMentioning, symbolUsage, reExports, reExportedFiles,
   };
 }
 

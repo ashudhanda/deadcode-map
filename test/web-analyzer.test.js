@@ -361,3 +361,251 @@ test('web js-deps: README-only deps are flagged, real imports are not', () => {
   }
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
 });
+
+test('web regex-arrow: a backtick inside a regex after => does not swallow the file', () => {
+  // The axios AxiosHeaders shape: `const f = (s) => /^[...`|...]+$/.test(s)`
+  // used to be misread as division, so the backtick inside the regex
+  // character class opened a template literal that blanked the rest of
+  // the file — normalizeHeader / parseTokens / parseHeaders all looked
+  // dead. The `=>` case is now a regex-start context in stripJs.
+  const headers = [
+    "const isValidHeaderName = (str) => /^[-_a-zA-Z0-9^`|~,!#$%&'*+.]+$/.test(str);",
+    'function normalizeHeader(header) { return isValidHeaderName(header) ? header : \'\'; }',
+    'function parseTokens(str) { return normalizeHeader(str); }',
+    'function parseHeaders(raw) { return parseTokens(raw); }',
+    'module.exports = { normalizeHeader, parseTokens, parseHeaders };',
+    '',
+  ].join('\n');
+  const caller = "const { normalizeHeader, parseTokens, parseHeaders } = require('./headers');\nconsole.log(normalizeHeader('x'), parseTokens('y'), parseHeaders('z'));\n";
+  const out = analyzeFiles([
+    { path: 'src/headers.js', content: headers },
+    { path: 'src/index.js', content: caller },
+  ]);
+  // The file parsed fully: parseHeaders is defined AFTER the regex line
+  // and is live. Nothing here may be flagged at all.
+  assert.equal(out.findings.length, 0, `expected no findings, got ${JSON.stringify(out.findings.map((f) => f.symbol || f.category))}`);
+  // The same file scanned alone still parses past the regex line: the
+  // symbols defined after it are found — parseHeaders is REVIEW
+  // (exported, never called from outside), while normalizeHeader and
+  // parseTokens are alive through same-file calls.
+  const alone = analyzeFiles([{ path: 'src/headers.js', content: headers }]);
+  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'parseHeaders').grade, 'REVIEW');
+  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'normalizeHeader'), undefined);
+  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'parseTokens'), undefined);
+});
+
+test('web f-string: names used only inside an f-string expression are live', () => {
+  // The typer _click/termui.py shape: _format_default is called only
+  // inside f"{prompt} [{_format_default(default)}]".
+  const termui = [
+    'def _format_default(default):',
+    '    return str(default)',
+    '',
+    'def render_prompt(prompt, default):',
+    '    return f"{prompt} [{_format_default(default)}]"',
+    '',
+    'def main():',
+    "    print(render_prompt('Name', 'x'))",
+    '',
+  ].join('\n');
+  const f = analyzeFiles([{ path: 'src/termui.py', content: termui }]).findings;
+  assert.equal(bySymbol(f, 'src/termui.py', '_format_default'), undefined, '_format_default is called inside the f-string expression');
+  assert.equal(bySymbol(f, 'src/termui.py', 'render_prompt'), undefined, 'render_prompt is called by main');
+});
+
+test('web dedupe: the same file twice and the same finding twice are reported once', () => {
+  const files = [
+    { path: 'src/a.js', content: 'function deadFn() { return 1; }\nmodule.exports = { deadFn };\n' },
+    { path: 'src/a.js', content: 'function deadFn() { return 1; }\nmodule.exports = { deadFn };\n' },
+    { path: 'src/index.js', content: "console.log('hi');\n" },
+  ];
+  const out = analyzeFiles(files);
+  assert.equal(out.filesScanned, 2, 'the duplicated input file is scanned once');
+  const ids = out.findings.map((x) => x.id);
+  assert.equal(new Set(ids).size, ids.length, 'no finding id repeats');
+});
+
+test('web constructor: new Client() in an importer calls the constructor in its file', () => {
+  const client = [
+    'class Client {',
+    '  constructor(script, args) { this.script = script; }',
+    '  send(x) { return x; }',
+    '  neverCalled() { return 0; }',
+    '}',
+    'module.exports = { Client };',
+    '',
+  ].join('\n');
+  const index = [
+    'const { Client } = require("./client");',
+    'const c = new Client("a", []);',
+    'console.log(c.send(1));',
+    '',
+  ].join('\n');
+  const f = analyzeFiles([
+    { path: 'src/client.js', content: client },
+    { path: 'src/index.js', content: index },
+  ]).findings;
+  assert.equal(bySymbol(f, 'src/client.js', 'constructor'), undefined, 'constructor is called via new Client() across files');
+  assert.equal(bySymbol(f, 'src/client.js', 'send'), undefined, 'send is called on the instance');
+  assert.equal(bySymbol(f, 'src/client.js', 'neverCalled').grade, 'REVIEW', 'an uncalled method is still REVIEW');
+});
+
+test('web py-annotations: string annotations, __all__ tuple, re-exported module use', () => {
+  const f = loadFixture('py-annotations').findings;
+  for (const symbol of ['Context', 'Buffer', 'TypeAdapter', 'Annotated', 'get_type_hints', 'run']) {
+    assert.equal(bySymbol(f, 'pkg/core.py', symbol), undefined, `${symbol} is used in a string annotation or re-exported via __all__`);
+  }
+  assert.equal(bySymbol(f, 'pkg/colors.py', 'RED'), undefined, 'pkg.colors.RED is used through the package');
+  assert.equal(bySymbol(f, 'pkg/colors.py', 'GREEN'), undefined, 'pkg.colors.GREEN is used through the package');
+  assert.equal(bySymbol(f, 'pkg/colors.py', 'BLUE').grade, 'REVIEW', 're-exported but never used: REVIEW at most, never SAFE');
+  assert.equal(bySymbol(f, 'pkg/core.py', 'os').grade, 'SAFE');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['import:pkg/core.py:os']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
+test('web py-typer: @app.command() / @app.callback() are KEEP entry points', () => {
+  const f = loadFixture('py-typer').findings;
+  // A decorated `def callback` must not be self-referenced by its own
+  // `@app.callback()` decorator, and both commands are framework-kept.
+  assert.equal(bySymbol(f, 'app.py', 'main').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'app.py', 'callback').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'app.py', 'helper').grade, 'REVIEW');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web js-alias: tsconfig paths aliases (@/* and exact @util) resolve to real files', () => {
+  const f = loadFixture('js-alias').findings;
+  assert.equal(bySymbol(f, 'src/lib/util.ts', 'helper'), undefined, 'helper is imported through @/lib/util and @util');
+  assert.equal(byCategory(f, 'src/lib/util.ts', 'file'), undefined, 'util.ts is imported through an alias');
+  assert.equal(bySymbol(f, 'src/lib/util.ts', 'unusedFn').grade, 'REVIEW');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web py-decorated: decorated methods, bare annotations, TypeAlias strings, %-format placeholders', () => {
+  const f = loadFixture('py-decorated').findings;
+  assert.equal(bySymbol(f, 'app.py', 'session'), undefined, 'session is called via an instance in main.py');
+  assert.equal(bySymbol(f, 'app.py', 'unused_ctx').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'app.py', 'timeout'), undefined, 'a bare annotation is a type declaration, not a definition');
+  assert.equal(bySymbol(f, 'app.py', 'Response'), undefined, 'a TypeAlias value string is a forward reference');
+  assert.equal(bySymbol(f, 'app.py', 'complete_func'), undefined, 'a %-format placeholder is a use');
+  assert.equal(bySymbol(f, 'app.py', 'TEMPLATE').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'app.py', 'Hook').grade, 'REVIEW');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web py-reexports: redundant aliases, noqa imports and compat shims are re-exports', () => {
+  const f = loadFixture('py-reexports').findings;
+  assert.equal(bySymbol(f, 'pkg/helpers.py', 'assist'), undefined, 'helpers.assist is used through the package');
+  assert.equal(byCategory(f, 'pkg/helpers.py', 'file'), undefined, 'a re-exported module is not a dead file');
+  for (const symbol of ['json', 'socket', 'OrderedDict', 'urlparse']) {
+    assert.equal(bySymbol(f, 'pkg/compat.py', symbol), undefined, `${symbol} in a compat shim is a re-export, never a dead import`);
+  }
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web js-reexports: export { X } re-exports an import, and .js imports resolve to .ts files', () => {
+  const f = loadFixture('js-reexports').findings;
+  assert.equal(bySymbol(f, 'src/reexport.ts', 'helper'), undefined, 'export { helper } is a use of the imported binding');
+  assert.equal(bySymbol(f, 'src/lib.ts', 'helper'), undefined, 'helper is imported (and re-exported) through the .js specifier');
+  assert.equal(bySymbol(f, 'src/runner.ts', 'run'), undefined, 'run is imported through the .js specifier');
+  assert.equal(byCategory(f, 'src/runner.ts', 'file'), undefined);
+  assert.equal(byCategory(f, 'src/lib.ts', 'file'), undefined);
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web py-pydantic: model fields, validators and overload groups are framework-invoked', () => {
+  const f = loadFixture('py-pydantic').findings;
+  // Model fields and validators: either no finding (a string hit or a
+  // call proves them used) or a KEEP finding — never SAFE or REVIEW.
+  // extra_field sits in a BaseModelWithConfig subclass (fastapi's
+  // openapi/models.py shape): the base name contains BaseModel.
+  for (const symbol of ['name', 'schema_', 'vocabulary', 'x', 'y', 'check', 'get', 'extra_field']) {
+    const found = bySymbol(f, 'models.py', symbol);
+    assert.ok(!found || found.grade === 'KEEP', `${symbol} is a model field / framework-invoked — must be KEEP or absent, never ${found && found.grade}`);
+  }
+  assert.equal(bySymbol(f, 'models.py', 'unused_fn').grade, 'REVIEW');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web ts-ambient: declare module augmentation is declaration merging, never dead', () => {
+  const f = loadFixture('ts-ambient').findings;
+  assert.equal(bySymbol(f, 'src/devtools.ts', 'StoreMutators').grade, 'KEEP');
+  assert.equal(byCategory(f, 'src/devtools.ts', 'file'), undefined, 'the augmentation file is imported by the entry point');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web ts-testfile: a file literally named test.ts holds type-test functions — KEEP, never SAFE', () => {
+  const f = loadFixture('ts-testfile').findings;
+  assert.equal(byCategory(f, 'src/foo/test.ts', 'file').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'src/foo/test.ts', '_test').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'src/lib.ts', 'usedFn'), undefined);
+  assert.equal(bySymbol(f, 'src/lib.ts', 'unusedExport').grade, 'REVIEW');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web js-methods: a method is not used by its own declaration line', () => {
+  const f = loadFixture('js-methods').findings;
+  assert.equal(bySymbol(f, 'src/widget.js', 'neverCalled').grade, 'REVIEW');
+  assert.equal(bySymbol(f, 'src/widget.js', 'constructor'), undefined, 'constructor is called via new Widget()');
+  assert.equal(bySymbol(f, 'src/widget.js', 'used'), undefined, 'used is called on the instance');
+});
+
+test('web js-framework: docker/proxy.ts middleware and config are KEEP', () => {
+  const f = loadFixture('js-framework').findings;
+  // proxy.ts is an entry point (Next.js resolves it), so it gets no
+  // file finding at all — only its symbols are graded, and they are KEEP.
+  assert.equal(byCategory(f, 'docker/proxy.ts', 'file'), undefined);
+  assert.equal(bySymbol(f, 'docker/proxy.ts', 'middleware').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'docker/proxy.ts', 'config').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'docker/proxy.ts', 'NextRequest'), undefined, 'the type-only import is used as a parameter type');
+});
+
+test('web module.exports chain, __future__, braceless return: three regex-parser traps', () => {
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "var express = require('./lib');\nvar app = module.exports = express();\nconst { describe } = require('./cmd');\ndescribe('x');\nconsole.log(app);\n" },
+    { path: 'src/lib.js', content: 'module.exports = function() { return 1; };\n' },
+    { path: 'src/cmd.js', content: [
+      'function describe(str) {',
+      '  if (str === undefined)',
+      '    return "none";',
+      '  this.description = str;',
+      '  return this;',
+      '}',
+      'module.exports = { describe };',
+      '',
+    ].join('\n') },
+    { path: 'main.py', content: 'from app import run\n\nif __name__ == "__main__":\n    print(run())\n' },
+    { path: 'app.py', content: 'from __future__ import annotations\n\n\ndef run():\n    return 1\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  // `var app = module.exports = express()` calls express() — the import
+  // is used, even though module.exports appears on the same line.
+  assert.equal(bySymbol(f, 'src/index.js', 'express'), undefined, 'express() is called on the module.exports line');
+  // A return that is the body of a braceless `if` does not terminate
+  // the block — the assignment after it is reachable.
+  assert.equal(byCategory(f, 'src/cmd.js', 'unreachable'), undefined, 'the assignment after a braceless-if return is reachable');
+  // `from __future__ import annotations` is a compiler directive.
+  assert.equal(bySymbol(f, 'app.py', 'annotations'), undefined, '__future__ imports are never flagged');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});
+
+test('web tests-dir: files under tests/ or test/ are KEEP at most, never SAFE', () => {
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/index.js' }) },
+    { path: 'src/index.js', content: "const { usedFn } = require('./lib');\nconsole.log(usedFn());\n" },
+    { path: 'src/lib.js', content: 'function usedFn() { return 1; }\nmodule.exports = { usedFn };\n' },
+    { path: 'tests/helpers/type-check.js', content: 'function deadHelper() { return 1; }\nmodule.exports = { deadHelper };\n' },
+    { path: 'src/test/test-utils.tsx', content: 'export function renderAll() { return 1; }\n' },
+  ];
+  const f = analyzeFiles(files).findings;
+  assert.equal(byCategory(f, 'tests/helpers/type-check.js', 'file').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'tests/helpers/type-check.js', 'deadHelper').grade, 'KEEP');
+  assert.equal(byCategory(f, 'src/test/test-utils.tsx', 'file').grade, 'KEEP');
+  assert.equal(bySymbol(f, 'src/test/test-utils.tsx', 'renderAll').grade, 'KEEP');
+  assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
+});

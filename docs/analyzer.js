@@ -62,7 +62,14 @@ var PY_KEYWORDS = new Set([
   'print', 'self', 'cls',
 ]);
 
-var TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$)/;
+var TEST_FILE = /(\.test\.|\.spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
+// A file literally named test.ts / test.tsx (date-fns) holds type-test
+// functions whose bodies ARE the assertions — the declarations are the
+// test, so the file is test code: KEEP at most, never SAFE.
+// A file under a tests/ (or test/, __tests__/) directory is test code:
+// its declarations ARE the test, so it is KEEP at most, never SAFE —
+// the CLI uses the same rule (axios type-test helpers, umami test utils).
+var TEST_DIR = /(^|\/)(test|tests|__tests__)\//;
 var CONFIG_FILE = /(\.config\.[jt]s|webpack\.config|vite\.config|jest\.config|babel\.config|tailwind\.config|\.d\.ts$)/;
 var ENTRY_BASENAMES = new Set([
   'index', 'main', 'app', 'server', 'cli', 'bin', 'entry', 'setup',
@@ -77,6 +84,11 @@ var ENTRY_PATTERNS = [
   /setup\.py$/, /conftest\.py$/, /\/__init__\.py$/,
   /webpack\.config\./, /vite\.config\./, /rollup\.config\./,
   /tailwind\.config\./, /jest\.config\./, /babel\.config\./,
+  // Next.js middleware / proxy at any depth (docker/proxy.ts): the
+  // framework resolves it, so it is an entry point, never dead.
+  /middleware\.(js|jsx|ts|tsx)$/, /proxy\.(js|jsx|ts|tsx)$/,
+  // Build-task files and example scripts are standalone entry points.
+  /(^|\/)gulpfile\.(js|ts)$/, /(^|\/)gruntfile\.(js|ts)$/, /(^|\/)examples\//,
 ];
 var ROUTE_DIR = /(^|\/)(pages|app|routes|views)\//;
 var FRAMEWORK_KEEP_EXPORTS = new Set([
@@ -86,6 +98,13 @@ var FRAMEWORK_KEEP_EXPORTS = new Set([
 var FRAMEWORK_KEEP_DECORATORS = [
   'app.route', 'app.errorhandler', 'app.before_request', 'app.after_request',
   'blueprint.route', 'pytest.fixture', 'pytest.mark.parametrize', 'pytest.mark.skip',
+  // Typer / Click CLI entry points and pytest hooks.
+  'app.command', 'app.callback', 'app.cli.command', 'click.command', 'click.group',
+  'click.pass_context', 'typer.Typer', 'pytest.hookimpl', 'hookimpl',
+  // Pydantic validators (invoked at validation time) and @overload
+  // stubs (type information, never called by design).
+  'model_validator', 'field_validator', 'computed_field', 'root_validator',
+  'validator', 'overload',
 ];
 
 /* ------------------------------------------------------------------ */
@@ -165,6 +184,7 @@ function stripJs(code, collect) {
       while (wordStart >= 0 && /[A-Za-z_$]/.test(code[wordStart])) wordStart--;
       var prevWord = code.slice(wordStart + 1, j + 1);
       var regexStart = prev === '' || '([{,=:!&|?;'.indexOf(prev) >= 0 ||
+        (prev === '>' && code[j - 1] === '=') || // `=> /regex/` — an arrow returning a regex literal
         ['return', 'typeof', 'case', 'throw', 'in', 'of', 'new', 'delete', 'void', 'yield', 'await'].indexOf(prevWord) >= 0;
       if (regexStart) {
         out += ' '; i++;
@@ -249,9 +269,51 @@ function stripPy(code, collect) {
       if (ch === "'" || ch === '"') {
         var q = ch;
         var start = i;
+        // F-string prefix? The quote may be preceded by f/F (alone or
+        // combined with r/R/b/B/u/U, e.g. rf"..."): an f-string's {...}
+        // expressions are real code — `f"{_format_default(d)}"` calls
+        // _format_default — so keep them and blank only the literal
+        // parts. Without this, every name used only inside an f-string
+        // expression looked dead. (Triple-quoted f-strings are not
+        // handled: their expressions stay blanked, a known limitation.)
+        var pfx = i - 1;
+        var isFString = false;
+        while (pfx >= 0 && /[rRbBfFuU]/.test(line[pfx])) {
+          if (line[pfx] === 'f' || line[pfx] === 'F') isFString = true;
+          pfx--;
+        }
+        // The prefix must sit after a non-identifier char — otherwise
+        // the letters are part of a longer word, not a string prefix.
+        if (isFString && pfx >= 0 && /[A-Za-z0-9_]/.test(line[pfx])) isFString = false;
         res += ' '; i++;
         while (i < line.length && line[i] !== q) {
           if (line[i] === '\\') { res += '  '; i += 2; continue; }
+          if (isFString && line[i] === '{') {
+            if (line[i + 1] === '{') { res += '  '; i += 2; continue; } // {{ is a literal brace
+            // Keep the { ... } expression as code.
+            res += '{'; i++;
+            var depth = 1;
+            while (i < line.length && depth > 0) {
+              var ec = line[i];
+              if (ec === '{') { depth++; res += ec; i++; continue; }
+              if (ec === '}') { depth--; res += ec; i++; continue; }
+              if (ec === "'" || ec === '"') {
+                // Nested string inside the expression: blank its
+                // contents (its identifiers are string data, not code).
+                var nq = ec;
+                res += ' '; i++;
+                while (i < line.length && line[i] !== nq) {
+                  if (line[i] === '\\') { res += '  '; i += 2; continue; }
+                  res += ' '; i++;
+                }
+                if (i < line.length) { res += ' '; i++; }
+                continue;
+              }
+              res += ec; i++;
+            }
+            continue;
+          }
+          if (isFString && line[i] === '}' && line[i + 1] === '}') { res += '  '; i += 2; continue; } // }} is a literal brace
           res += ' '; i++;
         }
         if (i < line.length) { res += ' '; i++; }
@@ -273,14 +335,18 @@ function parseJs(rel, raw) {
   var strings = [];
   var code = stripJs(raw, strings);
   var lines = code.split('\n');
+  // A compatibility shim's imports ARE its public API (mirrors
+  // src/parse-py.js): the names are re-exported for downstream code.
+  var isCompatShimJs = /(^|\/)(_?compat)(\.(js|jsx|ts|tsx|mjs|cjs))?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
   var parsed = {
     language: 'js', definitions: [], imports: [], references: new Set(),
-    calls: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
+    calls: new Set(), constructed: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
     unreachable: [], decorators: [], dunder: new Set(), strings: strings,
   };
 
   var braceDepth = 0;
   var classStack = []; // {name, depth}
+  var ambientStack = []; // {depth} — declare module/global blocks
   var declaredOnLine = {}; // lineNo (1-based) -> Set of declared names
 
   function markDeclared(lineNo, name) {
@@ -296,13 +362,16 @@ function parseJs(rel, raw) {
 
     // Pop class contexts whose block closed.
     while (classStack.length && braceDepth < classStack[classStack.length - 1].depth) classStack.pop();
+    // A definition inside a `declare module` / `declare global` block is
+    // a declaration-merging augmentation, not a standalone definition.
+    var inAmbient = ambientStack.length > 0;
 
     // Class declaration.
     m = line.match(/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/);
     if (m) {
       parsed.definitions.push({
         name: m[1], kind: 'class', exported: /^\s*export\b/.test(line),
-        startLine: lineNo, endLine: lineNo, decorators: [],
+        startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
       });
       markDeclared(lineNo, m[1]);
     } else if (classStack.length) {
@@ -311,7 +380,7 @@ function parseJs(rel, raw) {
       if (mm && !JS_KEYWORDS.has(mm[1]) && mm[1] !== 'if' && mm[1] !== 'for' && mm[1] !== 'while' && mm[1] !== 'switch' && mm[1] !== 'catch') {
         parsed.definitions.push({
           name: mm[1], kind: 'method', exported: false,
-          startLine: lineNo, endLine: lineNo, decorators: [],
+          startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
         });
         markDeclared(lineNo, mm[1]);
       }
@@ -322,7 +391,7 @@ function parseJs(rel, raw) {
     if (m) {
       parsed.definitions.push({
         name: m[1], kind: 'function', exported: /^\s*export\b/.test(line),
-        startLine: lineNo, endLine: lineNo, decorators: [],
+        startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
       });
       markDeclared(lineNo, m[1]);
     }
@@ -334,7 +403,7 @@ function parseJs(rel, raw) {
       var kind = /=>|function\b/.test(rhs) ? 'function' : 'variable';
       parsed.definitions.push({
         name: m[1], kind: kind, exported: /^\s*export\b/.test(line),
-        startLine: lineNo, endLine: lineNo, decorators: [],
+        startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
       });
       markDeclared(lineNo, m[1]);
     }
@@ -344,7 +413,7 @@ function parseJs(rel, raw) {
     if (m) {
       parsed.definitions.push({
         name: m[1], kind: 'type', exported: /^\s*export\b/.test(line),
-        startLine: lineNo, endLine: lineNo, decorators: [],
+        startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
       });
       markDeclared(lineNo, m[1]);
     }
@@ -354,6 +423,10 @@ function parseJs(rel, raw) {
     var closes = (line.match(/\}/g) || []).length;
     braceDepth += opens - closes;
     if (m && false) { /* placeholder, keeps structure clear */ }
+    // A `declare module` / `declare global` line opens an ambient block;
+    // interfaces inside it are declaration-merging augmentations.
+    if (/^\s*declare\s+(module|global)\b/.test(line) && opens > 0) ambientStack.push({ depth: braceDepth });
+    while (ambientStack.length && braceDepth < ambientStack[ambientStack.length - 1].depth) ambientStack.pop();
     // Re-detect class start depth: a class line opens a block at depthBefore.
     var cm = line.match(/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/);
     if (cm && opens > 0) classStack.push({ name: cm[1], depth: braceDepth });
@@ -413,7 +486,7 @@ function parseJs(rel, raw) {
       var defm = spec.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
       if (defm) names.push({ imported: 'default', local: defm[1], kind: 'default' });
     }
-    return { source: im[2], names: names, sideEffect: !spec, reExport: false };
+    return { source: im[2], names: names, sideEffect: !spec, reExport: isCompatShimJs };
   }
   var rawLines = raw.split('\n');
   for (var il2 = 0; il2 < rawLines.length; il2++) {
@@ -457,7 +530,7 @@ function parseJs(rel, raw) {
       } else if (reqM[2]) {
         names2.push({ imported: reqM[2], local: reqM[2], kind: 'value' });
       }
-      parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: false });
+      parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: isCompatShimJs });
     }
     // Inline / bare require('...') — require('./x').fn() or a bare
     // side-effect require('./x') — is an import edge too (matches the
@@ -527,12 +600,39 @@ function parseJs(rel, raw) {
         if (sm) boundHere.add(sm[1]);
       }
     }
-    if (/module\.exports\s*=/.test(l)) continue;
+    // A `module.exports = ...` line is an export, not a use — but only
+    // when it STARTS the line. `module.exports` chained mid-line
+    // (`var app = module.exports = express()`) also calls express() on
+    // the same line, so the line is scanned with only the `module` /
+    // `exports` identifiers dropped. (A pure `module.exports =
+    // express()` — exporting a call result — is still skipped: a known
+    // gap, the call is not counted.)
+    if (/^\s*module\.exports\s*=/.test(l)) continue;
+    var skipExportsIds = /module\.exports\b/.test(l) ? new Set(['module', 'exports']) : null;
     var declared = declaredOnLine[lineNo2] || new Set();
+    // Decorator line (`@app.command()`, `@Component({...})`,
+    // `@register(MyClass)`): the dotted member chain after the
+    // decorator object is dropped — `command` in `@app.command()` is a
+    // member of the decorator object, not a reference to a same-named
+    // local function, so a decorated `def command` is not
+    // self-referenced by its own decorator. The decorator object
+    // itself and any decorator arguments (`MyClass` above) are real
+    // references and are kept. (Multi-line decorators only guard their
+    // first line — a known limitation.)
+    var isDecLine = /^\s*@/.test(l);
+    var decChain = new Set();
+    if (isDecLine) {
+      var chainM = l.trim().slice(1).match(/^([A-Za-z_$][\w$]*)((?:\.[A-Za-z_$][\w$]*)*)/);
+      if (chainM) {
+        (chainM[2].match(/[A-Za-z_$][\w$]*/g) || []).forEach(function (n) { decChain.add(n); });
+      }
+    }
     identifiers(l).forEach(function (id) {
       if (JS_KEYWORDS.has(id)) return;
       if (declared.has(id)) return; // declaration site, not a use
       if (boundHere && boundHere.has(id)) return; // import binding, not a use
+      if (skipExportsIds && skipExportsIds.has(id)) return; // the `module.exports` tokens themselves
+      if (decChain.has(id)) return;
       parsed.references.add(id);
     });
     var callRe = /([A-Za-z_$][\w$]*)\s*\(/g;
@@ -541,7 +641,18 @@ function parseJs(rel, raw) {
       if (JS_KEYWORDS.has(cm2[1])) continue;
       if (declared.has(cm2[1])) continue; // `function foo(` is not a call
       if (boundHere && boundHere.has(cm2[1])) continue;
+      if (decChain.has(cm2[1])) continue;
       parsed.calls.add(cm2[1]);
+    }
+    // `new Client()` invokes the class constructor: without this, a
+    // constructor method was flagged REVIEW ("0 callers") even though
+    // the class is constructed in-repo. The constructed class name is
+    // kept so the cross-file pass can resolve it through imports.
+    var newRe = /\bnew\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    var nm;
+    while ((nm = newRe.exec(l)) !== null) {
+      parsed.calls.add('constructor');
+      parsed.constructed.add(nm[1]);
     }
   }
   // Import locals are references only when used elsewhere; the import line
@@ -551,12 +662,13 @@ function parseJs(rel, raw) {
   // same block, and if (false) branches.
   var depth = 0;
   var terminatedAt = null; // brace depth where the block was terminated
+  var terminatedLineU = -1; // line of the return/throw/break/continue
   var rawLinesU = raw.split('\n');
   for (var ui = 0; ui < lines.length; ui++) {
     var ul = lines[ui];
     var dBefore = depth;
     depth += (ul.match(/\{/g) || []).length - (ul.match(/\}/g) || []).length;
-    if (terminatedAt !== null && depth < terminatedAt) terminatedAt = null;
+    if (terminatedAt !== null && depth < terminatedAt) { terminatedAt = null; terminatedLineU = -1; }
     var trimmed = ul.trim();
     if (/^\s*if\s*\(\s*false\s*\)/.test(ul)) {
       parsed.unreachable.push({ line: ui + 1, reason: 'if (false) branch is never taken', snippet: trimmed.slice(0, 120) });
@@ -565,11 +677,29 @@ function parseJs(rel, raw) {
     // A line that closes a block opens a new one: `} catch`, `} else`,
     // `} finally`, or the end of the block itself — the code after it is
     // reachable again, and the line itself is not a statement.
-    if (trimmed.startsWith('}')) { terminatedAt = null; continue; }
+    if (trimmed.startsWith('}')) { terminatedAt = null; terminatedLineU = -1; continue; }
     // A new switch case is reachable even after a `break`.
-    if (/^case\b/.test(trimmed) || /^default\s*:/.test(trimmed)) { terminatedAt = null; continue; }
+    if (/^case\b/.test(trimmed) || /^default\s*:/.test(trimmed)) { terminatedAt = null; terminatedLineU = -1; continue; }
     if (terminatedAt !== null && dBefore >= terminatedAt && trimmed !== '' && !trimmed.startsWith('//') && /[A-Za-z0-9_$]/.test(trimmed)) {
-      parsed.unreachable.push({ line: ui + 1, reason: 'code after return/throw/break/continue', snippet: trimmed.slice(0, 120) });
+      // A continuation line of a multi-line expression (the previous line
+      // ends with an operator, comma or open bracket, or this line starts
+      // with one) is part of the same statement, not a new unreachable
+      // statement — without this, one finding was emitted per line
+      // (`return comparer ? ...` split over lines). Intentional
+      // unreachable code marked `/* istanbul ignore next */` is skipped
+      // too (the author knows it never runs); the marker sits on the
+      // terminating statement or the line above it.
+      var prevTrimmed = ui > 0 ? lines[ui - 1].trim() : '';
+      var isContinuation = /^[?:,)\].&|+]/.test(trimmed) || /[({[,&|?:+\-*/%=<>!]$/.test(prevTrimmed);
+      var checkIgnoredU = function (row) {
+        var a = rawLinesU[row] || '';
+        var b = row > 0 ? (rawLinesU[row - 1] || '') : '';
+        return /istanbul ignore/.test(a) || /istanbul ignore/.test(b)
+          || /pragma:\s*no cover/.test(a) || /pragma:\s*no cover/.test(b);
+      };
+      if (!isContinuation && !checkIgnoredU(ui) && !checkIgnoredU(terminatedLineU)) {
+        parsed.unreachable.push({ line: ui + 1, reason: 'code after return/throw/break/continue', snippet: trimmed.slice(0, 120) });
+      }
       continue;
     }
     if (/^\s*(return|throw|break|continue)\b/.test(ul)) {
@@ -578,11 +708,20 @@ function parseJs(rel, raw) {
       // and so does a return whose value is a template literal spanning
       // lines (its `${...}` expressions look like code but are not
       // statements). Detect the unclosed backtick on the raw line.
+      // And a return that is the body of a BRACELESS if/for/while (the
+      // control header is the previous line, with no `{`) only exits
+      // conditionally — it does not terminate the block. Without this,
+      // the statement after it was flagged unreachable (commander:
+      // `if (str === undefined ...) return this._description;` followed
+      // by a reachable assignment).
       var opens = (ul.match(/[\{\(\[]/g) || []).length;
       var closes = (ul.match(/[\}\)\]]/g) || []).length;
       var rawLineU = rawLinesU[ui] || '';
       var bt = (rawLineU.match(/`/g) || []).length;
-      if (opens <= closes && bt % 2 === 0) terminatedAt = dBefore;
+      var prevU = '';
+      for (var pi = ui - 1; pi >= 0; pi--) { if (lines[pi].trim() !== '') { prevU = lines[pi]; break; } }
+      var braceless = /^\s*else\s*$/.test(prevU) || /^\s*(if|else\s+if|for|while)\b[^;{]*\)\s*$/.test(prevU);
+      if (opens <= closes && bt % 2 === 0 && !braceless) { terminatedAt = dBefore; terminatedLineU = ui; }
     }
   }
 
@@ -603,7 +742,8 @@ function parsePy(rel, raw) {
     unreachable: [], decorators: [], dunder: new Set(), strings: strings,
   };
 
-  var classStack = []; // {name, indent}
+  var classStack = []; // {name, indent, model}
+  var funcStack = []; // {indent} — def lines, so a local inside a method is not a class field
   var pendingDecorators = [];
   var declaredOnLine = {};
 
@@ -623,6 +763,7 @@ function parsePy(rel, raw) {
     if (trimmed === '') continue;
     var indent = indentOf(line);
     while (classStack.length && indent <= classStack[classStack.length - 1].indent) classStack.pop();
+    while (funcStack.length && indent <= funcStack[funcStack.length - 1].indent) funcStack.pop();
 
     if (/^@/.test(trimmed)) {
       pendingDecorators.push(trimmed);
@@ -639,30 +780,64 @@ function parsePy(rel, raw) {
       parsed.definitions.push(def);
       if (/^__.*__$/.test(dm[2])) parsed.dunder.add(dm[2]);
       markDeclared(lineNo, dm[2]);
+      funcStack.push({ indent: indent });
       pendingDecorators = [];
       continue;
     }
     var cm = line.match(/^(\s*)class\s+([A-Za-z_]\w*)/);
     if (cm) {
+      // A Pydantic BaseModel subclass or a @dataclass is a model class:
+      // its class attributes are framework-populated fields (see the
+      // assignment branch below).
+      var baseM = line.match(/\(([^)]*)\)/);
+      var bases = baseM ? baseM[1] : '';
+      var isModelClass = /BaseModel|TypedDict/.test(bases) || pendingDecorators.some(function (d) { return /dataclass/.test(d); });
       parsed.definitions.push({
         name: cm[2], kind: 'class', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
       });
       markDeclared(lineNo, cm[2]);
-      classStack.push({ name: cm[2], indent: indent });
+      classStack.push({ name: cm[2], indent: indent, model: isModelClass });
       pendingDecorators = [];
+      continue;
+    }
+    // Module-level variable assignment: `NAME = ...` or an annotated
+    // `NAME: type = ...`. The name is marked declared so its own line
+    // does not count as a use of itself. Dunder names (`__version__`,
+    // `__all__`) are packaging/protocol metadata and are kept by the
+    // dunder rule. A class attribute inside a Pydantic BaseModel /
+    // @dataclass is a framework-populated model field (KEEP, never
+    // SAFE); other class attributes and function locals are not module
+    // definitions and are skipped.
+    var am = line.match(/^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^=]/);
+    // A field is directly in the class body (not inside a method: a
+    // local inside a method sits deeper than the enclosing def).
+    var inFunction = funcStack.length > 0 && indent > funcStack[funcStack.length - 1].indent;
+    var enclosingModel = !inFunction && classStack.length > 0 && indent > classStack[classStack.length - 1].indent && classStack[classStack.length - 1].model;
+    if (am && (indent === 0 || enclosingModel)) {
+      parsed.definitions.push({
+        name: am[2], kind: 'variable', exported: false,
+        startLine: lineNo, endLine: lineNo, decorators: [],
+        frameworkField: Boolean(enclosingModel),
+      });
+      if (/^__.*__$/.test(am[2])) parsed.dunder.add(am[2]);
+      markDeclared(lineNo, am[2]);
       continue;
     }
     if (pendingDecorators.length) pendingDecorators = [];
   }
 
-  // __all__ makes names public exports.
-  var allMatch = raw.match(/__all__\s*=\s*\[([^\]]*)\]/);
+  // __all__ makes names public exports — and listing a name there is a
+  // use of it (a re-export), so the name is added to references too.
+  // List and tuple forms, multiline, and += all count (the CLI's
+  // tree-sitter parser handles the same shapes).
+  var allMatch = raw.match(/__all__\s*\+?=\s*[\[(]([\s\S]*?)[\])]/);
   if (allMatch) {
     var am;
     var allRe = /['"]([^'"]+)['"]/g;
     while ((am = allRe.exec(allMatch[1])) !== null) {
       parsed.imports.push({ source: '__all__', names: [{ imported: am[1], local: am[1], kind: 'named' }], sideEffect: false, reExport: false, allExport: true });
+      parsed.references.add(am[1]);
     }
   }
   // Top-level public names are importable in Python.
@@ -674,6 +849,15 @@ function parsePy(rel, raw) {
   // Imports. In a package __init__.py every import is a re-export: it
   // defines the package's public namespace (pkg.utils, pkg.run), so the
   // dead-import check must never flag it — same rule as the CLI.
+  // The same holds for a redundant alias (`from x import Y as Y`), a
+  // `# noqa` import, and imports in a compat shim (compat.py /
+  // _compat/): the names are the module's public API, not dead code.
+  // (Mirrors src/parse-py.js.)
+  var isPackageInit = baseOf(rel) === '__init__.py';
+  var isCompatShimPy = /(^|\/)(_?compat)(\.py)?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
+  function reExportPy(stmt, redundantAlias) {
+    return isPackageInit || isCompatShimPy || /#\s*noqa\b/.test(stmt) || Boolean(redundantAlias);
+  }
   // An import statement can span lines — a parenthesized from-import
   // (`from x import (\n a,\n)`) or a backslash continuation
   // (`import a, \\\n b`). The statement is accumulated until its parens
@@ -684,7 +868,6 @@ function parsePy(rel, raw) {
   // (and a trailing backslash would be recorded as a bogus import named
   // `\`). A star import is kind 'namespace', matching the CLI — the
   // dead-import check skips it, a wildcard is not a name.
-  var isPackageInit = baseOf(rel) === '__init__.py';
   var importLines = {}; // 1-based line numbers covered by an import statement
   function parenDepth(s) {
     var d = 0;
@@ -708,23 +891,31 @@ function parsePy(rel, raw) {
   }
   function fromNames(text) {
     var names = [];
+    var redundantAlias = false;
     text.replace(/[()\\]/g, ' ').split(',').forEach(function (part) {
       part = part.trim();
       if (!part) return;
       var bits = part.split(/\s+as\s+/);
       var imported = bits[0].trim();
-      names.push({ imported: imported, local: (bits[1] || imported).trim(), kind: imported === '*' ? 'namespace' : 'named' });
+      var local = (bits[1] || imported).trim();
+      if (bits[1] && local === imported) redundantAlias = true;
+      names.push({ imported: imported, local: local, kind: imported === '*' ? 'namespace' : 'named' });
     });
-    return names;
+    return { names: names, redundantAlias: redundantAlias };
   }
   for (var ii = 0; ii < lines.length; ii++) {
     var il = lines[ii];
     var fm = il.match(/^\s*from\s+(\.+)?([\w.]*)\s+import\s+(.+)$/);
     if (fm) {
+      // `from __future__ import annotations` is a compiler directive,
+      // not an import — it is never dead, and the CLI does not record it
+      // either. Skip it so `annotations` is never flagged.
+      if (fm[2] === '__future__') continue;
       var acc = accumulateImport(ii, fm[3]);
       ii = acc.next;
+      var fn = fromNames(acc.stmt);
       parsed.imports.push({
-        source: fm[2] || '', names: fromNames(acc.stmt), sideEffect: false, reExport: isPackageInit,
+        source: fm[2] || '', names: fn.names, sideEffect: false, reExport: reExportPy(acc.stmt, fn.redundantAlias),
         fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
       });
       continue;
@@ -734,16 +925,19 @@ function parsePy(rel, raw) {
       var acc2 = accumulateImport(ii, im2[1]);
       ii = acc2.next;
       var names3 = [];
+      var redundantAlias2 = false;
       acc2.stmt.replace(/[()\\]/g, ' ').split(',').forEach(function (part) {
         part = part.trim();
         if (!part) return;
         var bits = part.split(/\s+as\s+/);
         var mod = bits[0].trim();
-        names3.push({ imported: mod.split('.')[0], local: (bits[1] || mod.split('.')[0]).trim(), kind: 'named', full: mod });
+        var local2 = (bits[1] || mod.split('.')[0]).trim();
+        if (bits[1] && local2 === mod) redundantAlias2 = true;
+        names3.push({ imported: mod.split('.')[0], local: local2, kind: 'named', full: mod });
       });
       parsed.imports.push({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
-        names: names3, sideEffect: false, reExport: isPackageInit, fromImport: false, relative: false, level: 0,
+        names: names3, sideEffect: false, reExport: reExportPy(acc2.stmt, redundantAlias2), fromImport: false, relative: false, level: 0,
       });
     }
   }
@@ -757,15 +951,30 @@ function parsePy(rel, raw) {
   // `references` here and no unused Python import was ever flagged.
   // Imports in __init__.py are re-exports (they define the package
   // namespace), so they are marked reExport below and never flagged.
+  var rawLinesPy = raw.split('\n');
   for (var ri = 0; ri < lines.length; ri++) {
     var rl = lines[ri];
     var rNo = ri + 1;
     if (importLines[rNo]) continue;
     if (/^\s*(import|from)\b/.test(rl)) continue;
     var declared = declaredOnLine[rNo] || new Set();
+    // Decorator line (`@app.command()`): the dotted member chain after
+    // the decorator object is dropped — `command` is a member of the
+    // decorator object, not a reference to a same-named local function.
+    // The decorator object and any decorator arguments are real
+    // references and are kept. (Multi-line decorators only guard their
+    // first line — a known limitation.)
+    var decChainPy = new Set();
+    if (/^\s*@/.test(rl)) {
+      var chainPy = rl.trim().slice(1).match(/^([A-Za-z_]\w*)((?:\.[A-Za-z_]\w*)*)/);
+      if (chainPy) {
+        (chainPy[2].match(/[A-Za-z_]\w*/g) || []).forEach(function (n) { decChainPy.add(n); });
+      }
+    }
     identifiers(rl).forEach(function (id) {
       if (PY_KEYWORDS.has(id)) return;
       if (declared.has(id)) return;
+      if (decChainPy.has(id)) return;
       parsed.references.add(id);
     });
     var callRe2 = /([A-Za-z_]\w*)\s*\(/g;
@@ -773,11 +982,53 @@ function parsePy(rel, raw) {
     while ((cm3 = callRe2.exec(rl)) !== null) {
       if (PY_KEYWORDS.has(cm3[1])) continue;
       if (declared.has(cm3[1])) continue;
+      if (decChainPy.has(cm3[1])) continue;
       parsed.calls.add(cm3[1]);
       if (['getattr', 'importlib', '__import__', 'eval', 'exec'].indexOf(cm3[1]) >= 0) {
         parsed.dynamic = true;
         parsed.dynamicReasons.push('dynamic ' + cm3[1] + '() at line ' + rNo);
       }
+    }
+    // String annotations: the identifiers inside a string used as a
+    // type annotation are real references — `ctx: "Context"`,
+    // `def f() -> "list[Buffer]"`, `cast("Context", x)`. This runs on
+    // the RAW line (string contents are blanked in the stripped code).
+    // The CLI's tree-sitter parser detects annotation positions
+    // precisely; here a regex over `:` / `->` / cast( covers the common
+    // shapes, and a type-like filter (at least one capitalised
+    // identifier) keeps plain string values (`"b"`, `"hello"`) from
+    // counting.
+    var annRe = /(?:->|:|cast\()\s*["']([^"']+)["']/g;
+    var ann;
+    while ((ann = annRe.exec(rawLinesPy[ri] || '')) !== null) {
+      if (!/[A-Z]/.test(ann[1])) continue;
+      var annIds = ann[1].match(/[A-Za-z_]\w*/g) || [];
+      annIds.forEach(function (id) {
+        if (!PY_KEYWORDS.has(id)) parsed.references.add(id);
+      });
+    }
+    // A TypeAlias value is a type expression: `HookType: TypeAlias =
+    // Callable[["Response"], Any]` — "Response" is a forward reference,
+    // so the TYPE_CHECKING import of Response is live.
+    if (/:\s*TypeAlias\s*=/.test(rawLinesPy[ri] || '')) {
+      var taRe = /["']([^"']+)["']/g;
+      var ta;
+      while ((ta = taRe.exec(rawLinesPy[ri] || '')) !== null) {
+        if (!/[A-Z]/.test(ta[1])) continue;
+        (ta[1].match(/[A-Za-z_]\w*/g) || []).forEach(function (id) {
+          if (!PY_KEYWORDS.has(id)) parsed.references.add(id);
+        });
+      }
+    }
+    // %-format placeholders are uses: `"%(complete_func)s" % vars`
+    // looks the name up in a mapping at runtime, so a TypedDict field
+    // (or a variable) named in a placeholder is live — even in the
+    // same file, where the plain string pass does not count. The
+    // lookbehind skips `%%(name)s`, an escaped literal percent.
+    var phRe = /(?<!%)%\(([A-Za-z_][A-Za-z0-9_]*)\)[sdifr%]/g;
+    var ph;
+    while ((ph = phRe.exec(rawLinesPy[ri] || '')) !== null) {
+      parsed.references.add(ph[1]);
     }
   }
   if (/\bimportlib\b/.test(code)) {
@@ -788,19 +1039,30 @@ function parsePy(rel, raw) {
   // Unreachable code: statements after return/raise/break/continue at the
   // same indent, until the block dedents.
   var terminatedIndent = null;
+  var terminatedLinePy = -1; // line of the return/raise/break/continue
   for (var ui2 = 0; ui2 < lines.length; ui2++) {
     var ul2 = lines[ui2];
     var t2 = ul2.trim();
     if (t2 === '') continue;
     var ind2 = indentOf(ul2);
-    if (terminatedIndent !== null && ind2 < terminatedIndent) terminatedIndent = null;
+    if (terminatedIndent !== null && ind2 < terminatedIndent) { terminatedIndent = null; terminatedLinePy = -1; }
     if (terminatedIndent !== null && ind2 === terminatedIndent) {
       // A lone closing bracket belongs to the multi-line return above it.
       if (/^[\]\)}]+$/.test(t2)) continue;
+      // Intentional unreachable code, marked `# pragma: no cover`
+      // (`yield` after a raise keeps a function a generator): the
+      // author knows it never runs, so it is not dead code to delete.
+      // The marker sits on the terminating statement or the line above it.
+      var checkPragmaPy = function (row) {
+        var a = rawLinesPy[row] || '';
+        var b = row > 0 ? (rawLinesPy[row - 1] || '') : '';
+        return /pragma:\s*no cover/.test(a) || /pragma:\s*no cover/.test(b);
+      };
+      if (checkPragmaPy(ui2) || checkPragmaPy(terminatedLinePy)) continue;
       parsed.unreachable.push({ line: ui2 + 1, reason: 'code after return/raise/break/continue', snippet: t2.slice(0, 120) });
       continue;
     }
-    if (/^\s*(return|raise|break|continue)\b/.test(ul2)) terminatedIndent = ind2;
+    if (/^\s*(return|raise|break|continue)\b/.test(ul2)) { terminatedIndent = ind2; terminatedLinePy = ui2; }
   }
 
   return parsed;
@@ -810,16 +1072,89 @@ function parsePy(rel, raw) {
 /* Import resolution                                                   */
 /* ------------------------------------------------------------------ */
 
-function resolveJsRelative(fromFile, source, existingFiles) {
-  if (!source.startsWith('.')) return null;
-  var base = joinPosix(dirOf(fromFile), source);
+function resolveFromBase(base, existingFiles) {
   var candidates = [];
   if (/\.[a-z]+$/i.test(base)) candidates.push(base);
+  // TypeScript ESM style: source files import `./x.js` but the file on
+  // disk is `x.ts` (tsc rewrites the extension at build time). Without
+  // this, every `.js`-suffixed import in a TS repo missed its edge and
+  // the target's exports looked dead. (Mirrors src/graph.js.)
+  if (/\.js$/i.test(base)) {
+    ['.ts', '.tsx', '.d.ts', '.mts', '.cts'].forEach(function (ext) { candidates.push(base.slice(0, -3) + ext); });
+  }
   JS_EXTS.concat(PY_EXTS).forEach(function (ext) { candidates.push(base + ext); });
   JS_EXTS.concat(PY_EXTS).forEach(function (ext) { candidates.push(joinPosix(base, 'index' + ext)); });
   candidates.push(joinPosix(base, '__init__.py'));
   for (var i = 0; i < candidates.length; i++) {
     if (existingFiles.has(candidates[i])) return candidates[i];
+  }
+  return null;
+}
+
+function resolveJsRelative(fromFile, source, existingFiles) {
+  if (!source.startsWith('.')) return null;
+  return resolveFromBase(joinPosix(dirOf(fromFile), source), existingFiles);
+}
+
+/**
+ * tsconfig / jsconfig `paths` aliases (`@/*` -> `./src/*`), the
+ * standard Next.js / Vite / monorepo import style. `tsConfigs` is the
+ * list of {dir, baseUrl, paths} built from the dropped files' tsconfig /
+ * jsconfig files (see analyzeFiles). `extends` is NOT followed yet.
+ * (Mirrors src/graph.js.)
+ */
+function loadTsAliases(textFiles) {
+  var out = [];
+  textFiles.forEach(function (f) {
+    var base = baseOf(f.rel);
+    if (base !== 'tsconfig.json' && base !== 'jsconfig.json') return;
+    var cfg;
+    try { cfg = JSON.parse(f.content); } catch (_) { return; }
+    var opts = (cfg && cfg.compilerOptions) || {};
+    if (!opts.paths || typeof opts.paths !== 'object') return;
+    var dir = dirOf(f.rel);
+    var baseUrl = opts.baseUrl ? joinPosix(dir, opts.baseUrl) : dir;
+    var paths = [];
+    Object.keys(opts.paths).forEach(function (pattern) {
+      var targets = opts.paths[pattern];
+      if (!Array.isArray(targets)) return;
+      var star = pattern.indexOf('*');
+      paths.push({
+        prefix: star < 0 ? pattern : pattern.slice(0, star),
+        suffix: star < 0 ? '' : pattern.slice(star + 1),
+        hasStar: star >= 0,
+        targets: targets.filter(function (t) { return typeof t === 'string'; }),
+      });
+    });
+    if (paths.length) out.push({ dir: dir, baseUrl: baseUrl, paths: paths });
+  });
+  return out;
+}
+
+function resolveAlias(fromFile, source, aliases, existingFiles) {
+  // Nearest config to the importing file wins. A root tsconfig has
+  // dir '' and matches every file.
+  var best = null;
+  aliases.forEach(function (a) {
+    if (a.dir === '' || fromFile === a.dir || fromFile.indexOf(a.dir + '/') === 0) {
+      if (!best || a.dir.length > best.dir.length) best = a;
+    }
+  });
+  if (!best) return null;
+  for (var i = 0; i < best.paths.length; i++) {
+    var p = best.paths[i];
+    var rest = null;
+    if (p.hasStar) {
+      if (source.indexOf(p.prefix) !== 0 || source.slice(-p.suffix.length) !== p.suffix) continue;
+      rest = source.slice(p.prefix.length, source.length - p.suffix.length);
+    } else if (source === p.prefix) {
+      rest = '';
+    } else continue;
+    for (var j = 0; j < p.targets.length; j++) {
+      var mapped = p.hasStar ? p.targets[j].replace('*', rest) : p.targets[j];
+      var target = resolveFromBase(joinPosix(best.baseUrl, mapped), existingFiles);
+      if (target) return target;
+    }
   }
   return null;
 }
@@ -931,6 +1266,19 @@ function looksLikeEntry(rel, abs, pkgEntries, raw) {
 
 function analyzeFiles(inputFiles, options) {
   options = options || {};
+  // The same file must never be scanned twice: a duplicated input (the
+  // browser drag-and-drop path can hand the same file twice) used to
+  // duplicate every finding for it.
+  var seenPaths = new Set();
+  var deduped = [];
+  (inputFiles || []).forEach(function (f) {
+    if (!f || typeof f.path !== 'string') return;
+    var rel0 = f.path.replace(/^\.\//, '').replace(/\\/g, '/');
+    if (seenPaths.has(rel0)) return;
+    seenPaths.add(rel0);
+    deduped.push(f);
+  });
+  inputFiles = deduped;
   var files = Object.create(null); // rel path -> {rel, language, parsed, raw, size}
   var existingFiles = new Set();
   var textFiles = []; // {rel, content} for the string-reference pass
@@ -959,12 +1307,36 @@ function analyzeFiles(inputFiles, options) {
   });
 
   var pkgEntries = packageJsonEntries(pkg, pkgDir);
+  // Published-library detection (matches the CLI's fileKind): a repo
+  // with a package.json that has `exports` (and is not private), or a
+  // pyproject.toml / setup.py / setup.cfg with a project name, is a
+  // published library — its unimported files are public surface, so a
+  // dead file is REVIEW, never SAFE.
+  var isLibrary = false;
+  textFiles.forEach(function (f) {
+    var base = baseOf(f.rel);
+    if (base === 'package.json') {
+      try {
+        var p = JSON.parse(f.content);
+        if (p && p.exports && !p.private) isLibrary = true;
+      } catch (_) {}
+    } else if (base === 'pyproject.toml') {
+      if (/\[project\]/.test(f.content) && /^\s*name\s*=/m.test(f.content)) isLibrary = true;
+    } else if (base === 'setup.py' || base === 'setup.cfg') {
+      isLibrary = true;
+    }
+  });
   var entries = Object.create(null); // rel -> reason
   Object.keys(files).forEach(function (rel) {
     var info = files[rel];
     var e = looksLikeEntry(rel, rel, pkgEntries, info.raw);
     if (e.entry) entries[rel] = e.reason;
   });
+
+  // tsconfig / jsconfig `paths` aliases (`@/*` -> `./src/*`): without
+  // these, every `@/lib/...` import misses its edge and the target's
+  // exports look dead (umami's dominant false-positive family).
+  var tsAliases = loadTsAliases(textFiles);
 
   // Import edges.
   var importers = Object.create(null); // target rel -> Set of importer rels
@@ -989,6 +1361,11 @@ function analyzeFiles(inputFiles, options) {
       var target = null;
       if (imp.source && imp.source.charAt(0) === '.') {
         target = resolveJsRelative(rel, imp.source, existingFiles);
+      } else if (info.language !== 'py' && imp.source) {
+        // tsconfig/jsconfig `paths` aliases (`@/lib/...`): the standard
+        // Next.js / Vite / monorepo import style. A bare specifier that
+        // is not an alias is an external dependency.
+        target = resolveAlias(rel, imp.source, tsAliases, existingFiles);
       } else if (info.language === 'py' && imp.source) {
         target = resolvePyModule(rel, imp.source, existingFiles);
         if (target && imp.fromImport) {
@@ -1139,13 +1516,59 @@ function analyzeFiles(inputFiles, options) {
       Object.keys(targetMap).forEach(function (name) {
         if (importerInfo.parsed.references.has(name)) targetMap[name].importedBy.add(rel);
       });
+      // Re-exported modules: an importer that reaches a package through
+      // its __init__ (`import typer`, `from typer import colors`) and
+      // then uses `typer.colors.RED` touches colors.py's RED, even
+      // though the import edge points at __init__.py, not colors.py.
+      // (Mirrors the CLI's reExports map in src/graph.js.)
+      if (baseOf(e.target) === '__init__.py') {
+        var initInfo = files[e.target];
+        var initEdges = importsByFile[e.target] || [];
+        if (initInfo && initInfo.parsed) {
+          initInfo.parsed.imports.forEach(function (rimp) {
+            if (!rimp.reExport) return;
+            (rimp.names || []).forEach(function (rn) {
+              var modName = rn.local || rn.imported;
+              if (!modName) return;
+              var reachesModule = (e.names || []).some(function (n) { return n.imported === modName || n.local === modName; })
+                || importerInfo.parsed.references.has(modName);
+              if (!reachesModule) return;
+              initEdges.forEach(function (ie) {
+                if (!(ie.names || []).some(function (n) { return n.local === modName || n.imported === modName; })) return;
+                var subMap = symbolUsage[ie.target];
+                if (!subMap) return;
+                Object.keys(subMap).forEach(function (name) {
+                  if (importerInfo.parsed.references.has(name)) subMap[name].importedBy.add(rel);
+                });
+              });
+            });
+          });
+        }
+      }
+      // Constructor calls across files: `new Client()` in an importer
+      // that imports Client from another file calls that file's
+      // `constructor` method. Same-file construction is already covered
+      // by the same-file calls pass above.
+      if (importerInfo.parsed.constructed) {
+        importerInfo.parsed.constructed.forEach(function (cls) {
+          if ((e.names || []).some(function (n) { return n.local === cls || n.imported === cls; })) {
+            if (targetMap['constructor']) targetMap['constructor'].calledIn.add(rel);
+          }
+        });
+      }
     });
   });
 
   // Grading, mirroring the CLI confidence engine.
   var findings = [];
+  var seenFindings = new Set();
   function add(f) {
     f.id = f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0);
+    // The same finding must never repeat: a symbol can be reached by
+    // several passes (file loop, symbol loop, dependency loop), and a
+    // duplicated finding used to repeat up to 444x on real repos.
+    if (seenFindings.has(f.id)) return null;
+    seenFindings.add(f.id);
     findings.push(f);
     return f;
   }
@@ -1155,7 +1578,7 @@ function analyzeFiles(inputFiles, options) {
     if (!info.parsed) return; // never flag what we could not parse
     var parsed = info.parsed;
     var isEntry = Boolean(entries[rel]);
-    var isTest = TEST_FILE.test(rel);
+    var isTest = TEST_FILE.test(rel) || TEST_DIR.test(rel);
     var isConfig = CONFIG_FILE.test(rel);
     var isRouteFile = ROUTE_DIR.test(rel);
     var keepFile = isEntry || isTest || isConfig || isRouteFile;
@@ -1187,6 +1610,13 @@ function analyzeFiles(inputFiles, options) {
             reason: 'no importers, but referenced by name as a string elsewhere',
             evidence: { importers: 0, reachable: false, stringRefs: stringRefs },
           });
+        } else if (isLibrary) {
+          add({
+            category: 'file', file: rel, symbol: null, grade: 'REVIEW',
+            startLine: 1, endLine: null, size: info.size,
+            reason: 'no importers, but this is a published library — public surface, review before deleting',
+            evidence: { importers: 0, reachable: false, stringRefs: [] },
+          });
         } else {
           add({
             category: 'file', file: rel, symbol: null, grade: 'SAFE',
@@ -1201,6 +1631,15 @@ function analyzeFiles(inputFiles, options) {
 
     // Dead symbols.
     var usageMap = symbolUsage[rel] || Object.create(null);
+    // Names with at least one @overload-decorated definition form an
+    // overload group: the stubs are type information and the
+    // implementation is invoked through the overloaded name.
+    var overloadedNames = new Set();
+    parsed.definitions.forEach(function (d) {
+      (d.decorators || []).forEach(function (dec) {
+        if (/(^|[@.])overload\b/.test(dec)) overloadedNames.add(d.name);
+      });
+    });
     var importLocals = new Set();
     parsed.imports.forEach(function (imp) {
       (imp.names || []).forEach(function (n) { importLocals.add(n.local); });
@@ -1230,6 +1669,14 @@ function analyzeFiles(inputFiles, options) {
         return;
       }
       if (importedBy.length > 0) return;
+      // A method called anywhere in-repo is alive. Cross-file method
+      // calls do not count as imports, so they need this branch — the
+      // same-file check above only covers calls from the defining file,
+      // and without it a constructor called via `new Client()` from an
+      // importer was still REVIEW.
+      if (def.kind === 'method' && usage.calledIn.size > 0) {
+        return;
+      }
 
       var stringHits = filesMentioning(def.name);
       var stringElsewhere = [];
@@ -1245,6 +1692,32 @@ function analyzeFiles(inputFiles, options) {
       // Framework keeps.
       if (FRAMEWORK_KEEP_EXPORTS.has(def.name)) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: 'framework-resolved export "' + def.name + '"' }));
+        return;
+      }
+      // Pydantic / dataclass model fields are populated by the framework
+      // from external data, never read by attribute in-repo.
+      if (def.frameworkField) {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: 'Pydantic/dataclass model field — populated by the framework, never read by attribute in-repo' }));
+        return;
+      }
+      // `declare module` / `declare global` augmentation is declaration
+      // merging: the declaration IS the use.
+      if (def.ambient) {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: 'declare module/global augmentation — declaration merging, the declaration IS the use' }));
+        return;
+      }
+      // An @overload group: the stubs are type information and the
+      // implementation is invoked through the overloaded name.
+      if (overloadedNames.has(def.name)) {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: '@overload group — stubs are type information and the implementation is invoked through the overloaded name' }));
+        return;
+      }
+      // Next.js middleware / proxy exports are framework-resolved, but
+      // only in middleware.ts / proxy.ts files — a `config` or
+      // `middleware` export elsewhere is ordinary code.
+      if ((def.name === 'middleware' || def.name === 'config') &&
+          (/middleware\.(js|jsx|ts|tsx)$/.test(rel) || /proxy\.(js|jsx|ts|tsx)$/.test(rel))) {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: 'Next.js middleware/proxy export "' + def.name + '"' }));
         return;
       }
       if ((def.decorators || []).some(function (d) {
@@ -1301,12 +1774,13 @@ function analyzeFiles(inputFiles, options) {
       });
     });
 
-    // Unreachable code.
+    // Unreachable code. Test files are KEEP at most: a test's
+    // unreachable branch is the test's business, never a SAFE delete.
     (parsed.unreachable || []).forEach(function (u) {
       add({
-        category: 'unreachable', file: rel, symbol: null, grade: 'SAFE',
+        category: 'unreachable', file: rel, symbol: null, grade: isTest ? 'KEEP' : 'SAFE',
         startLine: u.line, endLine: u.line, size: u.snippet ? u.snippet.length : 0,
-        reason: u.reason,
+        reason: isTest ? 'unreachable code in a test file (kept)' : u.reason,
         evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
         deleteDiff: u.snippet || '',
       });
