@@ -49,7 +49,7 @@ node bin/deadcode-map.js .
 
 It must report **0 findings**. If your change introduces a finding, fix the
 code (or the analyzer) — do not add a baseline to hide it. With
-`--include-fixtures` the planted fixture data still reports (380 findings,
+`--include-fixtures` the planted fixture data still reports (413 findings,
 0 in `src/`); that is expected.
 
 ## Rules for changes
@@ -73,7 +73,11 @@ code (or the analyzer) — do not add a baseline to hide it. With
   0) are KEEP — the runtime invokes them by reflection. An unused
   local whose initializer calls a method or creates an object is
   REVIEW, never SAFE — the call may have side effects; a pure unused
-  local (`int x = 1;`) stays SAFE.
+  local (`int x = 1;`) stays SAFE. The same rule applies to private
+  fields (batch 11): an unused private field whose initializer calls
+  a method or creates an object is REVIEW, never SAFE — the call runs
+  when the class loads / an instance is created, so deleting the
+  declaration would remove the call; a pure unused field stays SAFE.
 - The HTML map must stay single-file and offline: no CDN, no external scripts.
 - Do not break existing CLI flags or exit codes (0 ok, 1 `--fail-on`
   triggered, 2 usage error / no such directory).

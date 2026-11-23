@@ -1843,6 +1843,10 @@ const JAVA_FIXTURE_EXPECTATIONS = {
     'variable:src/SideEffectLocals.java:deferred',
     'variable:src/SideEffectLocals.java:pure',
   ]) },
+  'java-batch11-fields': { total: 8, safe: 2, review: 6, keep: 0, safeKeys: new Set([
+    'variable:src/SideEffectFields.java:deferred',
+    'variable:src/SideEffectFields.java:pure',
+  ]) },
 };
 
 for (const [dir, expected] of Object.entries(JAVA_FIXTURE_EXPECTATIONS)) {
@@ -1891,7 +1895,7 @@ test('web java: the web parser matches the CLI parser on every Java fixture', as
     };
   }
   const files = [];
-  for (const dir of ['java-basic', 'java-batch10-arity', 'java-batch10-policy', 'java-batch9-fj7']) {
+  for (const dir of ['java-basic', 'java-batch10-arity', 'java-batch10-policy', 'java-batch11-fields', 'java-batch9-fj7']) {
     const base = path.join(ROOT, 'fixtures', dir);
     (function walk(d) {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {

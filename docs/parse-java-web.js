@@ -278,14 +278,20 @@ function modifiersOf(node, src) {
   for (let i = 0; i < node.namedChildCount; i++) {
     const c = node.namedChild(i);
     if (c.type === 'modifiers') {
-      const raw = text(c, src);
-      if (/\bprivate\b/.test(raw)) mods.private = true;
-      if (/\bstatic\b/.test(raw)) mods.static = true;
-      if (/\bfinal\b/.test(raw)) mods.final = true;
-      if (/\bnative\b/.test(raw)) mods.native = true;
-      for (let j = 0; j < c.namedChildCount; j++) {
-        const m = c.namedChild(j);
-        if (m.type === 'marker_annotation' || m.type === 'annotation') {
+      // Test the modifier keyword nodes themselves, never the raw
+      // text: a comment sitting between two modifiers (`public
+      // /* private */ static`) or a word inside an annotation's
+      // string argument (`@Anno("private")`) used to flip the flags
+      // through the raw-text regexes. Modifier keywords are anonymous
+      // children of the modifiers node, and their type IS the keyword;
+      // comments and annotations are named children, never keywords.
+      for (let j = 0; j < c.childCount; j++) {
+        const m = c.child(j);
+        if (m.type === 'private') mods.private = true;
+        else if (m.type === 'static') mods.static = true;
+        else if (m.type === 'final') mods.final = true;
+        else if (m.type === 'native') mods.native = true;
+        else if (m.type === 'marker_annotation' || m.type === 'annotation') {
           mods.annotations.push(annotationSimpleName(m, src));
           mods.decorators.push(`@${annotationSimpleName(m, src)}`);
         }
@@ -324,6 +330,31 @@ function lastNonCommentChild(node) {
     if (!isComment(c)) return c;
   }
   return null;
+}
+
+// The class a `new` expression or `::new` reference actually
+// constructs: for a generic type, the base name — never a type
+// argument — and for a qualified name, the last segment. Splitting
+// the raw type text on non-word characters and taking the LAST
+// identifier took the last type argument instead:
+// `new TypeToken<List<Tweet>>()` recorded forClass=Tweet, and
+// `new java.util.ArrayList<String>()` recorded String.
+function constructedClassName(node, src) {
+  if (!node) return null;
+  if (node.type === 'generic_type') {
+    const base = node.namedChild(0);
+    return base && base.type !== 'type_arguments' ? constructedClassName(base, src) : null;
+  }
+  if (node.type === 'scoped_type_identifier') {
+    return constructedClassName(node.namedChild(node.namedChildCount - 1), src);
+  }
+  if (node.type === 'field_access') {
+    const f = childByField(node, 'field');
+    return f ? text(f, src) : null;
+  }
+  if (node.type === 'type_identifier' || node.type === 'identifier') return text(node, src);
+  const parts = text(node, src).split(/[^A-Za-z0-9_$]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : null;
 }
 // Number of real arguments in an argument_list: every named child
 // except comments. (Arguments are expressions; nothing else legal
@@ -387,10 +418,17 @@ function parseJavaWeb(filePath, src) {
     if (node.type === 'ERROR' || node.isMissing) hasError = true;
     if (node.type === 'string_literal') result.strings.push(text(node, src));
   });
+  // Bare-name references (see the addRef block below): a bare
+  // identifier or type-name read, never a method name. Declared here
+  // so the Javadoc pass below can join it, and the error early-return
+  // can report an empty set.
+  const bareReferences = new Set();
   if (hasError) {
     result.hasErrors = true;
     result.topLevelUses = [];
     result.topLevelUsesArity = [];
+    result.bareReferences = [];
+    result.topLevelBareUses = [];
     return result;
   }
 
@@ -405,7 +443,7 @@ function parseJavaWeb(filePath, src) {
   // import check only — it is NOT an occurrence, so it never lands in
   // a definition's uses or in topLevelUses, where it would wrongly
   // make a same-named definition a live root.
-  const addDocRef = (name) => { if (name) result.references.add(name); };
+  const addDocRef = (name) => { if (name) { result.references.add(name); bareReferences.add(name); } };
   walk(root, (node) => {
     if (node.type !== 'block_comment') return;
     const comment = text(node, src);
@@ -424,6 +462,24 @@ function parseJavaWeb(filePath, src) {
     if (!name) return;
     result.references.add(name);
     occurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
+  };
+  // Bare-name references: a bare identifier or type-name read, never
+  // the name of a method invocation or method reference (`foo()` calls
+  // the method `foo`; it does not read a field or local of that name).
+  // Same role as in parse-js.js / parse-py.js: a private field's only
+  // read signal was the name-keyed same-file flag, so a same-named
+  // method call kept a dead field alive. The set itself is declared
+  // above the Javadoc pass; Javadoc tag names join it too, preserving
+  // the old fail-open behaviour for names a doc comment mentions.
+  // bareOccurrences is the positioned twin of the bare set, so pass 4
+  // can attribute each bare read to the definition that contains it
+  // (a bare read inside a dead method must not keep a field alive).
+  const bareOccurrences = [];
+  const addBareRef = (name, node, startIndex) => {
+    if (!name) return;
+    addRef(name, node, startIndex);
+    bareReferences.add(name);
+    bareOccurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
   };
   const addArityOcc = (key, startIndex) => {
     if (!key) return;
@@ -537,12 +593,17 @@ function parseJavaWeb(filePath, src) {
     return false;
   }
 
-  // True when the declaration carries a `public` modifier (the
-  // modifiers child may be absent for package-private declarations).
+  // True when the declaration carries a real `public` modifier
+  // keyword. The raw-text regex used to match the word inside a
+  // comment between modifiers too (`static /* public */ final`),
+  // promoting a package-private member to public.
   function hasPublicModifier(node, srcText) {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);
-      if (c.type === 'modifiers' && /\bpublic\b/.test(text(c, srcText))) return true;
+      if (c.type !== 'modifiers') continue;
+      for (let j = 0; j < c.childCount; j++) {
+        if (c.child(j).type === 'public') return true;
+      }
     }
     return false;
   }
@@ -607,6 +668,16 @@ function parseJavaWeb(filePath, src) {
           // The whole declaration, so --fix can delete the statement
           // when every declarator in it is dead (see fix.js).
           statementRange: declarators.length > 1 ? rangeOf(node) : null,
+          // True when the initializer may run user code or change
+          // state (a method call, an object creation, an assignment
+          // or update inside it): deleting the declaration would
+          // remove that call, so the field is load-bearing, not dead
+          // (batch 11, the field analog of the FJ-3 local rule). A
+          // pure initializer (a literal, a name, arithmetic) is
+          // false and grades normally. Field initializers run when
+          // the class loads / an instance is created, so the call
+          // runs even though the field is never read.
+          initHasEffect: initializerHasEffect(childByField(d, 'value')),
         });
       }
     } else if (node.type === 'local_variable_declaration') {
@@ -794,6 +865,29 @@ function parseJavaWeb(filePath, src) {
           if (n) addBinding(node, text(n, src), d.startIndex, defByLocalNode.get(d.startIndex) || findLocalDef(d));
         }
       }
+    } else if (node.type === 'switch_block_statement_group') {
+      // A local declared in a switch case (`case 0: int x = ...`) is
+      // NOT a direct child of a block — it lives in the case group —
+      // so the block branch above never registers it, and its reads
+      // never resolve: readCount stayed 0 and the local was flagged
+      // SAFE even though live code reads it (gson's JsonReader
+      // pathIndex). Scope it to the enclosing switch block, which is
+      // its JLS scope (it stays visible to later cases), not just the
+      // group.
+      const switchBlock = node.parent && node.parent.type === 'switch_block' ? node.parent : null;
+      if (switchBlock) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const stmt = node.namedChild(i);
+          if (stmt.type === 'local_variable_declaration') {
+            for (let j = 0; j < stmt.namedChildCount; j++) {
+              const d = stmt.namedChild(j);
+              if (d.type !== 'variable_declarator') continue;
+              const n = childByField(d, 'name');
+              if (n) addBinding(switchBlock, text(n, src), d.startIndex, defByLocalNode.get(d.startIndex) || findLocalDef(d));
+            }
+          }
+        }
+      }
     } else if (node.type === 'enhanced_for_statement') {
       const n = childByField(node, 'name');
       if (n) addBinding(node, text(n, src), n.startIndex, null);
@@ -915,7 +1009,7 @@ function parseJavaWeb(filePath, src) {
   const SCOPE_NODE_TYPES = new Set([
     'method_declaration', 'constructor_declaration', 'lambda_expression',
     'block', 'constructor_body', 'for_statement', 'enhanced_for_statement',
-    'catch_clause',
+    'catch_clause', 'switch_block',
   ]);
 
   // visitNode handles one node (class-stack push/pop + scope push/pop +
@@ -936,12 +1030,12 @@ function parseJavaWeb(filePath, src) {
           if (b) {
             if (b.def) b.def._readCount += 1;
           } else {
-            addRef(name, node);
+            addBareRef(name, node);
           }
         }
       }
     } else if (node.type === 'type_identifier') {
-      if (!isDefinitionSite(node)) addRef(text(node, src), node);
+      if (!isDefinitionSite(node)) addBareRef(text(node, src), node);
     } else if (node.type === 'method_invocation') {
       const nameNode = childByField(node, 'name');
       if (nameNode) {
@@ -953,18 +1047,36 @@ function parseJavaWeb(filePath, src) {
         addArityOcc(`${name}/${arity}`, node.startIndex);
       }
     } else if (node.type === 'method_reference') {
+      // A `::new` reference constructs, and `new` is an ANONYMOUS
+      // child: the last named child is the type, never 'new' — the old
+      // `name === 'new'` test never fired, so `TypeToken::new`
+      // recorded a phantom method call named TypeToken, and
+      // `Outer.Inner::new` recorded nothing at all. Detect the
+      // anonymous `new` child directly; anything else is a plain
+      // method reference, whose last named child is the method name.
       // First / last named child, skipping comments: a `//` comment
       // before the type or after the name would otherwise be picked
       // up as the name or the type and the reference silently dropped.
-      const last = lastNonCommentChild(node);
-      if (last && last.type === 'identifier') {
-        const name = text(last, src);
-        if (name === 'new') {
-          const first = firstNonCommentChild(node);
-          const forClass = first ? text(first, src).split(/[^A-Za-z0-9_$]/).filter(Boolean).pop() : null;
-          result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity: null, forClass, methodRef: true });
-          addArityOcc(`constructor/*@${forClass || 'super'}`, node.startIndex);
-        } else {
+      let isNew = false;
+      for (let i = 0; i < node.childCount; i++) {
+        if (node.child(i).type === 'new') { isNew = true; break; }
+      }
+      if (isNew) {
+        const first = firstNonCommentChild(node);
+        const forClass = constructedClassName(first, src);
+        result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity: null, forClass, methodRef: true });
+        addArityOcc(`constructor/*@${forClass || 'super'}`, node.startIndex);
+        // The class name is a real reference: the identifier child of
+        // a `::new` reference is a definition site (the last named
+        // child, since `new` is anonymous), so the walk never records
+        // it — without this, `LinkedHashMap::new` left the import
+        // looking unused and it was flagged SAFE. The old phantom
+        // method call accidentally supplied this reference via addRef.
+        if (forClass && first) addBareRef(forClass, first);
+      } else {
+        const last = lastNonCommentChild(node);
+        if (last && last.type === 'identifier') {
+          const name = text(last, src);
           result.calls.push({ name, full: name, line: node.startPosition.row + 1, startIndex: node.startIndex, arity: null, methodRef: true });
           addRef(name, last);
           addArityOcc(`${name}/*`, node.startIndex);
@@ -974,8 +1086,7 @@ function parseJavaWeb(filePath, src) {
       const typeNode = childByField(node, 'type');
       const args = childByField(node, 'arguments');
       if (typeNode) {
-        const rawType = text(typeNode, src);
-        const forClass = rawType.split(/[^A-Za-z0-9_$]/).filter(Boolean).pop();
+        const forClass = constructedClassName(typeNode, src);
         const arity = argumentArity(args);
         result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity, forClass });
         addArityOcc(`constructor/${arity}@${forClass || 'super'}`, node.startIndex);
@@ -1094,9 +1205,11 @@ function parseJavaWeb(filePath, src) {
   const arityByDef = new Map();
   const topLevelUses = new Set();
   const topLevelUsesArity = new Set();
-  const attribute = (list, startIndex, name, isArity) => {
+  // Attribute one occurrence to the innermost definition containing
+  // it, or to the top level when no definition does.
+  const attributeInto = (map, top, startIndex, name) => {
     if (startIndex < 0) {
-      if (isArity) topLevelUsesArity.add(name); else topLevelUses.add(name);
+      top.add(name);
       return;
     }
     let best = null;
@@ -1107,20 +1220,31 @@ function parseJavaWeb(filePath, src) {
       }
     }
     if (best) {
-      const map = isArity ? arityByDef : usesByDef;
       if (!map.has(best)) map.set(best, new Set());
       map.get(best).add(name);
-    } else if (isArity) topLevelUsesArity.add(name);
-    else topLevelUses.add(name);
+    } else top.add(name);
+  };
+  const attribute = (list, startIndex, name, isArity) => {
+    attributeInto(isArity ? arityByDef : usesByDef, isArity ? topLevelUsesArity : topLevelUses, startIndex, name);
   };
   for (const occ of occurrences) attribute(occ, occ.startIndex, occ.name, false);
   for (const occ of arityOccurrences) attribute(occ, occ.startIndex, occ.key, true);
+  // Bare occurrences attribute the same way, into their own channel:
+  // a bare read of a field inside a dead method must not keep the
+  // field alive, so the confidence engine needs bare uses per live
+  // definition, not just the file-level bare set.
+  const bareUsesByDef = new Map();
+  const topLevelBareUses = new Set();
+  for (const occ of bareOccurrences) attributeInto(bareUsesByDef, topLevelBareUses, occ.startIndex, occ.name);
   for (const d of result.definitions) {
     d.uses = [...(usesByDef.get(d) || [])].sort();
     d.usesArity = [...(arityByDef.get(d) || [])].sort();
+    d.bareUses = [...(bareUsesByDef.get(d) || [])].sort();
   }
   result.topLevelUses = [...topLevelUses].sort();
   result.topLevelUsesArity = [...topLevelUsesArity].sort();
+  result.bareReferences = [...bareReferences].sort();
+  result.topLevelBareUses = [...topLevelBareUses].sort();
 
   // De-duplicate definitions (a node visited twice via two paths).
   const seen = new Set();

@@ -341,7 +341,17 @@ function parseJsTs(filePath, src, ext) {
       case 'method_definition':
       case 'method_signature': {
         const nameNode = childByField(node, 'name');
-        if (nameNode) addDef(text(nameNode, src), 'method', node);
+        if (nameNode) {
+          // A getter/setter is invoked by property access, not by a
+          // call: `get slots()` runs when code reads `ctx.slots`. The
+          // first child of a getter/setter definition is the anonymous
+          // `get`/`set` keyword; a plain method has none. The flag
+          // lets the grader credit a same-file property access as a
+          // use (a plain method needs a bare read or a bare call).
+          const first = node.child(0);
+          const accessor = first && (first.type === 'get' || first.type === 'set') ? first.type : null;
+          addDef(text(nameNode, src), 'method', node, accessor === 'get' ? { isGetter: true } : accessor === 'set' ? { isSetter: true } : undefined);
+        }
         break;
       }
       case 'decorator': {
@@ -427,10 +437,25 @@ function parseJsTs(filePath, src, ext) {
   // `references` stays the flat file-level set; occurrences are the
   // positioned twin used to build each definition's `uses` list.
   const occurrences = [];
+  // Bare-name references: identifiers read as values, type names, JSX
+  // component names and shorthand properties — never a member/property
+  // name (`obj.foo` names the member `foo`, not a variable `foo`) and
+  // never the base of a member call. The flat `references` set keeps
+  // every name (methods must stay live through `obj.method()`), but a
+  // LOCAL definition can only be read by its bare name: the old
+  // name-keyed same-file flag swallowed a dead local `foo` whenever
+  // the file also called a same-named method. Serialised as a sorted
+  // array, like topLevelUses, so the parse cache round-trips it.
+  const bareReferences = new Set();
   const addRef = (name, node, startIndex) => {
     if (!name) return;
     result.references.add(name);
     occurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
+  };
+  const addBareRef = (name, node, startIndex) => {
+    if (!name) return;
+    addRef(name, node, startIndex);
+    bareReferences.add(name);
   };
   // Names bound by imports, for the export_specifier rule below.
   const importLocals = new Set();
@@ -476,7 +501,7 @@ function parseJsTs(filePath, src, ext) {
 
   walk(root, (node) => {
     if (node.type === 'identifier') {
-      if (!isDefinitionSite(node)) addRef(text(node, src), node);
+      if (!isDefinitionSite(node)) addBareRef(text(node, src), node);
       else if (node.parent && node.parent.type === 'export_specifier'
         && sameNode(childByField(node.parent, 'name'), node)
         && importLocals.has(text(node, src))) {
@@ -492,7 +517,7 @@ function parseJsTs(filePath, src, ext) {
       // `request<User, CustomResponse>()`, `interface P { x: Foo }`.
       // The declaration's own name (`type A = ...`, `interface I {}`)
       // is a type_identifier too — isDefinitionSite excludes it.
-      if (!isDefinitionSite(node)) addRef(text(node, src), node);
+      if (!isDefinitionSite(node)) addBareRef(text(node, src), node);
     } else if (node.type === 'property_identifier') {
       // A method/field/property declaration's own name is a definition,
       // not a use: without this, every method looked used by its own
@@ -501,7 +526,7 @@ function parseJsTs(filePath, src, ext) {
       // member-access names still count as references.
       if (!isPropertyDefinitionSite(node)) addRef(text(node, src), node);
     } else if (node.type === 'jsx_identifier' || node.type === 'jsx_namespace_name') {
-      addRef(text(node, src), node);
+      addBareRef(text(node, src), node);
     } else if (node.type === 'comment') {
       // JSDoc {@link X} / {@linkcode X} / {@linkplain X} is a real
       // reference to X: TypeScript resolves the link target, so an
@@ -524,7 +549,7 @@ function parseJsTs(filePath, src, ext) {
       const assign = obj && obj.parent;
       const isModuleExports = assign && assign.type === 'assignment_expression'
         && (() => { const left = childByField(assign, 'left'); return left && /^module\.exports|^exports\./.test(text(left, src)); })();
-      if (!isModuleExports) addRef(text(node, src), node);
+      if (!isModuleExports) addBareRef(text(node, src), node);
     } else if (node.type === 'string' || node.type === 'template_string') {
       result.strings.push(text(node, src));
     } else if (node.type === 'new_expression') {
@@ -560,9 +585,12 @@ function parseJsTs(filePath, src, ext) {
         const base = callee.split('.').pop();
         // A decorator call (`@app.command()`) is not a call to a local
         // function of the same name — see insideDecorator above.
+        // A bare call `foo()` reads the local `foo`; a member call
+        // `obj.foo()` names the member, never the local.
         if (!insideDecorator(node)) {
           result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1, startIndex: node.startIndex });
-          addRef(base, fn);
+          if (fn.type === 'identifier') addBareRef(base, fn);
+          else addRef(base, fn);
         }
         if (base === 'require') {
           const args = firstNamed(node, 'arguments');
@@ -693,6 +721,7 @@ function parseJsTs(filePath, src, ext) {
   }
   for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
   result.topLevelUses = [...topLevelUses].sort();
+  result.bareReferences = [...bareReferences].sort();
 
   // JSX-pragma imports count as uses when the file contains JSX (see
   // the decision block above): the transform calls the pragma factory

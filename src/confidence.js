@@ -524,6 +524,11 @@ function gradeFindings(ctx) {
     // name takes down with it: none that it does not own.
     const scopes = Array.isArray(parsed.topLevelUses);
     let sameFileLiveDefs = null;
+    // Java bare-use channel (parse-java.js pass 4): definition ->
+    // Set<names it reads by bare identifier>. Null when the parse
+    // predates the channel (stale cache) — the field rule below then
+    // falls back to the old scope-based flag, fail-open.
+    let defBareUses = null;
     // Java arity channel: the set of definition names whose bodies can
     // keep a private method alive, and the (name, arity) liveness test
     // for a private method / constructor. See the assignment below.
@@ -540,6 +545,10 @@ function gradeFindings(ctx) {
       }
       const defUses = new Map(); // definition -> Set<used names>
       for (const d of parsed.definitions) defUses.set(d, new Set(d.uses || []));
+      if (Array.isArray(parsed.topLevelBareUses)) {
+        defBareUses = new Map(); // definition -> Set<bare-read names>
+        for (const d of parsed.definitions) defBareUses.set(d, new Set(d.bareUses || []));
+      }
       // Live roots: top-level code (runs on import) and live
       // cross-file uses. A kept definition is a CONDUIT, not a live
       // root: it still gets its own KEEP / REVIEW finding, but the
@@ -786,6 +795,12 @@ function gradeFindings(ctx) {
         };
       }
     }
+    // Bare-name references for this file (see parse-js.js /
+    // parse-py.js / parse-java.js): names read as bare identifiers,
+    // never member names. A stale parse cache predates the field, so
+    // a missing array falls back to the old name-based flag below —
+    // fail-open, never a new SAFE from a stale cache.
+    const bareRefSet = Array.isArray(parsed.bareReferences) ? new Set(parsed.bareReferences) : null;
     for (const def of parsed.definitions) {
       if (importLocals.has(def.name)) continue;
       // Methods belong to a class; a method with no callers is a candidate
@@ -818,15 +833,64 @@ function gradeFindings(ctx) {
       // enclosing function is dead. Module- and class-level symbols
       // use the reachability scopes above (or the old rule when the
       // parsers predate scopes).
+      //
+      // But the file-level rule is bare-name only for locals, and a
+      // local can never be used from another file: the old name-keyed
+      // flag swallowed a dead local `foo` whenever the file also
+      // called a same-named method (`obj.foo()` names the member, not
+      // the local), and cross-file credit under the same name belonged
+      // to a same-named top-level symbol, never to the local. A bare
+      // call `foo()` in this file still counts, via the bare
+      // references (the callee identifier is a bare read) — and, for
+      // a stale parse without bareReferences, via the old flag.
+      // Java locals skip the name flag entirely: the Java branch
+      // below grades them on binding-resolved reads (readCount), so a
+      // same-named method call never keeps one alive.
+      const isJavaLocal = parsed.language === 'java' && def.local;
+      const bareCallInFile = !isJavaLocal && (parsed.calls || []).some((c) => c.name === def.name && c.full === def.name);
+      // A getter/setter is invoked by property access, not by a call:
+      // `ctx.slots` runs `get slots()`, so a same-file reference by
+      // that name — a property read or write — is a use. A plain
+      // method needs a bare read or a bare call; a property access
+      // alone (`obj.foo`) names the member, not the local.
+      const isAccessor = def.kind === 'method' && (def.isGetter || def.isSetter);
+      const localSameFileUse = isJavaLocal
+        ? false
+        : isAccessor
+          ? usage.sameFile
+          : (bareRefSet ? bareRefSet.has(def.name) : usage.sameFile) || bareCallInFile;
+      // A Java private field's reads are bare-identifier occurrences,
+      // and only bare reads from LIVE code count: a bare read inside a
+      // dead method (FJ-9: a field read only by a dead method stays
+      // SAFE) does not count, and neither does a same-named method
+      // call from live code (`foo()` calls the method, it does not
+      // read the field). Top-level bare reads count too — a field
+      // initializer runs at class load, and the class is a live root.
+      // Without the per-definition bare channel (stale parse), fall
+      // back to the old scope-based flag, fail-open.
+      const isJavaPrivateField = parsed.language === 'java' && def.kind === 'variable' && !def.local && def.visibility === 'private';
+      let fieldSameFileUse;
+      if (isJavaPrivateField && defBareUses) {
+        const topBare = parsed.topLevelBareUses || [];
+        fieldSameFileUse = topBare.includes(def.name)
+          || [...sameFileLiveDefs].some((d) => d !== def && (defBareUses.get(d) || new Set()).has(def.name));
+      } else if (isJavaPrivateField) {
+        fieldSameFileUse = scopes ? sameFileLiveDefs.has(def) : (usage.sameFile || calledIn.includes(file));
+      } else {
+        fieldSameFileUse = usage.sameFile || calledIn.includes(file);
+      }
       const sameFileUse = def.local
-        ? (usage.sameFile || calledIn.includes(file))
-        : (scopes ? sameFileLiveDefs.has(def) : (usage.sameFile || calledIn.includes(file)));
+        ? localSameFileUse
+        : (isJavaPrivateField
+          ? fieldSameFileUse
+          : (scopes ? sameFileLiveDefs.has(def) : (usage.sameFile || calledIn.includes(file))));
       // Java private methods need arity-aware liveness, not the
       // name-based same-file flag: format/2 is dead even when format/1
       // is called from live code. The Java branch below decides with
       // (name, arity), so the name-based flag must not skip it here.
-      // (Private fields keep the name-based flag: their reads are
-      // already read-only occurrences, so it is exact for them.)
+      // (Private fields keep the bare-name flag above: their reads are
+      // bare-identifier occurrences from live code, so it is exact
+      // for them.)
       const javaPrivateMethod = parsed.language === 'java' && def.kind === 'method' && def.visibility === 'private';
       // A Java assumed-live root (a non-private method, a class
       // definition) is live by assumption, not by use: a same-file
@@ -850,10 +914,25 @@ function gradeFindings(ctx) {
       // into noise (e.g. our own isGitRepo / resolveRelative /
       // buildMapData). An export that is only used in its own file is
       // still used — never a finding.
-      if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUseEffective) {
+      //
+      // Cross-file credit never belongs to a non-exported VARIABLE
+      // local: a nested variable cannot be imported or called by name
+      // from another file, so an importer or caller under the same
+      // name is using a same-named top-level symbol instead (or the
+      // namespace-import over-approximation, which credits every
+      // definition of the target file). Function and method locals
+      // are different: they CAN escape — a factory that returns an
+      // object of helpers (`cacheCtx.parseJs`, called cross-file as a
+      // member) — so they keep their cross-file credit. (An exported
+      // local keeps it too: `export { localFn }` names it as public
+      // surface, so it is graded as an export.)
+      const isEscapableLocal = def.local && !def.exported && def.kind === 'variable';
+      const crossFileImporters = isEscapableLocal ? [] : importedBy;
+      const crossFileCallers = isEscapableLocal ? [] : calledElsewhere;
+      if (crossFileImporters.length === 0 && crossFileCallers.length === 0 && sameFileUseEffective) {
         continue;
       }
-      const isUsed = importedBy.length > 0 || calledElsewhere.length > 0;
+      const isUsed = crossFileImporters.length > 0 || crossFileCallers.length > 0;
       if (isUsed) continue;
 
       const stringHits = filesMentioning(def.name);
@@ -874,7 +953,7 @@ function gradeFindings(ctx) {
           // symbol pct below must win for a symbol finding (the old
           // order silently showed the file pct for every symbol).
           ...evidenceBase,
-          importers: importedBy.length, callers: calledElsewhere.length,
+          importers: crossFileImporters.length, callers: crossFileCallers.length,
           stringRefs: stringElsewhere.map((f) => path.relative(root, f)),
           exported: def.exported, coveragePct: cov ? cov.pct : null,
         },
@@ -1157,6 +1236,19 @@ function gradeFindings(ctx) {
         if (def.kind === 'variable') {
           if ((def.writeCount || 0) > 0) {
             add({ ...common, grade: 'REVIEW', reason: 'private field written but never read — deleting the declaration would leave the assignments behind' });
+            continue;
+          }
+          // A load-bearing unused field (batch 11, the field analog
+          // of FJ-3 for locals): the initializer calls a method or
+          // creates an object, so the declaration does work even
+          // though the field is never read — the call runs when the
+          // class loads / an instance is created. Deleting the
+          // declaration would remove that call. REVIEW, never SAFE:
+          // a human decides whether the call matters. A pure
+          // initializer (a literal, a name, arithmetic) stays SAFE
+          // below.
+          if (def.initHasEffect) {
+            add({ ...common, grade: 'REVIEW', reason: 'unused private field, but its initializer calls a method or creates an object — the call may have side effects, so deleting the declaration would remove the call' });
             continue;
           }
           add(withCascade({ ...common, grade: javaGrade('java', 'SAFE'), reason: javaSafeReason('private field, never read or written, 0 string mentions') }));

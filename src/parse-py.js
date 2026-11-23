@@ -106,6 +106,18 @@ function parsePy(filePath, src) {
     result.references.add(name);
     occurrences.push({ name, startIndex: startIndex !== undefined ? startIndex : (node ? node.startIndex : 0) });
   };
+  // Bare-name references: a bare identifier read, never an attribute
+  // name (`obj.foo` names the member `foo`, not a variable `foo`) and
+  // never the base of a member call. Same role as in parse-js.js: a
+  // LOCAL definition can only be read by its bare name, so the old
+  // name-keyed same-file flag swallowed a dead local `foo` whenever
+  // the file also called a same-named method.
+  const bareReferences = new Set();
+  const addBareRef = (name, node, startIndex) => {
+    if (!name) return;
+    addRef(name, node, startIndex);
+    bareReferences.add(name);
+  };
   // Class-body inventories for the class-attribute rules (FP-6):
   // per class, the names defined directly in its body, whether the body
   // defines any method, and the class node itself (for its bases).
@@ -681,9 +693,16 @@ function parsePy(filePath, src) {
       if (!isDefinitionSite(node)) {
         // A decorator attribute (`@app.callback()`) is a member of the
         // decorator object, not a reference to a same-named definition.
+        // Likewise the attribute name of any `obj.foo` lookup: the
+        // `foo` identifier is the member, not a bare read of a
+        // same-named local — only the object (`obj`) is a bare read.
         const p = node.parent;
         const isDecAttr = p && p.type === 'attribute' && sameNode(childByField(p, 'attribute'), node) && insideDecorator(p);
-        if (!isDecAttr) addRef(text(node, src), node);
+        const isAttrName = p && p.type === 'attribute' && sameNode(childByField(p, 'attribute'), node);
+        if (!isDecAttr) {
+          if (isAttrName) addRef(text(node, src), node);
+          else addBareRef(text(node, src), node);
+        }
       }
     } else if (node.type === 'attribute') {
       const attr = childByField(node, 'attribute');
@@ -712,7 +731,7 @@ function parsePy(filePath, src) {
       if (node.type === 'string_content' && isAnnotationString(node)) {
         const s = text(node, src);
         for (const m of s.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
-          addRef(m[0], node, node.startIndex + m.index);
+          addBareRef(m[0], node, node.startIndex + m.index);
         }
       }
       // %-format placeholders are uses: `"%(complete_func)s" % vars`
@@ -731,9 +750,12 @@ function parsePy(filePath, src) {
         const base = callee.split('.').pop();
         // A decorator call (`@app.command()`) is not a call to a local
         // function of the same name — see insideDecorator above.
+        // A bare call `foo()` reads the local `foo`; a member call
+        // `obj.foo()` names the member, never the local.
         if (!insideDecorator(node)) {
           result.calls.push({ name: base, full: callee, line: node.startPosition.row + 1, startIndex: node.startIndex });
-          addRef(base, fn);
+          if (fn.type === 'identifier') addBareRef(base, fn);
+          else addRef(base, fn);
         }
         if (['getattr', 'importlib', '__import__', 'eval', 'exec'].includes(base)) {
           result.dynamic = true;
@@ -806,6 +828,7 @@ function parsePy(filePath, src) {
   }
   for (const d of result.definitions) d.uses = [...(usesByDef.get(d) || [])].sort();
   result.topLevelUses = [...topLevelUses].sort();
+  result.bareReferences = [...bareReferences].sort();
   result.attributeRefs = [...attributeRefSet].sort();
 
   return result;

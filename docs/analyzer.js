@@ -2224,6 +2224,14 @@ function buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames) {
   });
   var defUses = new Map();
   parsed.definitions.forEach(function (d) { defUses.set(d, new Set(d.uses || [])); });
+  // Bare-use channel (parse-java-web.js pass 4): definition -> Set<names
+  // it reads by bare identifier>. Null when the parse predates the
+  // channel — the field rule below then keeps the old scope-based flag.
+  var defBareUses = null;
+  if (Array.isArray(parsed.topLevelBareUses)) {
+    defBareUses = new Map();
+    parsed.definitions.forEach(function (d) { defBareUses.set(d, new Set(d.bareUses || [])); });
+  }
   // Live roots: top-level code (runs on import). Java has no import
   // resolution, so there are no cross-file callers to add; the seeding
   // below supplies the rest.
@@ -2420,13 +2428,16 @@ function buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames) {
     javaUsedByLive: javaUsedByLive,
     javaArityIsLive: javaArityIsLive,
     javaUtilityClasses: javaUtilityClasses,
+    defBareUses: defBareUses,
+    topLevelBareUses: parsed.topLevelBareUses || null,
   };
 }
 
 // Normalize a docs/parse-java-web.js result into the shape the
 // analyzer's grading loop expects: `calls` is a Set of names (like
 // parseJs), `dunder` is a Set (Java has no dunder methods). The raw
-// arity channel (uses / usesArity / topLevelUses / topLevelUsesArity)
+// arity channel (uses / usesArity / topLevelUses / topLevelUsesArity),
+// the bare channel (bareUses / topLevelBareUses / bareReferences),
 // and the grading fields (readCount, writeCount, stringMention,
 // annotations, classAnnotations, arity, varargs, fixedArity,
 // isConstructor, className, classKind, anonymousClass, initHasEffect,
@@ -3116,20 +3127,44 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       // rescued by their own same-file callers — the CLI computes both
       // from the arity-aware live-scope BFS instead (buildJavaLiveness
       // above). Private methods get sameFileUse false here; the Java
-      // branch below decides them with javaArityIsLive. Locals keep the
-      // file-level rule: a local is part of its enclosing function's
-      // implementation, so any reference in the file keeps it alive.
-      // With no liveness data (stale parse), sameFileUse is false too:
-      // the Java branch then falls back to REVIEW, never SAFE.
+      // branch below decides them with javaArityIsLive. Non-Java locals
+      // keep the file-level rule: a local is part of its enclosing
+      // function's implementation, so any reference in the file keeps
+      // it alive. Java locals do not: the Java branch below grades
+      // them on binding-resolved reads (readCount), so a same-named
+      // method call must not keep a dead Java local alive. With no
+      // liveness data (stale parse), sameFileUse is false too: the Java
+      // branch then falls back to REVIEW, never SAFE.
       var javaPrivateMethod = info.language === 'java' && def.kind === 'method' && def.visibility === 'private';
       var javaAssumedLive = info.language === 'java'
         && (def.kind === 'class' || (def.kind === 'method' && def.visibility !== 'private'));
       var sameFileUseEffective = sameFileUse;
-      if (info.language === 'java' && !def.local) {
-        if (javaCtx) {
+      if (info.language === 'java') {
+        if (def.local) {
+          // Java locals grade on binding-resolved reads (readCount) in
+          // the Java branch below, never on the name-based flag.
+          sameFileUseEffective = false;
+        } else if (javaCtx) {
           sameFileUseEffective = javaCtx.sameFileLiveDefs.has(def);
           if (javaPrivateMethod) sameFileUseEffective = false;
           else if (javaAssumedLive) sameFileUseEffective = javaCtx.javaUsedByLive.has(def);
+          else if (def.kind === 'variable' && def.visibility === 'private' && javaCtx.defBareUses) {
+            // A private field is live only on a bare read from live
+            // code: a bare read inside a dead method (FJ-9) does not
+            // count, and neither does a same-named method call from
+            // live code (`foo()` calls the method, it does not read
+            // the field). Top-level bare reads count too — a field
+            // initializer runs at class load, and the class is a live
+            // root.
+            var topBare = javaCtx.topLevelBareUses || [];
+            var bareLive = topBare.indexOf(def.name) >= 0;
+            if (!bareLive) {
+              javaCtx.sameFileLiveDefs.forEach(function (d) {
+                if (d !== def && (javaCtx.defBareUses.get(d) || new Set()).has(def.name)) bareLive = true;
+              });
+            }
+            sameFileUseEffective = bareLive;
+          }
         } else {
           sameFileUseEffective = false;
         }
@@ -3341,6 +3376,15 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         if (def.kind === 'variable') {
           if ((def.writeCount || 0) > 0) {
             add(javaCommon('REVIEW', 'private field written but never read — deleting the declaration would leave the assignments behind'));
+            return;
+          }
+          // A load-bearing unused field (batch 11, the field analog
+          // of FJ-3 for locals): the initializer calls a method or
+          // creates an object, so the declaration does work even
+          // though the field is never read. REVIEW, never SAFE. A
+          // pure initializer stays SAFE below.
+          if (def.initHasEffect) {
+            add(javaCommon('REVIEW', 'unused private field, but its initializer calls a method or creates an object — the call may have side effects, so deleting the declaration would remove the call'));
             return;
           }
           add(javaCommon('SAFE', 'private field, never read or written, 0 string mentions'));
