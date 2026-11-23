@@ -180,17 +180,18 @@ function loadCache(location, expected) {
 
 /**
  * Save a cache file. Fail-open: a write failure yields a warning and
- * the scan results are unaffected. Writes via a temp file + rename so
- * a concurrent reader never sees a half-written cache.
+ * the scan results are unaffected. Uses a unique temp file + atomic rename
+ * and cleans up the temp file on failure (important on Windows).
  */
 function saveCache(location, data) {
+  const tmp = `${location}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   try {
     fs.mkdirSync(path.dirname(location), { recursive: true });
-    const tmp = `${location}.tmp-${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
     fs.renameSync(tmp, location);
     return { ok: true, warning: null };
   } catch (e) {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) { /* best effort cleanup */ }
     return { ok: false, warning: `could not write cache file ${location}: ${e.message}` };
   }
 }
@@ -271,6 +272,42 @@ function createCacheContext({ root, location, configHash }) {
     parseJava(file, src, origParseJava) {
       const rel = path.relative(path.resolve(root), file);
       return wrapParse(rel, src, () => origParseJava(file, src));
+    },
+    /**
+     * Non-counting cache read for the parallel parser pool's pre-pass:
+     * returns the cached parse (or null) without touching hit/miss
+     * counters or `seen`. The pool counts hits via lookupHit only
+     * when it actually engages; otherwise the synchronous path counts
+     * them once through the wrapped parsers. Without this split, a
+     * warm CLI run counted every hit twice (14 instead of 7).
+     */
+    peekHit(rel, contentHash) {
+      const entry = entries.get(rel);
+      if (entry && entry.hash === contentHash) return deserializeParsed(entry.parsed);
+      return null;
+    },
+    /**
+     * Direct cache access for the parallel parser pool: lookupHit counts
+     * a hit without counting a miss, recordMiss counts + stores a
+     * worker-parsed file. Both mark the file seen so save() keeps it.
+     */
+    lookupHit(rel, contentHash) {
+      seen.add(rel);
+      const entry = entries.get(rel);
+      if (entry && entry.hash === contentHash) {
+        hits += 1;
+        return deserializeParsed(entry.parsed);
+      }
+      return null;
+    },
+    recordMiss(rel, contentHash, parsed, elapsedMs) {
+      seen.add(rel);
+      misses += 1;
+      parseMs += elapsedMs || 0;
+      if (parsed) {
+        parsedCount += 1;
+        store(rel, contentHash, parsed);
+      }
     },
     /** Persist entries for files seen in this scan; drop deleted files. */
     save() {

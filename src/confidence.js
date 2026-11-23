@@ -22,62 +22,8 @@ const { mentionRegExp } = require('./graph');
 const { coverageForSymbol, coverageForSymbolBody } = require('./coverage');
 const { isManualScriptPath } = require('./discover');
 const { FRAMEWORK_CLASS_ANNOTATIONS } = require('./parse-java');
-
-// Java serialization callbacks (FJ-4): private methods the
-// serialization runtime invokes by reflection — ObjectInputStream /
-// ObjectOutputStream call them, never in-repo code (Java Object
-// Serialization Specification, stream protocol). The (name, arity)
-// pair IS the contract: readObject / writeObject take the stream (1),
-// readObjectNoData / readResolve / writeReplace take none (0). A
-// same-named method with another arity is an ordinary method and
-// grades normally. A class need not declare `implements
-// Serializable` itself: the contract is inherited (java.lang.Number
-// is Serializable, so a Number subclass's readObject is a callback).
-const JAVA_SERIALIZATION_CALLBACKS = {
-  readObject: 1, writeObject: 1,
-  readObjectNoData: 0, readResolve: 0, writeReplace: 0,
-};
-
-function loadFrameworks(dir) {
-  const packs = [];
-  if (!fs.existsSync(dir)) return packs;
-  for (const f of fs.readdirSync(dir)) {
-    if (!f.endsWith('.json')) continue;
-    try {
-      const pack = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-      pack._file = f;
-      packs.push(pack);
-    } catch (_) { /* bad pack — skip, do not crash */ }
-  }
-  return packs;
-}
-
-function frameworkKeepFile(rel, packs) {
-  const reasons = [];
-  for (const pack of packs) {
-    for (const pat of pack.entryPatterns || []) {
-      try { if (new RegExp(pat).test(rel)) reasons.push(`framework pack ${pack._file}: matches ${pat}`); } catch (_) {}
-    }
-    for (const pat of pack.keepFiles || []) {
-      try { if (new RegExp(pat).test(rel)) reasons.push(`framework pack ${pack._file}: matches ${pat}`); } catch (_) {}
-    }
-  }
-  return reasons;
-}
-
-function frameworkKeepSymbol(rel, name, decorators, packs) {
-  const reasons = [];
-  for (const pack of packs) {
-    if (name && (pack.keepExports || []).includes(name)) reasons.push(`framework pack ${pack._file}: export "${name}" is framework-resolved`);
-    if (name && (pack.keepNames || []).includes(name)) reasons.push(`framework pack ${pack._file}: name "${name}" is framework-resolved`);
-    for (const d of decorators || []) {
-      for (const kd of pack.keepDecorators || []) {
-        if (d.includes(kd)) reasons.push(`framework pack ${pack._file}: decorator "${kd}"`);
-      }
-    }
-  }
-  return reasons;
-}
+const { loadFrameworks, frameworkKeepFile, frameworkKeepSymbol, collectFrameworkClassAnnotations } = require('./rules/frameworks');
+const { isJavaSerializationCallback } = require('./rules/java-policy');
 
 // `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
 // runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
@@ -106,6 +52,9 @@ function gradeFindings(ctx) {
   // default is flipped back. Every Java SAFE below goes through
   // javaGrade, so the gate cannot be bypassed by a new call site.
   const javaSafeEnabled = Boolean(ctx.javaSafe);
+  // Framework class stereotypes (pack keepClassAnnotations + the
+  // parse-java fallback set), compiled once per scan.
+  const frameworkClassAnnotations = collectFrameworkClassAnnotations(packs, FRAMEWORK_CLASS_ANNOTATIONS);
   const javaGrade = (language, grade) => (language === 'java' && grade === 'SAFE' && !javaSafeEnabled ? 'REVIEW' : grade);
   const JAVA_SAFE_GATE = 'Java SAFE is disabled by default (batch 9: 0.3% precision on real repos) — review before deleting';
   const javaSafeReason = (reason) => (javaSafeEnabled ? reason : `${reason}. ${JAVA_SAFE_GATE}`);
@@ -1178,9 +1127,8 @@ function gradeFindings(ctx) {
         }
         // Java serialization callbacks (FJ-4): private methods the
         // serialization runtime invokes by reflection. The (name,
-        // arity) pair is the contract — see
-        // JAVA_SERIALIZATION_CALLBACKS above.
-        if (def.kind === 'method' && !def.isConstructor && JAVA_SERIALIZATION_CALLBACKS[def.name] === def.arity) {
+        // arity) pair is the contract — see rules/java-policy.js.
+        if (isJavaSerializationCallback(def)) {
           add({ ...common, grade: 'KEEP', reason: `private ${def.name} — Java serialization callback, invoked by the serialization runtime via reflection, never called from source` });
           continue;
         }
@@ -1219,8 +1167,7 @@ function gradeFindings(ctx) {
         // pack-only stereotype such as @ControllerAdvice or
         // @JsonIgnoreProperties keeps members at REVIEW too, with no
         // annotation list hardcoded here for the new packs.
-        const fwClassAnn = (def.classAnnotations || []).find((a) => FRAMEWORK_CLASS_ANNOTATIONS.has(a)
-          || (packs || []).some((pack) => (pack.keepClassAnnotations || []).includes(a)));
+        const fwClassAnn = (def.classAnnotations || []).find((a) => frameworkClassAnnotations.has(a));
         if (fwClassAnn) {
           add({ ...common, grade: 'REVIEW', reason: `enclosing class is annotated @${fwClassAnn} — the framework may invoke this member` });
           continue;
@@ -1427,4 +1374,7 @@ function gradeFindings(ctx) {
   return [...findingsById.values()];
 }
 
-module.exports = { gradeFindings, loadFrameworks };
+// Explicit `loadFrameworks: loadFrameworks` (not shorthand): a shorthand
+// property in `module.exports = {...}` records an export but not a use
+// (parse-js.js), so the shorthand form reads the import as dead.
+module.exports = { gradeFindings, loadFrameworks: loadFrameworks };

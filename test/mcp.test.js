@@ -95,11 +95,11 @@ async function withClient(script, args, fn) {
   }
 }
 
-test('MCP: initialize reports the server, tools/list has all five tools', async () => {
+test('MCP: initialize reports the server, tools/list has all six tools', async () => {
   await withClient(MCP_BIN, [], async (c) => {
     const tools = await c.request('tools/list', {});
     const names = tools.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ['explain_finding', 'fix_safe', 'get_map', 'scan_repo', 'status']);
+    assert.deepEqual(names, ['explain_finding', 'fix_safe', 'get_map', 'prove_safe', 'scan_repo', 'status']);
     for (const t of tools.tools) {
       assert.ok(t.inputSchema && t.inputSchema.type === 'object', `${t.name} needs an input schema`);
     }

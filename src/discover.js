@@ -13,6 +13,7 @@ const path = require('path');
 
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'out', '.next',
+  '.nuxt', '.svelte-kit', '.output', '.astro', '.parcel-cache',
   'coverage', '.coverage', '__pycache__', '.venv', 'venv', '.tox',
   '.pytest_cache', '.mypy_cache', '.turbo', 'vendor', 'target',
 ]);
@@ -29,25 +30,133 @@ const SKIP_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'])
 const CODE_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.java']);
 const ALL_EXTS = new Set([...CODE_EXTS, '.json', '.md', '.txt', '.yaml', '.yml', '.toml', '.html', '.css', '.vue', '.xml', '.properties']);
 
+/** Normalize OS-specific path separators to POSIX forward slashes. */
+function toPosix(p) {
+  return String(p || '').replace(/\\/g, '/');
+}
+
 function isCodeFile(p) {
   return CODE_EXTS.has(path.extname(p).toLowerCase());
 }
 
-function walk(dir, out, includeFixtures) {
+/**
+ * Compile one .gitignore pattern into a matcher relative to the directory
+ * containing that .gitignore file.
+ */
+function compileGitignoreLine(rawLine) {
+  let line = rawLine.replace(/\r$/, '');
+  if (!line || line.startsWith('#')) return null;
+  // Strip unescaped trailing spaces.
+  line = line.replace(/(?<!\\)\s+$/, '');
+  if (!line) return null;
+
+  let negated = false;
+  if (line.startsWith('!')) {
+    negated = true;
+    line = line.slice(1);
+  } else if (line.startsWith('\\#') || line.startsWith('\\!')) {
+    line = line.slice(1);
+  }
+  if (!line) return null;
+
+  let dirOnly = false;
+  if (line.endsWith('/')) {
+    dirOnly = true;
+    line = line.slice(0, -1);
+  }
+  if (!line) return null;
+
+  const anchored = line.includes('/');
+  if (line.startsWith('/')) line = line.slice(1);
+
+  // Convert gitignore glob syntax to RegExp.
+  let re = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '*') {
+      if (line[i + 1] === '*') {
+        if (line[i + 2] === '/') {
+          re += '(?:.*/)?';
+          i += 2;
+        } else {
+          re += '.*';
+          i += 1;
+        }
+      } else {
+        re += '[^/]*';
+      }
+    } else if (ch === '?') {
+      re += '[^/]';
+    } else if ('[\\^$.|+(){}'.includes(ch)) {
+      re += '\\' + ch;
+    } else {
+      re += ch;
+    }
+  }
+
+  const regex = anchored
+    ? new RegExp(`^${re}(?:/.*)?$`)
+    : new RegExp(`(?:^|/)${re}(?:/.*)?$`);
+
+  return { negated, dirOnly, regex };
+}
+
+function loadGitignoreRules(dir) {
+  const file = path.join(dir, '.gitignore');
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (_) {
+    return [];
+  }
+  const rules = [];
+  for (const line of text.split('\n')) {
+    const compiled = compileGitignoreLine(line);
+    if (compiled) rules.push({ baseDir: dir, ...compiled });
+  }
+  return rules;
+}
+
+function isIgnoredByGitignore(fullPath, isDir, rules) {
+  if (!rules.length) return false;
+  let ignored = false;
+  for (const rule of rules) {
+    const rel = toPosix(path.relative(rule.baseDir, fullPath));
+    if (!rel || rel.startsWith('..')) continue;
+    if (rule.dirOnly && !isDir) {
+      // A dir-only rule still ignores files inside a matched directory,
+      // which the walk skips before descending, so check full path too.
+      if (!rel.includes('/')) continue;
+    }
+    if (rule.regex.test(rel)) {
+      ignored = !rule.negated;
+    }
+  }
+  return ignored;
+}
+
+function walk(dir, out, includeFixtures, respectGitignore, inheritedRules) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (_) {
     return out;
   }
+
+  const rules = respectGitignore
+    ? inheritedRules.concat(loadGitignoreRules(dir))
+    : inheritedRules;
+
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
-      if (SKIP_DIRS.has(e.name) || e.name.startsWith('.') && e.name !== '.github') continue;
+      if (SKIP_DIRS.has(e.name) || (e.name.startsWith('.') && e.name !== '.github')) continue;
       if (!includeFixtures && FIXTURE_DIRS.has(e.name)) continue;
-      walk(full, out, includeFixtures);
+      if (respectGitignore && isIgnoredByGitignore(full, true, rules)) continue;
+      walk(full, out, includeFixtures, respectGitignore, rules);
     } else if (e.isFile()) {
       if (SKIP_FILES.has(e.name)) continue;
+      if (respectGitignore && isIgnoredByGitignore(full, false, rules)) continue;
       out.push(full);
     }
   }
@@ -98,10 +207,6 @@ function packageJsonEntries(root, pkg) {
   return out;
 }
 
-// File paths named in package.json scripts are entries: the script runs
-// them directly (migrations, seeds, codegen, `tsx scripts/build.ts`).
-// Tokens are resolved against the manifest's own directory, not the repo
-// root — a workspace script must not resolve against the wrong package.
 function scriptEntries(manifestDir, pkg) {
   const out = new Set();
   if (!pkg || !pkg.scripts) return out;
@@ -117,12 +222,6 @@ function scriptEntries(manifestDir, pkg) {
   return out;
 }
 
-// Config files name the scripts they load: MkDocs `extra_javascript`,
-// plugin hooks (`scripts/agent_banner.py` under `markdown_extensions`
-// or `plugins`), and similar. Any token ending in a code extension
-// that resolves to a real file next to the config is an entry — and so
-// is a dotted module reference (`scripts.mkdocs_hook` -> the file
-// `scripts/mkdocs_hook.py`), which is how MkDocs names Python plugins.
 function configFileEntries(configPath) {
   const out = new Set();
   let text;
@@ -134,7 +233,7 @@ function configFileEntries(configPath) {
   }
   for (const m of text.matchAll(/[A-Za-z_][\w]*(?:\.[\w]+)+/g)) {
     const dotted = m[0];
-    if (/\.(js|jsx|ts|tsx|mjs|cjs|py)$/.test(dotted)) continue; // handled above
+    if (/\.(js|jsx|ts|tsx|mjs|cjs|py)$/.test(dotted)) continue;
     for (const ext of ['.py', '.js', '.ts']) {
       const p = path.resolve(dir, dotted.replace(/\./g, '/') + ext);
       if (fs.existsSync(p)) { out.add(p); break; }
@@ -149,55 +248,41 @@ const ENTRY_BASENAMES = new Set([
 ]);
 
 const ENTRY_PATTERNS = [
-  /(^|\/)(pages|app|routes|views)\//, // framework route directories
-  /(^|\/)examples\//, // example scripts are standalone entry points, run directly
-  /(^|\/)(scripts|tools)\//, // manually-run tools: invoked by hand, never imported (see isManualScriptPath)
+  /(^|\/)(pages|app|routes|views)\//,
+  /(^|\/)examples\//,
+  /(^|\/)(scripts|tools)\//,
   /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.test-d\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
-  /Test\.java$/, // JUnit test class (src/test/java or *Test.java)
+  /Test\.java$/,
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
   /\/migrations\//, /\/seeds?\//,
+  // Worker entry scripts (Node worker_threads / Web Workers): loaded by
+  // the runtime via a string path (new Worker('...')), never imported,
+  // so without this they read as dead files with only a string mention.
+  /-worker\.[jt]sx?$/, /\.worker\.[jt]sx?$/,
   /setup\.py$/, /conftest\.py$/, /\/__init__\.py$/,
   /webpack\.config\./, /vite\.config\./, /rollup\.config\./,
   /tailwind\.config\./, /jest\.config\./, /babel\.config\./,
 ];
 
-// Heuristic: a code file under a scripts/ or tools/ directory at any
-// depth is a manually-run tool — a seed, deploy, migration-helper, or
-// one-off script an operator invokes directly (`node scripts/seed.js`,
-// `python tools/audit.py`), not something the import graph reaches.
-// It is an entry point (never a dead file), and its symbols are kept
-// too (see confidence.js): the operator invokes its functions by name,
-// by editing the script, or through argv dispatch the static graph
-// cannot see, so an unreferenced function there cannot be proven dead.
-// This is deliberately fail-open — a genuinely dead helper inside
-// scripts/ stays hidden rather than risk flagging a tool the operator
-// runs by hand. It only ever demotes findings, never creates a SAFE.
-// Files the graph DOES reach (imported helpers under scripts/) are
-// unaffected: their symbols were already live through their importers.
 function isManualScriptPath(rel) {
-  return /(^|\/)(scripts|tools)\//.test(rel);
+  return /(^|\/)(scripts|tools)\//.test(toPosix(rel));
 }
 
 function looksLikeEntry(rel, abs, pkgEntries) {
   if (pkgEntries.has(abs)) return { entry: true, reason: 'package.json entry point' };
-  // Entry basenames are case-insensitive: Django's `Gruntfile.js` is
-  // executed by the grunt CLI exactly like a lowercase `gruntfile.js`.
+  const posixRel = toPosix(rel);
+  const posixAbs = toPosix(abs);
   const base = path.basename(abs, path.extname(abs)).toLowerCase();
   if (ENTRY_BASENAMES.has(base)) return { entry: true, reason: `entry basename "${base}"` };
   for (const re of ENTRY_PATTERNS) {
-    if (re.test(rel) || re.test(abs)) return { entry: true, reason: `matches entry pattern ${re}` };
+    if (re.test(posixRel) || re.test(posixAbs)) return { entry: true, reason: `matches entry pattern ${re}` };
   }
-  // Shebang / executable CLI script, or a runnable script
-  // (`if __name__ == "__main__":` in Python,
-  // `if (require.main === module)` in Node) — the file is run directly.
-  // One read serves all three checks.
   let src = '';
   try { src = fs.readFileSync(abs, 'utf8'); } catch (_) { return { entry: false, reason: '' }; }
   if (src.startsWith('#!')) return { entry: true, reason: 'has a shebang (CLI script)' };
   if (/__name__\s*==\s*['"]__main__['"]/.test(src)) return { entry: true, reason: 'runnable script (if __name__ == "__main__")' };
   if (/require\.main\s*===\s*module/.test(src)) return { entry: true, reason: 'runnable script (require.main === module)' };
-  // Java: a public static void main(String[]) method is the entry point.
   if (/public\s+static\s+void\s+main\s*\(\s*String\s*\[/.test(src)) return { entry: true, reason: 'has a main() method (Java entry point)' };
   return { entry: false, reason: '' };
 }
@@ -211,14 +296,12 @@ function readText(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch (_) { return null; }
 }
 
-// A pyproject.toml with a [project] name is a published package.
 function pyprojectHasProjectName(text) {
   if (!text || !text.includes('[project]')) return false;
   const section = text.slice(text.indexOf('[project]'));
   return /^\s*name\s*=\s*["'][^"']+["']/m.test(section);
 }
 
-// setup.py / setup.cfg naming a package: a published package too.
 function setupHasName(file, text) {
   if (!text) return false;
   if (file.endsWith('setup.py')) return /\bname\s*=\s*["'][^"']+["']/.test(text);
@@ -227,31 +310,37 @@ function setupHasName(file, text) {
 
 function discover(root, opts) {
   const absRoot = path.resolve(root);
-  let allFiles = walk(absRoot, [], Boolean(opts && opts.includeFixtures));
-  // Tool-generated output files must never be scanned: a report or map
-  // written inside the scanned root on one run would otherwise count
-  // as string references on the next run and change the findings (the
-  // same reason the cache file is filtered in src/index.js). Only the
-  // exact resolved paths in opts.excludeFiles are dropped — never a
-  // directory, never a same-named file elsewhere. Paths need not exist
-  // yet: the output file is written after the scan, so the first run
-  // already excludes the path the second run finds on disk. A path
-  // outside the scanned root matches nothing and changes nothing.
+  const includeFixtures = Boolean(opts && opts.includeFixtures);
+  const respectGitignore = !(opts && opts.noGitignore);
+  let allFiles = walk(absRoot, [], includeFixtures, respectGitignore, []);
+
   const excludeFiles = opts && Array.isArray(opts.excludeFiles) ? opts.excludeFiles : [];
   if (excludeFiles.length) {
     const excluded = new Set(excludeFiles.map((p) => path.resolve(absRoot, p)));
     allFiles = allFiles.filter((f) => !excluded.has(f));
+  }
+  // Config-supplied ignore patterns (path prefixes or regexes).
+  const ignorePatterns = opts && Array.isArray(opts.ignorePatterns) ? opts.ignorePatterns : [];
+  if (ignorePatterns.length) {
+    const compiledIgnores = [];
+    for (const pat of ignorePatterns) {
+      try { compiledIgnores.push(new RegExp(pat)); } catch (_) {}
+    }
+    if (compiledIgnores.length) {
+      allFiles = allFiles.filter((f) => {
+        const rel = toPosix(path.relative(absRoot, f));
+        return !compiledIgnores.some((re) => re.test(rel));
+      });
+    }
   }
   const codeFiles = allFiles.filter(isCodeFile);
   const textFiles = allFiles.filter((f) => ALL_EXTS.has(path.extname(f).toLowerCase()));
   const pkgPath = path.join(absRoot, 'package.json');
   const pkg = fs.existsSync(pkgPath) ? readJson(pkgPath) : null;
 
-  // Every manifest in the tree, not just the root: workspaces and
-  // sub-packages have their own entries, scripts, and library/app kind.
-  const jsManifests = new Map(); // dir -> { hasExports, isPrivate, hasMain, isAppFramework, hasAppDir }
-  const pyManifests = new Map(); // dir -> { isLibrary }
-  const manageDirs = new Set(); // dirs containing manage.py (Django app)
+  const jsManifests = new Map();
+  const pyManifests = new Map();
+  const manageDirs = new Set();
   const pkgEntries = new Set();
   for (const f of allFiles) {
     const base = path.basename(f);
@@ -276,33 +365,19 @@ function discover(root, opts) {
     } else if (base === 'manage.py') {
       manageDirs.add(dir);
     } else if (/^mkdocs.*\.ya?ml$/.test(base)) {
-      // MkDocs loads scripts and JS assets named in its config.
       for (const p of configFileEntries(f)) pkgEntries.add(p);
     }
   }
   const isLibrary = Boolean(pkg && pkg.exports);
 
-  // Library vs app, per file, from the nearest manifest above it.
-  // Libraries keep public API at REVIEW; apps may grade exported but
-  // uncalled app-internal symbols SAFE (see confidence.js). Unknown
-  // (no manifest signal either way) keeps the old behaviour: REVIEW.
-  // The rule is deliberately narrow so fixtures and plain packages do
-  // not flip: a package.json with only `main` and no app signal is
-  // unknown, not an app.
-  const kindCache = new Map(); // abs file -> 'library' | 'app' | 'unknown'
+  const kindCache = new Map();
   function fileKind(abs) {
     if (kindCache.has(abs)) return kindCache.get(abs);
     let kind = 'unknown';
     const ext = path.extname(abs).toLowerCase();
     let dir = path.dirname(abs);
-    // A `private: true` manifest does not decide the kind by itself:
-    // in a monorepo the sub-packages are private (published through the
-    // root package) while the root has `exports` — preact's compat/ and
-    // hooks/ sub-packages were graded 'app' and their exported symbols
-    // went SAFE. So a private manifest is skipped and the walk continues
-    // up; only a chain of nothing but private manifests is an app.
     let sawPrivate = false;
-    let exhausted = false; // the walk ran out of ancestors without a decisive manifest
+    let exhausted = false;
     while (true) {
       if (ext === '.py') {
         if (pyManifests.has(dir)) {
@@ -325,13 +400,31 @@ function discover(root, opts) {
     return kind;
   }
 
-  const entries = new Map(); // abs path -> reason
+  const entries = new Map();
   for (const f of codeFiles) {
-    const rel = path.relative(absRoot, f);
+    const rel = toPosix(path.relative(absRoot, f));
     const r = looksLikeEntry(rel, f, pkgEntries);
     if (r.entry) entries.set(f, r.reason);
+  }
+  // Config-supplied extra entry points (exact paths or regexes over code files).
+  const extraEntries = opts && Array.isArray(opts.extraEntries) ? opts.extraEntries : [];
+  for (const entry of extraEntries) {
+    if (typeof entry !== 'string') continue;
+    const direct = path.resolve(absRoot, entry);
+    if (fs.existsSync(direct)) {
+      entries.set(direct, 'project config entry point');
+      continue;
+    }
+    try {
+      const re = new RegExp(entry);
+      for (const f of codeFiles) {
+        if (re.test(toPosix(path.relative(absRoot, f)))) {
+          entries.set(f, `project config entry pattern ${entry}`);
+        }
+      }
+    } catch (_) {}
   }
   return { root: absRoot, allFiles, codeFiles, textFiles, pkg, pkgEntries, isLibrary, entries, fileKind };
 }
 
-module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS, isManualScriptPath };
+module.exports = { discover, isCodeFile, CODE_EXTS, readJson, FIXTURE_DIRS, isManualScriptPath, toPosix };

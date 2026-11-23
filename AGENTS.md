@@ -21,7 +21,7 @@ and carries its evidence (importers, callers, string mentions, git age, coverage
 - `src/prove.js` — isolated git worktree + test run.
 - `src/baseline.js` — `.deadcode-map.json` grandfathering for CI.
 - `src/mcp-server.js` — MCP server (stdio): tools `scan_repo`, `explain_finding`,
-  `fix_safe`, `get_map`, `status`; prompt `cleanup-dead-code`; resource
+  `prove_safe`, `fix_safe`, `get_map`, `status`; prompt `cleanup-dead-code`; resource
   `deadcode://map/{path}`. Stdout is the JSON-RPC channel — never `console.log`
   in MCP mode, `console.error` only.
 - `plugins/deadcode-map/` — Claude Code plugin (skill, slash command, MCP launcher).

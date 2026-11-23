@@ -13,6 +13,7 @@ const path = require('path');
 const { parseJsTs } = require('./parse-js');
 const { parsePy } = require('./parse-py');
 const { parseJava } = require('./parse-java');
+const { toPosix } = require('./discover');
 
 const JS_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
 const PY_EXTS = ['.py'];
@@ -59,25 +60,121 @@ function resolveRelative(fromFile, source, existingFiles) {
 }
 
 /**
+ * Parse JSON with comments (//, /* ... *\/) and trailing commas (tsconfig / jsconfig).
+ */
+function parseJsonc(raw) {
+  let out = '';
+  let inString = false;
+  let quote = '';
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inString) {
+      out += ch;
+      if (ch === '\\' && next !== undefined) {
+        out += next;
+        i += 1;
+      } else if (ch === quote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      quote = ch;
+      out += ch;
+    } else if (ch === '/' && next === '/') {
+      while (i < raw.length && raw[i] !== '\n') i += 1;
+      out += '\n';
+    } else if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i += 1;
+      i += 1;
+    } else {
+      out += ch;
+    }
+  }
+  // Remove trailing commas before } or ].
+  const cleaned = out.replace(/,\s*([}\]])/g, '$1');
+  return JSON.parse(cleaned);
+}
+
+/**
+ * Load a tsconfig / jsconfig and recursively merge `extends` chains
+ * (supports relative parent configs, single string or array in TS 5+, with cycle guard).
+ */
+function readTsConfigMerged(file, seen = new Set()) {
+  const abs = path.resolve(file);
+  if (seen.has(abs)) return null;
+  seen.add(abs);
+
+  let cfg;
+  try {
+    cfg = parseJsonc(fs.readFileSync(abs, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+  if (!cfg || typeof cfg !== 'object') return null;
+
+  const dir = path.dirname(abs);
+  let baseOpts = {};
+  let baseUrlDir = dir;
+
+  const extendList = Array.isArray(cfg.extends)
+    ? cfg.extends
+    : (typeof cfg.extends === 'string' ? [cfg.extends] : []);
+
+  for (const extRef of extendList) {
+    if (typeof extRef !== 'string' || !extRef.startsWith('.')) continue;
+    const baseCandidate = path.resolve(dir, extRef);
+    const parentPath = fs.existsSync(baseCandidate) && fs.statSync(baseCandidate).isFile()
+      ? baseCandidate
+      : (fs.existsSync(baseCandidate + '.json') ? baseCandidate + '.json' : null);
+    if (!parentPath) continue;
+    const parent = readTsConfigMerged(parentPath, seen);
+    if (!parent) continue;
+    baseOpts = {
+      ...baseOpts,
+      ...parent.compilerOptions,
+      paths: { ...(baseOpts.paths || {}), ...(parent.compilerOptions.paths || {}) },
+    };
+    if (parent.compilerOptions.baseUrl && !cfg.compilerOptions?.baseUrl) {
+      baseUrlDir = parent.baseUrlDir;
+    }
+  }
+
+  const ownOpts = (cfg.compilerOptions && typeof cfg.compilerOptions === 'object') ? cfg.compilerOptions : {};
+  const mergedOpts = {
+    ...baseOpts,
+    ...ownOpts,
+    paths: { ...(baseOpts.paths || {}), ...(ownOpts.paths || {}) },
+  };
+  if (ownOpts.baseUrl) baseUrlDir = dir;
+
+  return { compilerOptions: mergedOpts, baseUrlDir };
+}
+
+/**
  * tsconfig / jsconfig `paths` aliases (`@/*` -> `./src/*`), the
  * standard Next.js / Vite / monorepo import style. Without this, every
  * `@/lib/...` import missed its edge and the target's exports looked
  * dead (umami: most of its 196 SAFE findings were `@/` imports).
  *
- * `extends` is NOT followed yet: paths must live in the local
- * tsconfig/jsconfig. A base config that holds the paths is a known gap.
+ * `extends` chains are followed (relative parent configs), and JSONC
+ * (comments, trailing commas) is accepted, so a base config holding
+ * the paths works too.
  */
 function loadTsAliases(discovery) {
   const out = [];
   for (const f of discovery.textFiles || []) {
     const base = path.basename(f);
     if (base !== 'tsconfig.json' && base !== 'jsconfig.json') continue;
-    let cfg;
-    try { cfg = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { continue; }
-    const opts = (cfg && cfg.compilerOptions) || {};
+    const resolved = readTsConfigMerged(f);
+    if (!resolved) continue;
+    const opts = resolved.compilerOptions || {};
     if (!opts.paths || typeof opts.paths !== 'object') continue;
     const dir = path.dirname(f);
-    const baseUrl = opts.baseUrl ? path.resolve(dir, opts.baseUrl) : dir;
+    const baseUrl = opts.baseUrl ? path.resolve(resolved.baseUrlDir, opts.baseUrl) : dir;
     const paths = [];
     for (const [pattern, targets] of Object.entries(opts.paths)) {
       if (!Array.isArray(targets)) continue;
@@ -258,7 +355,14 @@ function resolveWorkspaceSelfRef(source, workspacePackages, existingFiles) {
   return null;
 }
 
-function analyze(root, discovery) {
+function analyze(root, discovery, opts) {
+  const options = opts || {};
+  const parsers = options.parsers || {};
+  const parseJsFn = parsers.parseJsTs || parseJsTs;
+  const parsePyFn = parsers.parsePy || parsePy;
+  const parseJavaFn = parsers.parseJava || parseJava;
+  const preparsed = options.preparsed || null; // optional Map<absPath, { parsed, src, parseError }>
+
   const existingFiles = new Set(discovery.codeFiles);
   const tsAliases = loadTsAliases(discovery);
   const workspacePackages = loadWorkspacePackages(discovery, existingFiles);
@@ -266,6 +370,20 @@ function analyze(root, discovery) {
 
   for (const f of discovery.codeFiles) {
     const ext = path.extname(f).toLowerCase();
+    const pre = preparsed ? preparsed.get(f) : null;
+    if (pre) {
+      files.set(f, {
+        rel: toPosix(path.relative(root, f)),
+        language: pre.parsed ? pre.parsed.language : (ext === '.py' ? 'py' : ext === '.java' ? 'java' : 'js'),
+        parsed: pre.parsed,
+        src: pre.src,
+        size: pre.src.length,
+        ext,
+        parseError: pre.parseError || (pre.parsed ? (pre.parsed.hasErrors ? 'parse errors' : null) : 'parse failed'),
+      });
+      continue;
+    }
+
     let src;
     try { src = fs.readFileSync(f, 'utf8'); } catch (_) { continue; }
     let parsed;
@@ -274,14 +392,14 @@ function analyze(root, discovery) {
       // unparsed (parse-java.js sets hasErrors and returns no
       // definitions): its own findings are skipped, but its string
       // literals still protect the same names elsewhere.
-      parsed = JS_EXTS.includes(ext) ? parseJsTs(f, src, ext) : JAVA_EXTS.includes(ext) ? parseJava(f, src) : parsePy(f, src);
+      parsed = JS_EXTS.includes(ext) ? parseJsFn(f, src, ext) : JAVA_EXTS.includes(ext) ? parseJavaFn(f, src) : parsePyFn(f, src);
     } catch (e) {
       // A parse failure must never kill the whole run; the file is skipped
       // with a warning and treated as live (never flagged).
       parsed = null;
     }
     files.set(f, {
-      rel: path.relative(root, f), language: parsed ? parsed.language : (ext === '.py' ? 'py' : ext === '.java' ? 'java' : 'js'),
+      rel: toPosix(path.relative(root, f)), language: parsed ? parsed.language : (ext === '.py' ? 'py' : ext === '.java' ? 'java' : 'js'),
       parsed, src, size: src.length, ext, parseError: parsed ? (parsed.hasErrors ? 'parse errors' : null) : 'parse failed',
     });
   }

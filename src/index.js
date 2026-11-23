@@ -1,15 +1,21 @@
 'use strict';
 
-/** Public entry point: run a scan and return the report. */
+/** Public entry point: run a scan (sync or parallel async) and return the report. */
 
 const fs = require('fs');
 const path = require('path');
 const { discover } = require('./discover');
 const { analyze } = require('./graph');
+const { parseJsTs } = require('./parse-js');
+const { parsePy } = require('./parse-py');
+const { parseJava } = require('./parse-java');
 const { gradeFindings, loadFrameworks } = require('./confidence');
 const { BASELINE_FILE } = require('./baseline');
 const { gitInfo } = require('./git');
 const { parseCoverage } = require('./coverage');
+const { parseFilesParallel } = require('./parser-pool');
+const { loadConfig, configToFrameworkPack } = require('./config');
+const { applyInlineIgnores } = require('./rules/ignore');
 const {
   computeConfigHash,
   computeContentHash,
@@ -18,54 +24,6 @@ const {
   sha256,
 } = require('./cache');
 
-/**
- * Cache wiring for a scan.
- *
- * The graph parses each file through parse-js / parse-py, which it
- * requires itself — so the cache is installed by briefly wrapping
- * those parser modules and re-requiring the graph, which then binds
- * the wrapped parsers. The wrappers are restored immediately after
- * the graph loads (the graph already holds its references), and the
- * re-require is synchronous inside scan(), so no other scan can
- * interleave. With the cache off, the plain top-level `analyze` runs
- * exactly as before.
- */
-function analyzeWithCache(root, discovery, cacheCtx) {
-  if (!cacheCtx) return analyze(root, discovery);
-  const graphPath = require.resolve('./graph');
-  delete require.cache[graphPath];
-  const jsMod = require('./parse-js');
-  const pyMod = require('./parse-py');
-  const javaMod = require('./parse-java');
-  const origJs = jsMod.parseJsTs;
-  const origPy = pyMod.parsePy;
-  const origJava = javaMod.parseJava;
-  jsMod.parseJsTs = (file, src, ext) => cacheCtx.parseJs(file, src, ext, origJs);
-  pyMod.parsePy = (file, src) => cacheCtx.parsePy(file, src, origPy);
-  javaMod.parseJava = (file, src) => cacheCtx.parseJava(file, src, origJava);
-  let freshGraph;
-  try {
-    freshGraph = require('./graph');
-  } finally {
-    jsMod.parseJsTs = origJs;
-    pyMod.parsePy = origPy;
-    javaMod.parseJava = origJava;
-  }
-  try {
-    return freshGraph.analyze(root, discovery);
-  } finally {
-    // Restore the pristine graph module in the require cache: the
-    // fresh module above binds the cache-wrapped parsers, and a later
-    // lazy require('./graph') in this process (prove.js re-runs the
-    // analysis inside its worktree) must never see parsers bound to
-    // this scan's cache context. graph.js requires only fs/path and
-    // the two parsers, so reloading it here is cycle-free.
-    delete require.cache[graphPath];
-    require('./graph');
-  }
-}
-
-/** Manifest files whose contents feed the config hash (see cache.js). */
 const CONFIG_MANIFEST_NAMES = new Set([
   'package.json', 'pyproject.toml', 'tsconfig.json', 'jsconfig.json', 'setup.py', 'setup.cfg',
   'pom.xml', 'build.gradle', 'build.gradle.kts',
@@ -89,13 +47,6 @@ function manifestHashes(discovery) {
  *   opts.cacheStats  — print hit/miss stats; implies --cache (--cache-stats)
  *   opts.cacheLocation — explicit cache file path (tests / scripts)
  *
- * Output options on `opts`:
- *   opts.excludeFiles — exact file paths to leave out of discovery
- *     (absolute, or relative to the scanned root). The CLI passes the
- *     resolved --json / --map output paths here, so a report or map
- *     written inside the scanned root is never scanned on the next
- *     run. Applies whether or not --cache is on.
- *
  * Default: OFF. A scan is read-only by default and writes nothing
  * into the scanned repo unless the user opts in with --cache.
  */
@@ -108,11 +59,8 @@ function buildCacheContext(root, discovery, packs, opts) {
   const configHash = computeConfigHash({
     entries,
     includeFixtures: Boolean(opts.includeFixtures),
-    // Coverage affects grades (a covered body line demotes SAFE to
-    // REVIEW), so the coverage options join the config hash: changing
-    // them re-parses instead of reusing parses graded under the old
-    // coverage. The coverage file itself is re-read fresh every run
-    // (see scan()), so a warm run still reflects current coverage.
+    noGitignore: Boolean(opts.noGitignore),
+    javaSafe: Boolean(opts.javaSafe),
     coveragePath: opts.coveragePath || null,
     noCoverage: Boolean(opts.noCoverage),
     packs: packs.map((p) => p._file || ''),
@@ -123,53 +71,76 @@ function buildCacheContext(root, discovery, packs, opts) {
   return createCacheContext({ root, location, configHash });
 }
 
-function scan(root, opts) {
-  const discovery = discover(root, opts);
+function buildCachedParsers(cacheCtx) {
+  if (!cacheCtx) return null;
+  return {
+    parseJsTs: (file, src, ext) => cacheCtx.parseJs(file, src, ext, parseJsTs),
+    parsePy: (file, src) => cacheCtx.parsePy(file, src, parsePy),
+    parseJava: (file, src) => cacheCtx.parseJava(file, src, parseJava),
+  };
+}
+
+function prepareScan(root, opts) {
+  const loadedCfg = loadConfig(root, opts && opts.configPath);
+  const cfg = loadedCfg.config || {};
+  const mergedOpts = {
+    ...opts,
+    includeFixtures: (opts && opts.includeFixtures !== undefined) ? opts.includeFixtures : Boolean(cfg.includeFixtures),
+    noGitignore: (opts && opts.noGitignore !== undefined) ? opts.noGitignore : Boolean(cfg.noGitignore),
+    javaSafe: (opts && opts.javaSafe !== undefined) ? opts.javaSafe : Boolean(cfg.javaSafe),
+    extraEntries: Array.isArray(cfg.entries) ? cfg.entries : [],
+    ignorePatterns: Array.isArray(cfg.ignore) ? cfg.ignore : [],
+  };
+  const discovery = discover(root, mergedOpts);
+  // Exclude the project config file itself from string-reference scanning.
+  if (loadedCfg.path) {
+    discovery.textFiles = (discovery.textFiles || []).filter((f) => f !== loadedCfg.path);
+    discovery.allFiles = (discovery.allFiles || []).filter((f) => f !== loadedCfg.path);
+  }
   // The cache file must never be scanned, in any mode: it contains
   // cached symbol names, which would otherwise count as string
-  // references and keep dead code alive. This applies even to a
-  // --no-cache run, where a cache file from an earlier --cache run
-  // may already exist. (The node_modules location is already skipped
-  // by discovery; the dotfile location is filtered here.)
+  // references and keep dead code alive.
   const cacheFile = resolveCacheLocation(root, opts);
   if (cacheFile.startsWith(discovery.root + path.sep)) {
     discovery.textFiles = (discovery.textFiles || []).filter((f) => f !== cacheFile);
     discovery.allFiles = (discovery.allFiles || []).filter((f) => f !== cacheFile);
   }
-  // The baseline file (.deadcode-map.json) is excluded the same way,
-  // and for the same reason: it lists finding ids and symbol names, so
-  // on the run after --update-baseline its contents counted as string
-  // references and demoted SAFE findings to REVIEW — the same self-scan
-  // bug class as the --json output file (a dead file went SAFE on run
-  // 1 and REVIEW on run 2, with the baseline itself as the only
-  // "mention"). The file is still read separately by loadBaseline in
-  // the CLI; it is only excluded from the scan itself. The exclusion
-  // is by exact path at the scanned root (the only place a baseline
-  // is written), never by name elsewhere.
+  // The baseline file (.deadcode-map.json) is excluded the same way:
+  // it lists finding ids and symbol names, so on the run after
+  // --update-baseline its contents counted as string references and
+  // demoted SAFE findings to REVIEW.
   const baselineFile = path.join(discovery.root, BASELINE_FILE);
   discovery.textFiles = (discovery.textFiles || []).filter((f) => f !== baselineFile);
   discovery.allFiles = (discovery.allFiles || []).filter((f) => f !== baselineFile);
-  // Framework packs are loaded before the analysis so their contents
-  // can feed the cache config hash (a pack change forces a re-parse).
+
   const packs = loadFrameworks(path.join(__dirname, '..', 'frameworks'));
-  const cacheCtx = buildCacheContext(root, discovery, packs, opts);
-  const graph = analyzeWithCache(root, discovery, cacheCtx);
+  const customPack = configToFrameworkPack(cfg, loadedCfg.path);
+  if (customPack) packs.push(customPack);
+  const cacheCtx = buildCacheContext(root, discovery, packs, mergedOpts);
+  return { discovery, packs, cacheCtx, mergedOpts, config: cfg };
+}
+
+function finalizeScan(root, opts, discovery, packs, cacheCtx, graph) {
   if (cacheCtx) {
     cacheCtx.save();
-    // Warnings (load + save) go to stderr so `--json -` stdout stays pure JSON.
     for (const w of cacheCtx.warnings) console.error(`deadcode-map cache: ${w}`);
   }
   const git = gitInfo(root, discovery.codeFiles);
   // Coverage is re-read fresh every run (never cached): it is evidence
   // about the current code, and a stale coverage file can only demote
-  // SAFE to REVIEW, never invent a SAFE. --coverage points at an
-  // explicit Cobertura XML or lcov file; --no-coverage ignores any
-  // coverage file in the repo.
+  // SAFE to REVIEW, never invent a SAFE.
   const coverage = opts && opts.noCoverage ? null : parseCoverage(root, opts && opts.coveragePath);
-  const findings = gradeFindings({
-    root: discovery.root, discovery, graph, git, coverage, packs,
-    isLibrary: discovery.isLibrary, javaSafe: Boolean(opts && opts.javaSafe),
+  const rawFindings = gradeFindings({
+    root: discovery.root,
+    discovery,
+    graph,
+    git,
+    coverage,
+    packs,
+    isLibrary: discovery.isLibrary,
+    javaSafe: Boolean(opts && opts.javaSafe),
   });
+  const findings = applyInlineIgnores(discovery.root, graph, rawFindings);
   return {
     root: discovery.root,
     discovery,
@@ -184,4 +155,19 @@ function scan(root, opts) {
   };
 }
 
-module.exports = { scan };
+function scan(root, opts) {
+  const { discovery, packs, cacheCtx, mergedOpts } = prepareScan(root, opts);
+  const graph = analyze(root, discovery, { parsers: buildCachedParsers(cacheCtx) });
+  return finalizeScan(root, mergedOpts, discovery, packs, cacheCtx, graph);
+}
+
+async function scanAsync(root, opts) {
+  const { discovery, packs, cacheCtx, mergedOpts } = prepareScan(root, opts);
+  const preparsed = await parseFilesParallel(root, discovery, cacheCtx, opts && opts.workers);
+  const graph = preparsed
+    ? analyze(root, discovery, { preparsed })
+    : analyze(root, discovery, { parsers: buildCachedParsers(cacheCtx) });
+  return finalizeScan(root, mergedOpts, discovery, packs, cacheCtx, graph);
+}
+
+module.exports = { scan, scanAsync };

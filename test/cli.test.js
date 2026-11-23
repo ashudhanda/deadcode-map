@@ -117,6 +117,47 @@ test('CLI: --fix removes a dead dotted import without touching the live one or m
   assert.equal(rescan.status, 0, `no SAFE findings should remain after --fix, got: ${rescan.stdout} ${rescan.stderr}`);
 });
 
+test('CLI: --fix on a CRLF file removes a dead require() without leaving a bare `const` or stray CR', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-fix-crlf-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 't', main: 'src/a.js' }));
+  fs.writeFileSync(path.join(dir, 'src', 'dead.js'), 'module.exports = () => 1;\n');
+  fs.writeFileSync(path.join(dir, 'src', 'used.js'), 'module.exports = () => 2;\n');
+  // A require() record covers only its declarator, not the `const`:
+  // deleting from the record start used to leave `const const used = ...`.
+  fs.writeFileSync(path.join(dir, 'src', 'a.js'),
+    "const unused = require('./dead');\r\nconst used = require('./used');\r\nconsole.log(used());\r\n");
+  const r = run(dir, ['--fix']);
+  assert.equal(r.status, 0, r.stderr);
+  const fixed = fs.readFileSync(path.join(dir, 'src', 'a.js'));
+  assert.ok(!fixed.includes('unused'), 'dead require must be removed');
+  assert.ok(!fixed.includes('const const'), 'no bare `const` may be left behind');
+  assert.ok(fixed.includes("require('./used')"), 'live require must survive');
+  assert.ok(fixed.includes('console.log(used())'), 'live code must survive');
+  for (let i = 0; i < fixed.length; i++) {
+    if (fixed[i] === '\r') assert.equal(fixed[i + 1], '\n', 'no stray CR outside CRLF');
+  }
+  // The fixed file must still parse.
+  execFileSync(process.execPath, ['--check', path.join(dir, 'src', 'a.js')]);
+});
+
+test('CLI: --fix removes only the dead declarator when require()s share one `const` line', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-fix-shared-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 't', main: 'src/a.js' }));
+  fs.writeFileSync(path.join(dir, 'src', 'dead.js'), 'module.exports = () => 1;\n');
+  fs.writeFileSync(path.join(dir, 'src', 'used.js'), 'module.exports = () => 2;\n');
+  fs.writeFileSync(path.join(dir, 'src', 'a.js'),
+    "const used = require('./used'), unused = require('./dead');\nconsole.log(used());\n");
+  const r = run(dir, ['--fix']);
+  assert.equal(r.status, 0, r.stderr);
+  const fixed = fs.readFileSync(path.join(dir, 'src', 'a.js'), 'utf8');
+  assert.ok(!fixed.includes('unused'), 'dead declarator must be removed');
+  assert.ok(fixed.includes("const used = require('./used');"), 'live declarator must survive intact');
+  assert.ok(fixed.includes('console.log(used())'), 'live code must survive');
+  execFileSync(process.execPath, ['--check', path.join(dir, 'src', 'a.js')]);
+});
+
 test('CLI: --prove proves a deletion when tests pass', () => {
   const dir = copyFixture('js-basic');
   // Make it a git repo with a passing test script.

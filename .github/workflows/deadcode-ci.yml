@@ -1,0 +1,42 @@
+name: deadcode-map CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  deadcode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Scan PR diff and emit SARIF
+        id: scan
+        continue-on-error: true
+        run: |
+          node bin/deadcode-map.js . \
+            --diff origin/${{ github.base_ref }} \
+            --sarif deadcode-map.sarif \
+            --fail-on safe
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && hashFiles('deadcode-map.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: deadcode-map.sarif
+
+      - name: Fail job if new SAFE dead code was introduced
+        if: steps.scan.outcome == 'failure'
+        run: exit 1

@@ -170,8 +170,23 @@
       byFile[f.file].push(f);
     });
     var files = Object.keys(byFile).sort();
+    var filterBanner = activeFile
+      ? '<div class="row" style="margin:0 0 12px"><span class="status">Filtered to <strong>'
+        + escapeHtml(activeFile)
+        + '</strong></span><button type="button" id="clear-file-filter" class="secondary" style="padding:4px 10px;font-size:0.8rem">Show all files</button></div>'
+      : '';
+    function bindClearFilter() {
+      var clearBtn = document.getElementById('clear-file-filter');
+      if (clearBtn) {
+        clearBtn.addEventListener('click', function () {
+          activeFile = null;
+          renderFindings(report);
+        });
+      }
+    }
     if (files.length === 0) {
-      findingsEl.innerHTML = '<p class="status">No findings match this filter' + (activeFile ? ' for ' + escapeHtml(activeFile) : '') + '.</p>';
+      findingsEl.innerHTML = filterBanner + '<p class="status">No findings match this filter' + (activeFile ? ' for ' + escapeHtml(activeFile) : '') + '.</p>';
+      bindClearFilter();
       return;
     }
     var html = '';
@@ -198,7 +213,8 @@
       });
       html += '</div>';
     });
-    findingsEl.innerHTML = html;
+    findingsEl.innerHTML = filterBanner + html;
+    bindClearFilter();
   }
 
   function renderResults(report, repo, warnings) {
@@ -222,6 +238,34 @@
   }
 
   /* ---------------- analysis ---------------- */
+
+  // Run the analyzer in a Web Worker so a 500-file repo does not freeze
+  // the tab; any worker failure (load error, or the worker reporting a
+  // failure) falls back to the main thread, which handles the same
+  // input identically.
+  function runAnalyzer(files, opts) {
+    if (typeof Worker !== 'undefined') {
+      return new Promise(function (resolve, reject) {
+        var worker = new Worker('analyzer-worker.js');
+        var id = Date.now();
+        var fallback = function () {
+          worker.terminate();
+          window.DeadcodeMap.analyzeFilesAsync(files, opts).then(resolve, reject);
+        };
+        worker.onmessage = function (e) {
+          if (e.data && e.data.ok) {
+            worker.terminate();
+            resolve(e.data.report);
+          } else {
+            fallback();
+          }
+        };
+        worker.onerror = fallback;
+        worker.postMessage({ id: id, files: files, opts: opts });
+      });
+    }
+    return window.DeadcodeMap.analyzeFilesAsync(files, opts);
+  }
 
   async function analyze() {
     clearError();
@@ -256,7 +300,18 @@
       }
       var totalBytes = codeBlobs.reduce(function (sum, t) { return sum + (t.size || 0); }, 0);
       if (totalBytes > MAX_TOTAL_BYTES) {
-        warnings.push('repo is over the 5 MB code cap — results cover the first files only');
+        var cappedCodeBlobs = [];
+        var runningBytes = 0;
+        for (var ci = 0; ci < codeBlobs.length; ci++) {
+          var sz = codeBlobs[ci].size || 0;
+          if (runningBytes + sz > MAX_TOTAL_BYTES && cappedCodeBlobs.length > 0) break;
+          runningBytes += sz;
+          cappedCodeBlobs.push(codeBlobs[ci]);
+        }
+        if (cappedCodeBlobs.length < codeBlobs.length) {
+          warnings.push('repo exceeded the 5 MB code cap — analyzed first ' + cappedCodeBlobs.length + ' of ' + codeBlobs.length + ' files');
+          codeBlobs = cappedCodeBlobs;
+        }
       }
       var skippedLarge = blobs.filter(function (t) { return CODE_EXTS.indexOf(extOf(t.path)) >= 0 && t.size > MAX_FILE_BYTES; }).length;
       if (skippedLarge) warnings.push(skippedLarge + ' file(s) over 200 KB skipped');
@@ -292,7 +347,7 @@
       }
 
       setStatus('Analyzing…');
-      var report = await window.DeadcodeMap.analyzeFilesAsync(files, { includeFixtures: includeFixturesInput && includeFixturesInput.checked });
+      var report = await runAnalyzer(files, { includeFixtures: includeFixturesInput && includeFixturesInput.checked });
       if (report.javaSkipped) warnings.push('Java files were skipped (' + (report.javaSkipReason || 'parser unavailable') + ') — use the CLI for Java');
       setStatus('');
       renderResults(report, repo, warnings);

@@ -2,7 +2,7 @@
 
 /** Git evidence: last-touch age + churn per file. Best effort, never fatal. */
 
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -15,18 +15,17 @@ function isGitRepo(root) {
   }
 }
 
-// One batched `git log` for the whole repo instead of two processes per
-// file (log + rev-list). On a 1500-file repo that was ~3000 spawns —
-// the single biggest fixed cost after parsing. The log is newest-first:
-// the first time a file appears is its last touch, and every appearance
-// is one commit touching it.
 function gitInfo(root, files) {
-  const info = new Map(); // abs path -> { lastCommit, ageDays, commits }
+  const info = new Map();
   if (!isGitRepo(root)) return { isRepo: false, info };
   const now = Date.now();
   let out;
   try {
-    out = execFileSync('git', ['-C', root, 'log', '--format=COMMIT:%ct', '--name-only', '--'], { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 });
+    out = execFileSync(
+      'git',
+      ['-C', root, '-c', 'core.quotepath=false', 'log', '--format=COMMIT:%ct', '--name-only', '--'],
+      { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 },
+    );
   } catch (_) {
     return { isRepo: true, info };
   }
@@ -51,7 +50,6 @@ function gitInfo(root, files) {
       }
     }
   }
-  // Only report files the scan asked about; untracked files have no entry.
   const wanted = new Set(files.map((f) => path.resolve(f)));
   for (const key of [...info.keys()]) {
     if (!wanted.has(key)) info.delete(key);
@@ -59,16 +57,31 @@ function gitInfo(root, files) {
   return { isRepo: true, info };
 }
 
+function hasCommand(cmd) {
+  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) return false;
+  try {
+    const checker = process.platform === 'win32' ? 'where' : 'which';
+    return spawnSync(checker, [cmd], { stdio: 'ignore', timeout: 5000 }).status === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 function defaultTestCommand(root, pkg) {
   if (pkg && pkg.scripts && pkg.scripts.test && pkg.scripts.test !== 'echo "Error: no test specified" && exit 1') {
     return 'npm test';
   }
-  // Java: Maven or Gradle, when the build tool is actually installed.
-  // A missing mvn/gradle must never be reported as a test failure, so
-  // the command is only offered when the tool exists. Gradle Wrapper
-  // downloads its own Gradle, but still needs a Java runtime.
+  // Python: pytest when config or tests exist and pytest is available.
+  const looksPython = fs.existsSync(path.join(root, 'pyproject.toml'))
+    || fs.existsSync(path.join(root, 'pytest.ini'))
+    || fs.existsSync(path.join(root, 'setup.py'))
+    || fs.existsSync(path.join(root, 'setup.cfg'));
+  if (looksPython && hasCommand('pytest')) return 'pytest -q';
+
+  // Java: Maven or Gradle, when Java + build tool are installed.
   if (hasCommand('java')) {
     if (fs.existsSync(path.join(root, 'pom.xml')) && hasCommand('mvn')) return 'mvn -q test';
+    if (process.platform === 'win32' && fs.existsSync(path.join(root, 'gradlew.bat'))) return 'gradlew.bat test';
     if (fs.existsSync(path.join(root, 'gradlew'))) return './gradlew test';
     if (fs.existsSync(path.join(root, 'build.gradle')) || fs.existsSync(path.join(root, 'build.gradle.kts'))) {
       if (hasCommand('gradle')) return 'gradle test';
@@ -77,14 +90,4 @@ function defaultTestCommand(root, pkg) {
   return null;
 }
 
-// True when `cmd` resolves on PATH (via the shell builtin `command -v`).
-function hasCommand(cmd) {
-  try {
-    const { spawnSync } = require('child_process');
-    return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore', timeout: 5000 }).status === 0;
-  } catch (_) {
-    return false;
-  }
-}
-
-module.exports = { isGitRepo, gitInfo, defaultTestCommand };
+module.exports = { isGitRepo, gitInfo, defaultTestCommand, hasCommand };
