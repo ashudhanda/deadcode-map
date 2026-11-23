@@ -23,6 +23,9 @@ const { spawnSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 const BIN = path.join(ROOT, 'bin', 'deadcode-map.js');
+// The cache keys its entries by the tool version from package.json; read it
+// here so a version bump never breaks this test again.
+const TOOL_VERSION = require('../package.json').version;
 const { scan } = require('../src/index');
 const { parseJsTs } = require('../src/parse-js');
 const {
@@ -125,7 +128,7 @@ test('cache: default location prefers node_modules, else a dotfile', () => {
 test('cache: corrupt / missing / stale cache files fail open', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcm-cache-corrupt-'));
   const loc = path.join(dir, 'cache.json');
-  const expected = { toolVersion: '0.1.0', parserVersion: 'p', configHash: 'c' };
+  const expected = { toolVersion: TOOL_VERSION, parserVersion: 'p', configHash: 'c' };
   const missing = loadCache(loc, expected);
   assert.equal(missing.entries.size, 0);
   assert.equal(missing.warning, null, 'a missing cache is normal, not a warning');
@@ -142,7 +145,7 @@ test('cache: corrupt / missing / stale cache files fail open', () => {
   // lack `uses` / `topLevelUses`, so reusing them would silently
   // disable the same-file cascade. (A v2 file is rejected the same way:
   // it lacks the Java fields and Python class inventory batch 6 added.)
-  fs.writeFileSync(loc, JSON.stringify({ format: 1, toolVersion: '0.1.0', parserVersion: 'p', configHash: 'c', entries: {} }));
+  fs.writeFileSync(loc, JSON.stringify({ format: 1, toolVersion: TOOL_VERSION, parserVersion: 'p', configHash: 'c', entries: {} }));
   const oldFormat = loadCache(loc, expected);
   assert.equal(oldFormat.entries.size, 0);
   assert.match(oldFormat.warning, /unsupported format/);

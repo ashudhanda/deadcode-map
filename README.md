@@ -12,14 +12,16 @@ JS / TypeScript and Python in v1, one command, one mental model. Java (private-o
 
 ## The map
 
-![deadcode-map HTML map of the js-basic fixture: red SAFE nodes, amber REVIEW nodes, grey file nodes](docs/html-map-screenshot.png)
+![deadcode-map HTML map of umami (1,511 files): red SAFE nodes, amber REVIEW nodes, grey file nodes](docs/umami-map.png)
 
-A scan of the repo's own `fixtures/js-basic` fixture (9 files) rendered with
-`deadcode-map fixtures/js-basic --map deadcode-map.html`. Red nodes are SAFE —
+A scan of [umami](https://github.com/umami-software/umami) (1,511 files, 5,184 imports) rendered with
+`deadcode-map <umami> --map umami-map.html`: 36 SAFE, 71 REVIEW, 529 KEEP. Red nodes are SAFE —
 provably dead; amber nodes are REVIEW — a human should look; grey nodes are
 files. Drag to pan, scroll to zoom, click a node for its evidence and the
 exact delete diff. The map is one self-contained HTML file: no CDN, no server,
 open it by double-clicking.
+
+![Map interaction: filter to SAFE, open a dead symbol's delete diff, copy it, drag a node, zoom](docs/umami-map-demo.gif)
 
 ## Install
 
