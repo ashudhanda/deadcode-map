@@ -67,10 +67,21 @@ test('web js-basic: planted dead items are found', () => {
 test('web js-basic: SAFE false-positive rate is 0%', () => {
   const f = loadFixture('js-basic').findings;
   const safe = f.filter((x) => x.grade === 'SAFE');
+  // Planted SAFE items: dead-file, unused import, unreachable code.
+  // dynamic.js file is also genuinely dead (nothing imports it).
+  // lazy-target.js is second-order dead (cascade): its only importer is
+  // dead dynamic.js, which loads it via import() — deleting dynamic.js
+  // leaves lazy-target.js unreferenced in the same run (the CLI grades
+  // it SAFE the same way; the web used to keep it at REVIEW on the
+  // dead file's string mention).
   const expectedSafe = new Set([
-    'file:src/dead-file.js', 'file:src/dynamic.js',
+    'file:src/dead-file.js', 'file:src/dynamic.js', 'file:src/lazy-target.js',
     'import:src/used.js:unusedImport', 'unreachable:src/used.js',
   ]);
+  const lazyTarget = byCategory(f, 'src/lazy-target.js', 'file');
+  assert.equal(lazyTarget.grade, 'SAFE');
+  assert.ok(lazyTarget.evidence.cascade, 'lazy-target.js must carry cascade evidence');
+  assert.deepEqual(lazyTarget.evidence.cascade.via, ['src/dynamic.js']);
   for (const s of safe) {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
@@ -455,13 +466,16 @@ test('web regex-arrow: a backtick inside a regex after => does not swallow the f
   // and is live. Nothing here may be flagged at all.
   assert.equal(out.findings.length, 0, `expected no findings, got ${JSON.stringify(out.findings.map((f) => f.symbol || f.category))}`);
   // The same file scanned alone still parses past the regex line: the
-  // symbols defined after it are found — parseHeaders is REVIEW
-  // (exported, never called from outside), while normalizeHeader and
-  // parseTokens are alive through same-file calls.
+  // symbols defined after it are found — and all three are REVIEW
+  // (exported, never called from outside), exactly as the CLI grades
+  // them: the `module.exports = { ... }` shorthand names are exports,
+  // not uses, so nothing in the file is a live root, and a dead chain
+  // whose head is dead does not rescue its members (the same-file
+  // live-root BFS, not the old flat same-file flag).
   const alone = analyzeFiles([{ path: 'src/headers.js', content: headers }]);
   assert.equal(bySymbol(alone.findings, 'src/headers.js', 'parseHeaders').grade, 'REVIEW');
-  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'normalizeHeader'), undefined);
-  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'parseTokens'), undefined);
+  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'normalizeHeader').grade, 'REVIEW');
+  assert.equal(bySymbol(alone.findings, 'src/headers.js', 'parseTokens').grade, 'REVIEW');
 });
 
 test('web f-string: names used only inside an f-string expression are live', () => {
@@ -550,6 +564,10 @@ test('web py-typer: @app.command() / @app.callback() are KEEP entry points', () 
 test('web js-alias: tsconfig paths aliases (@/* and exact @util) resolve to real files', () => {
   const f = loadFixture('js-alias').findings;
   assert.equal(bySymbol(f, 'src/lib/util.ts', 'helper'), undefined, 'helper is imported through @/lib/util and @util');
+  // onlyAlias is imported ONLY through the @/* star alias: before the
+  // resolveAlias empty-suffix fix no @/* import ever resolved, so it
+  // looked unimported. This pins the fix.
+  assert.equal(bySymbol(f, 'src/lib/util.ts', 'onlyAlias'), undefined, 'onlyAlias is imported only through @/lib/util');
   assert.equal(byCategory(f, 'src/lib/util.ts', 'file'), undefined, 'util.ts is imported through an alias');
   assert.equal(bySymbol(f, 'src/lib/util.ts', 'unusedFn').grade, 'REVIEW');
   assert.equal(f.filter((x) => x.grade === 'SAFE').length, 0);
@@ -580,19 +598,19 @@ test('web py-typechecking: unreferenced type aliases inside if blocks are SAFE',
   // SAFE false-positive rate is 0%: every other SAFE finding would be
   // a live symbol flagged dead.
   const safe = f.filter((x) => x.grade === 'SAFE');
-  const expectedSafe = new Set(['variable:aliases.py:DeadType', 'variable:aliases.py:OtherDeadType', 'variable:aliases.py:LegacyType']);
+  const expectedSafe = new Set(['variable:aliases.py:DeadType', 'variable:aliases.py:OtherDeadType', 'variable:aliases.py:LegacyType', 'variable:aliases.py:retries']);
   for (const s of safe) {
     const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
     assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
   }
 });
 
-test('web py-typechecking: used aliases, class attributes and function locals stay unflagged', () => {
+test('web py-typechecking: used aliases and function locals stay unflagged; a dead class attribute is SAFE', () => {
   const f = loadFixture('py-typechecking').findings;
   assert.equal(bySymbol(f, 'aliases.py', 'NameType'), undefined, 'NameType is used by a string annotation in aliases.py and main.py');
   assert.equal(bySymbol(f, 'aliases.py', 'format_name'), undefined, 'format_name is called from main.py');
   assert.equal(bySymbol(f, 'main.py', 'show'), undefined, 'show is called in its own file');
-  assert.equal(bySymbol(f, 'aliases.py', 'retries'), undefined, 'a plain class attribute is not a module definition');
+  assert.equal(bySymbol(f, 'aliases.py', 'retries').grade, 'SAFE', 'a plain class attribute is recorded as a definition, and unreferenced it is SAFE — the CLI grades it the same way');
   assert.equal(bySymbol(f, 'aliases.py', 'timeout'), undefined, 'a function local is not a module definition');
   assert.equal(bySymbol(f, 'aliases.py', 'make_config').grade, 'REVIEW', 'an exported but never imported function is REVIEW, never SAFE');
 });
@@ -2095,6 +2113,49 @@ test('web manual-script: symbols under scripts/ or tools/ are KEEP, never SAFE',
   assert.equal(r.findings.filter((x) => x.category === 'file' && x.file === '.github/scripts/release.js').length, 0,
     'a script under scripts/ is an entry point, never a dead file');
   assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0, 'no SAFE may come out of a manual-script file');
+});
+
+test('web hidden-dirs: files under hidden directories are never scanned, except .github', () => {
+  // Port of src/discover.js: the CLI's walker skips every directory
+  // whose name starts with '.', except .github — a changeset config,
+  // an IDE directory, or a docs-site build directory is not repo
+  // code. The web used to scan them, so sveltejs-kit's
+  // .changeset/changelog.js (loaded by the changesets CLI, never
+  // imported) looked like a dead export and went SAFE once the
+  // exported rule was narrowed to app-kind files. A hidden FILE in a
+  // visible directory is still scanned, exactly as in the CLI, which
+  // skips hidden directories only.
+  const r = analyzeFiles([
+    { path: '.changeset/changelog.js', content: 'export function getReleaseLine() { return ""; }\n' },
+    { path: 'docs/.vitepress/theme/x.js', content: 'export function helper() { return 1; }\n' },
+    { path: '.github/scripts/release.js', content: 'function release() { return 1; }\n' },
+    { path: '.eslintrc.cjs', content: 'export function lint() { return 1; }\n' },
+  ]);
+  assert.equal(r.findings.filter((x) => x.file === '.changeset/changelog.js').length, 0, '.changeset/ is never scanned');
+  assert.equal(r.findings.filter((x) => x.file === 'docs/.vitepress/theme/x.js').length, 0, '.vitepress/ is never scanned');
+  assert.ok(r.findings.some((x) => x.file === '.github/scripts/release.js'), '.github/ is scanned');
+  assert.ok(r.findings.some((x) => x.file === '.eslintrc.cjs'), 'a hidden file in a visible directory is scanned');
+});
+
+test('web root-pkg: the dead-dependency check reads the root package.json, not a nested one', () => {
+  // The CLI's discover reads the root manifest. The web used to take
+  // the first package.json in input order, so a nested docs/ package
+  // (listed first) made its own dependencies look like repo
+  // dependencies — axios's docs-only @splidejs/splide was flagged
+  // REVIEW once the hidden-dir skip removed the .vitepress string
+  // mention that used to save it. The shallowest manifest wins now,
+  // whatever order the files arrive in.
+  const docsPkg = JSON.stringify({ name: 'docs', dependencies: { '@splidejs/splide': '^4.1.4' } });
+  const rootPkg = JSON.stringify({ name: 'axios', version: '1.0.0', dependencies: { formdata: '^1.0.0' } });
+  const r = analyzeFiles([
+    { path: 'docs/package.json', content: docsPkg },
+    { path: 'package.json', content: rootPkg },
+    { path: 'lib/index.js', content: "import FormData from 'formdata';\nconsole.log(FormData);\n" },
+  ]);
+  assert.equal(r.findings.filter((x) => x.category === 'dependency' && x.symbol === '@splidejs/splide').length, 0,
+    'a docs-only dependency is not a repo dependency');
+  assert.equal(r.findings.filter((x) => x.category === 'dependency' && x.symbol === 'formdata').length, 0,
+    'an imported root dependency is not flagged');
 });
 
 const { parsePy } = require('../docs/analyzer');

@@ -632,6 +632,49 @@ preact 1 (`memo` in `demo/suspense.jsx` — the known JSX-pragma CLI
 gap), date-fns 1 (the one-off `expectify.js` codemod), typer 4,
 umami 36, everything else 0.
 
+### Batch 14 update (2026-11-23)
+
+Batch 13 ended with the web checker missing 52 CLI SAFE findings —
+the web had no dead-file detection for JS/TS, so dead files and the
+symbols inside them graded REVIEW while the CLI graded them SAFE
+(umami 33, nestjs 16, typer 2, django 1). Batch 14 ports dead-file
+detection to the web analyzer: grading repeats to a fixpoint (at most
+6 passes), ignoring usage from files already graded SAFE-dead — dead
+importers, dead string mentions, and dead callers do not keep a file
+or a symbol alive — with cascade evidence (`{ iteration, via }`) on
+findings that appear only in a later pass. The same port brings
+per-file library/app kind (the kind comes from the nearest manifest
+above the file, not a repo-global flag, so an exported-but-uncalled
+symbol in an app repo is SAFE while in a library it stays REVIEW),
+workspace self-references (a monorepo package imported by its own
+name resolves to its own source), `.test-d.` files as test files and
+entry points, the `@/*` alias empty-suffix fix, case-insensitive entry
+basenames, hidden-directory skipping, and Next.js `instrumentation.ts`
+as a keep file. It also ports the same-file live-root BFS (a symbol
+counts as same-file-live only through live code — uses from dead
+files never seed liveness) and the Python class-body assignment
+recording with the CLI's FP-6 guardrails (override, cross-file
+attribute read, Sphinx docs, external base, config class, chained
+alias), which recovers typer's `command_class` / `group_class` and
+Django's `handles_files`.
+
+Web/CLI parity (`web-bench14.js`, 13 repos): missed CLI SAFE **52 →
+0**, web-only SAFE stays **0** — CLI SAFE 67, web SAFE 67, the same
+67 ids (umami 36, nestjs 24, typer 4, django 2, vue2 1; gson, junit5,
+petclinic 0 under `--java-safe`). The 139 remaining grade diffs are
+all between REVIEW and KEEP (126 web REVIEW vs CLI KEEP, 13 web KEEP
+vs CLI REVIEW) — no SAFE-grade disagreement anywhere. The CLI is
+unchanged (no `src/` changes), re-verified identical to batch 13 on
+the spot-checked repos (umami 36 SAFE / 636 findings, nestjs 24 /
+2,682, typer 4 / 2,155). Fixtures `js-batch14-deadfile`,
+`js-batch14-parity`, `js-same-file-bfs`, `js-alias`,
+`py-batch14-class-attrs` + 36 tests; full suite: 402 tests (401
+pass, 1 skipped — the javac test). Dogfood 0 findings. The next gap
+is grade parity, not recall: Django's 131 diffs are mostly
+framework-invoked names the CLI keeps (migration classes,
+templatetag functions, management-command methods) that the web
+grades REVIEW.
+
 Java landed in the CLI in batch 6 (private-only SAFE:
 tree-sitter-java, calls grouped by name + arity, field read-vs-write
 tracking, fail-open on parse errors; exact-16 fixture SAFE set, 0

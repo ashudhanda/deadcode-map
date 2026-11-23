@@ -51,7 +51,13 @@ test('web analyzer: Object.prototype symbol names do not crash the scan', () => 
 });
 
 test('web analyzer: a standalone function named like a prototype member is handled', () => {
+  // b.js is the entry point (package.json main): the program is live,
+  // so the function it imports and calls must not be flagged. (Without
+  // the entry, b.js itself is dead — nothing imports it — and the CLI
+  // grades both files SAFE and hasOwnProperty REVIEW, since its only
+  // caller is dead code; the cascade must agree with that, not hide it.)
   const out = analyzeFiles([
+    { path: 'package.json', content: JSON.stringify({ name: 't', main: 'src/b.js' }) },
     { path: 'src/a.js', content: 'function hasOwnProperty(x) { return !!x; }\nmodule.exports = { hasOwnProperty };\n' },
     { path: 'src/b.js', content: 'const { hasOwnProperty } = require("./a");\nconsole.log(hasOwnProperty(1));\n' },
   ]);

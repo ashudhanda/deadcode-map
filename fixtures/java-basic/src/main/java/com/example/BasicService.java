@@ -43,7 +43,7 @@ public class BasicService {
     counter += 1;
     writeOnlyCounter = 5;
     if (false) { System.out.println("never"); }
-    return helperUsed() + format("x") + privateStaticUsed() + mixedLive;
+    return helperUsed() + format("x").length() + privateStaticUsed() + mixedLive;
   }
 
   public int sum() {

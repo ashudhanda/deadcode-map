@@ -22,7 +22,8 @@ def format_name(name: "NameType") -> str:
 
 
 class Config:
-    # A plain class attribute: not a module definition, never flagged.
+    # A plain class attribute: recorded as a definition, and
+    # unreferenced here it is SAFE (the CLI grades it the same way).
     retries = 3
 
 

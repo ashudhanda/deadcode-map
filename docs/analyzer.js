@@ -32,6 +32,32 @@
  * - `__unittest` is a KEEP module attribute (unittest traceback
  *   trimming), and an import shadowed by a same-file top-level
  *   definition is a conditional definition, never a dead import.
+ * - Dead-file cascade (batch 14): grading repeats to a fixpoint (at
+ *   most 6 passes), ignoring usage from files already graded SAFE-dead
+ *   — dead importers, dead string mentions, and dead callers do not
+ *   keep a file or a symbol alive. A file's string refs count only
+ *   top-level symbols (locals never keep a file alive).
+ * - Per-file library / app kind (batch 14): the kind comes from the
+ *   nearest manifest above the file, not from a repo-global flag — so
+ *   an exported-but-uncalled symbol in an app repo is SAFE, while in
+ *   a library (or with no manifest signal) it stays REVIEW.
+ * - Workspace self-references (batch 14): a monorepo package imported
+ *   by its own name resolves to the package's own source (FP-8).
+ * - `.test-d.` files are test files and entry points (batch 14).
+ * - Alias patterns with an empty suffix (batch 14): `@/*` matches
+ *   any `@/` import — the old slice(-0) check compared the whole
+ *   source against '' and never matched, so every `@/` import missed
+ *   its edge and the target's exports looked dead (umami, 166 false
+ *   SAFEs before the fix).
+ * - Entry basenames are case-insensitive (batch 14): `Gruntfile.js`
+ *   is an entry exactly like `gruntfile.js` (src/discover.js).
+ * - Hidden directories except .github are not scanned (batch 14):
+ *   the CLI walk skips dot-directories, so `.changeset/` files are
+ *   never flagged here either.
+ * - Next.js instrumentation files (batch 14): `instrumentation.ts`
+ *   is a keepFiles file in frameworks/next.json — Next.js calls its
+ *   `register()` at server startup, so the file and its exports are
+ *   KEEP, never SAFE.
  *
  * No browser-only APIs in this file: it runs in Node and in the browser.
  * UMD wrapper: module.exports in Node, window.DeadcodeMap in the browser.
@@ -108,7 +134,14 @@ var JSX_PRAGMA_NAMES = [
 // references pass. 200 lines still bounds a malformed statement.
 var IMPORT_STMT_MAX_LINES = 200;
 
-var TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
+var TEST_FILE = /(\.test\.|\.spec\.|\.test-d\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
+// `.test-d.` is the tsd / expect-type marker (a file of type assertions
+// the type checker runs): a test entry point like `.spec.` / `.test.`,
+// never a dead file — mirrors src/confidence.js TEST_FILE in the CLI.
+// Without it a type-test file graded SAFE-dead poisoned its imports:
+// its only importer looked dead, so the imported helper file went SAFE
+// too, while the CLI keeps the whole test file and everything it
+// imports.
 // `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
 // runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
 // test entry point like `.spec.` / `.test.`, never a dead file —
@@ -123,11 +156,11 @@ var TEST_DIR = /(^|\/)(test|tests|__tests__)\//;
 var CONFIG_FILE = /(\.config\.[jt]s|webpack\.config|vite\.config|jest\.config|babel\.config|tailwind\.config|\.d\.ts$)/;
 var ENTRY_BASENAMES = new Set([
   'index', 'main', 'app', 'server', 'cli', 'bin', 'entry', 'setup',
-  'wsgi', 'asgi', 'manage', '__main__',
+  'wsgi', 'asgi', 'manage', '__main__', 'gulpfile', 'gruntfile',
 ]);
 var ENTRY_PATTERNS = [
   /(^|\/)(pages|app|routes|views)\//,
-  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
+  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /\.test-d\.[jt]sx?$/, /\.e2e-spec\.[jt]sx?$/, /_test\.py$/, /test_[^/]+\.py$/,
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
   /\/migrations\//, /\/seeds?\//,
@@ -161,6 +194,40 @@ var FRAMEWORK_KEEP_DECORATORS = [
   'model_validator', 'field_validator', 'computed_field', 'root_validator',
   'validator', 'overload',
 ];
+// Framework entry patterns, ported from the CLI packs
+// (frameworks/*.json, src/confidence.js frameworkKeepFile): a file
+// matching one is framework-resolved, so its symbols are KEEP, never
+// SAFE or REVIEW — Django discovers migrations and management
+// commands, Next.js resolves route/middleware files, pytest collects
+// test files. The web already covers the pytest patterns
+// (TEST_FILE/TEST_DIR) and the Next.js route patterns (ROUTE_DIR);
+// they are listed here so the port stays faithful to the packs and
+// cannot drift from them. Both keepFile and keepSymbols use it, as
+// in the CLI (confidence.js: keepFile and keepSymbols both take
+// fwReasons). `src` is the pack's pattern text, used verbatim in
+// the reason so it matches the CLI's reason string.
+var FRAMEWORK_KEEP_PATTERNS = [
+  { pack: 'django.json', src: '(^|/)migrations/', pattern: /(^|\/)migrations\// },
+  { pack: 'django.json', src: '(^|/)management/commands/', pattern: /(^|\/)management\/commands\// },
+  { pack: 'next.json', src: '(^|/)pages/', pattern: /(^|\/)pages\// },
+  { pack: 'next.json', src: '(^|/)app/', pattern: /(^|\/)app\// },
+  { pack: 'next.json', src: '(^|/)src/app/', pattern: /(^|\/)src\/app\// },
+  { pack: 'next.json', src: '(^|/)src/pages/', pattern: /(^|\/)src\/pages\// },
+  { pack: 'next.json', src: 'middleware\\.(js|jsx|ts|tsx)$', pattern: /middleware\.(js|jsx|ts|tsx)$/ },
+  { pack: 'next.json', src: 'proxy\\.(js|jsx|ts|tsx)$', pattern: /proxy\.(js|jsx|ts|tsx)$/ },
+  { pack: 'next.json', src: 'instrumentation\\.(js|ts)$', pattern: /instrumentation\.(js|ts)$/ },
+  { pack: 'next.json', src: 'next\\.config\\..*', pattern: /next\.config\..*/ },
+  { pack: 'pytest.json', src: '(^|/)test_.*\\.py$', pattern: /(^|\/)test_.*\.py$/ },
+  { pack: 'pytest.json', src: '(.*)_test\\.py$', pattern: /(.*)_test\.py$/ },
+  { pack: 'pytest.json', src: '(^|/)conftest\\.py$', pattern: /(^|\/)conftest\.py$/ },
+];
+function frameworkKeepReason(rel) {
+  for (var i = 0; i < FRAMEWORK_KEEP_PATTERNS.length; i++) {
+    var entry = FRAMEWORK_KEEP_PATTERNS[i];
+    if (entry.pattern.test(rel)) return 'framework pack ' + entry.pack + ': matches ' + entry.src;
+  }
+  return null;
+}
 
 // Java framework stereotypes on an enclosing class: the framework
 // reflects over the class's private members, so members are REVIEW at
@@ -621,6 +688,36 @@ function parseJs(rel, raw) {
     // fail-open (a parse without them falls back to the old flag).
     bareReferences: new Set(), bareCalls: new Set(),
   };
+  // Positioned twin of `references` / `calls`, for per-definition
+  // scopes (same-file cascade): every name the references pass
+  // records, with the line and column it sits on. The post-pass below
+  // attributes each occurrence to the innermost definition whose body
+  // contains it (port of src/parse-js.js pass 4).
+  var occurrences = [];
+  // Scope extent of a definition (port of the byte range the CLI's
+  // tree-sitter parse records): the declaration column, and the line /
+  // column where the body closes. Defaults cover a body-less
+  // definition (an overload signature, an expression-bodied arrow, a
+  // type alias): the close is the first `}` after the name on the
+  // declaration line, or the end of the line when there is none. A
+  // scope that opens a block overwrites the close when its block pops
+  // (see the pop below). `bodyCol` is where the definition's own
+  // expression begins on the declaration line — the name column by
+  // default, but for a function-valued variable the function
+  // expression: `var Monitoring = Monitoring || (function () {...})`
+  // reads the pre-existing global on the right-hand side before the
+  // function starts, and that read runs in the enclosing scope, not
+  // inside the new function (the CLI's tree-sitter range for the
+  // function starts at the `function` keyword), so it must not be
+  // attributed to the definition itself.
+  function initScopeExtent(def, line, nameCol, bodyCol) {
+    def.declCol = nameCol;
+    def.bodyCol = bodyCol === undefined ? nameCol : bodyCol;
+    def.closeLine = def.startLine;
+    var ci = line.slice(nameCol).indexOf('}');
+    def.closeCol = ci < 0 ? Infinity : nameCol + ci;
+    return def;
+  }
   // Absolute offset of each line in the stripped code, so the
   // bare-reference pass can look at the characters around a name even
   // across a line break (`obj\n.foo()` is still a member name).
@@ -823,8 +920,9 @@ function parseJs(rel, raw) {
   // drops below it. `pendingScopeKind` is a declaration whose body
   // `{` lands on a later line (a signature split across lines) — the
   // first line after it that opens a brace is the body.
-  var scopeStack = []; // {kind: 'function'|'class', depth}
+  var scopeStack = []; // {kind: 'function'|'class', depth, def}
   var pendingScopeKind = null;
+  var pendingScopeDef = null; // definition that owns the pending scope
   // True when a definition on the current line sits inside a function
   // body: walk the scope stack from the innermost scope out — the
   // first function or class entry decides (a bare block pushes
@@ -896,7 +994,20 @@ function parseJs(rel, raw) {
     // Pop class contexts whose block closed.
     while (classStack.length && braceDepth < classStack[classStack.length - 1].depth) classStack.pop();
     // Pop function/class scopes whose block closed on an earlier line.
-    while (scopeStack.length && braceDepth < scopeStack[scopeStack.length - 1].depth) scopeStack.pop();
+    // A popped scope closes its definition: the close line is the line
+    // just processed (ln is 0-based, so the 1-based close line is ln),
+    // and the close column is the first `}` on it — code after that
+    // brace on the same line (`} else { ... }`, `}; const x = ...`)
+    // is outside the definition, not inside it.
+    while (scopeStack.length && braceDepth < scopeStack[scopeStack.length - 1].depth) {
+      var poppedScope = scopeStack.pop();
+      if (poppedScope.def) {
+        poppedScope.def.closeLine = ln;
+        var closeText = lines[ln - 1] || '';
+        var closeIdx = closeText.indexOf('}');
+        poppedScope.def.closeCol = closeIdx < 0 ? Infinity : closeIdx;
+      }
+    }
     // A definition inside a `declare module` / `declare global` block is
     // a declaration-merging augmentation, not a standalone definition.
     var inAmbient = ambientStack.length > 0;
@@ -905,15 +1016,24 @@ function parseJs(rel, raw) {
     // push at the end of the line reads these.
     var fnBodyHere = null;
     var methodBodyHere = null;
+    // Definitions declared on this line that can own a scope, for the
+    // scope push below (a variable is never a scope owner).
+    var lineClassDef = null;
+    var lineMethodDef = null;
+    var lineFnDef = null;
+    var lineConstDef = null;
 
     // Class declaration.
     m = line.match(/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/);
     if (m) {
-      parsed.definitions.push({
+      var classDef = {
         name: m[1], kind: 'class', exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
         local: isLocalHere(),
-      });
+      };
+      parsed.definitions.push(classDef);
+      initScopeExtent(classDef, line, m.index + m[0].lastIndexOf(m[1]));
+      lineClassDef = classDef;
       markDeclared(lineNo, m[1]);
     } else if (classStack.length) {
       // Method inside a class body — but only when the `name(` line
@@ -947,6 +1067,8 @@ function parseJs(rel, raw) {
           if (/\bget\s*$/.test(modPart)) methodDef.isGetter = true;
           if (/\bset\s*$/.test(modPart)) methodDef.isSetter = true;
           parsed.definitions.push(methodDef);
+          initScopeExtent(methodDef, line, mm.index + mm[0].lastIndexOf(mm[1]));
+          lineMethodDef = methodDef;
           markDeclared(lineNo, mm[1]);
           methodBodyHere = bodyOpensOnLine(line, mm.index + mm[0].length - 1);
         }
@@ -976,11 +1098,14 @@ function parseJs(rel, raw) {
     if (m) {
       var bracketTop = bracketTopAtLineStart[ln];
       if (bracketTop !== '(' && bracketTop !== '[' && !prevLineContinuesExpr(ln)) {
-        parsed.definitions.push({
+        var fnDef = {
           name: m[1], kind: 'function', exported: /^\s*export\b/.test(line),
           startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
           local: isLocalHere(),
-        });
+        };
+        parsed.definitions.push(fnDef);
+        initScopeExtent(fnDef, line, m.index + m[0].lastIndexOf(m[1]));
+        lineFnDef = fnDef;
       }
       markDeclared(lineNo, m[1]);
       fnBodyHere = bodyOpensOnLine(line, m.index + m[0].length - 1);
@@ -991,11 +1116,34 @@ function parseJs(rel, raw) {
     if (m && !line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+\{/)) {
       var rhs = line.slice(m.index + m[0].length);
       var kind = /=>|function\b/.test(rhs) ? 'function' : 'variable';
-      parsed.definitions.push({
+      var constDef = {
         name: m[1], kind: kind, exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
         local: isLocalHere(),
-      });
+      };
+      parsed.definitions.push(constDef);
+      // For a function-valued binding the body starts at the function
+      // expression, not at the name: an initializer read before it
+      // (`var M = M || (function () {...})`) belongs to the enclosing
+      // scope (see initScopeExtent). An arrow's body starts at its
+      // parameter list — or at the bare parameter when there is none.
+      var bodyCol;
+      if (kind === 'function') {
+        var rhsStart = m.index + m[0].length;
+        var fnAt = rhs.search(/\bfunction\b/);
+        if (fnAt >= 0) bodyCol = rhsStart + fnAt;
+        else {
+          var arrowAt = rhs.indexOf('=>');
+          var parenAt = rhs.indexOf('(');
+          if (parenAt >= 0 && (arrowAt < 0 || parenAt < arrowAt)) bodyCol = rhsStart + parenAt;
+          else {
+            var firstNonSpace = rhs.search(/\S/);
+            bodyCol = rhsStart + (firstNonSpace < 0 ? 0 : firstNonSpace);
+          }
+        }
+      }
+      initScopeExtent(constDef, line, m.index + m[0].lastIndexOf(m[1]), bodyCol);
+      if (kind === 'function') lineConstDef = constDef;
       markDeclared(lineNo, m[1]);
     }
 
@@ -1007,11 +1155,13 @@ function parseJs(rel, raw) {
     // looked dead (zustand src/middleware.ts).
     m = line.match(/^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)((?:\s*<[^>]*>)?\s*(?:=|\{|extends\b))/);
     if (m) {
-      parsed.definitions.push({
+      var typeDef = {
         name: m[1], kind: 'type', exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
         local: isLocalHere(),
-      });
+      };
+      parsed.definitions.push(typeDef);
+      initScopeExtent(typeDef, line, m.index + m[0].lastIndexOf(m[1]));
       markDeclared(lineNo, m[1]);
     }
 
@@ -1035,30 +1185,46 @@ function parseJs(rel, raw) {
     // or early-popped scope costs a missed local (fail open), never a
     // top-level definition misread as local.
     var netOpens = opens - closes;
-    if (cm && netOpens > 0) scopeStack.push({ kind: 'class', depth: braceDepth });
-    else if (cm && !pendingScopeKind && line.indexOf('{', cm.index + cm[0].length) === -1) pendingScopeKind = 'class';
+    if (cm && netOpens > 0) scopeStack.push({ kind: 'class', depth: braceDepth, def: lineClassDef });
+    else if (cm && !pendingScopeKind && line.indexOf('{', cm.index + cm[0].length) === -1) { pendingScopeKind = 'class'; pendingScopeDef = lineClassDef; }
     var pushedFnScope = false;
-    var pushFnScope = function () {
+    var pushFnScope = function (owner) {
       if (pushedFnScope || netOpens <= 0) return;
       pushedFnScope = true;
-      scopeStack.push({ kind: 'function', depth: braceDepth });
+      scopeStack.push({ kind: 'function', depth: braceDepth, def: owner || null });
     };
-    if (fnBodyHere === 'same' || methodBodyHere === 'same') pushFnScope();
-    else if ((fnBodyHere === 'pending' || methodBodyHere === 'pending') && !pendingScopeKind) pendingScopeKind = 'function';
-    if (!pushedFnScope && /=>\s*\{/.test(line)) pushFnScope();
+    if (fnBodyHere === 'same' || methodBodyHere === 'same') pushFnScope(lineFnDef || lineMethodDef);
+    else if ((fnBodyHere === 'pending' || methodBodyHere === 'pending') && !pendingScopeKind) { pendingScopeKind = 'function'; pendingScopeDef = lineFnDef || lineMethodDef; }
+    if (!pushedFnScope && /=>\s*\{/.test(line)) pushFnScope(lineConstDef);
     if (!pushedFnScope) {
       // An anonymous function expression (`setTimeout(function () {`,
       // `.then(function (x) {`): same signature scan as a declaration.
       var fnex = /function\s*[A-Za-z_$]*\s*\(/.exec(line);
       if (fnex) {
         var fnexBody = bodyOpensOnLine(line, fnex.index + fnex[0].length - 1);
-        if (fnexBody === 'same') pushFnScope();
-        else if (fnexBody === 'pending' && !pendingScopeKind) pendingScopeKind = 'function';
+        if (fnexBody === 'same') pushFnScope(null);
+        else if (fnexBody === 'pending' && !pendingScopeKind) { pendingScopeKind = 'function'; pendingScopeDef = null; }
       }
     }
-    if (pendingScopeKind && netOpens > 0) {
-      scopeStack.push({ kind: pendingScopeKind, depth: braceDepth });
+    // A pending scope whose body turns out to be empty (`) {}` on the
+    // continuation line of a multi-line signature, or a lone `{}`) is
+    // complete: clear it, or it stays dangling and gets attached to
+    // the next block that opens — swallowing the rest of the file into
+    // the wrong definition's `uses` (a NestJS spec's
+    // `constructor(...) {}` did exactly that, making every class the
+    // spec instantiates look dead). A pending CLASS scope cannot hit
+    // this: it is only set when the class line has no `{` at all, and
+    // a lone `{}` line cannot be a class body without its `class`
+    // line — the `)` guard scopes the clear to function/method
+    // signatures.
+    if (pendingScopeKind === 'function' && netOpens === 0 && (/\)\s*\{\s*\}\s*$/.test(line) || /^\s*\{\s*\}\s*$/.test(line))) {
       pendingScopeKind = null;
+      pendingScopeDef = null;
+    }
+    if (pendingScopeKind && netOpens > 0) {
+      scopeStack.push({ kind: pendingScopeKind, depth: braceDepth, def: pendingScopeDef || null });
+      pendingScopeKind = null;
+      pendingScopeDef = null;
     }
     void depthBefore;
   }
@@ -1573,7 +1739,10 @@ function parseJs(rel, raw) {
       expBody.split(',').forEach(function (part) {
         var bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/);
         var localName = (bits[0] || '').trim();
-        if (localName && importLocalNames.has(localName)) parsed.references.add(localName);
+        if (localName && importLocalNames.has(localName)) {
+          parsed.references.add(localName);
+          occurrences.push({ name: localName, line: lineNo2, col: 0 });
+        }
       });
       continue;
     }
@@ -1602,6 +1771,7 @@ function parseJs(rel, raw) {
         }
         if (regionDepth === 1 && isExportEntryName(l, regionIdM.index, regionId.length)) continue;
         parsed.references.add(regionId);
+        occurrences.push({ name: regionId, line: lineNo2, col: regionIdM.index });
         // A method's own definition name is not a bare read (see
         // isMethodDefAt); a value or shorthand in the export object is.
         if (!isMethodDefAt(lineOffsets[li] + regionIdM.index, regionId.length, li)
@@ -1616,6 +1786,7 @@ function parseJs(rel, raw) {
         if (regionDeclared.has(regionCm[1])) continue;
         if (regionSkipIds && regionSkipIds.has(regionCm[1])) continue;
         parsed.calls.add(regionCm[1]);
+        occurrences.push({ name: regionCm[1], line: lineNo2, col: regionCm.index });
         if (!isMethodDefAt(lineOffsets[li] + regionCm.index, regionCm[1].length, li)
           && isBareAt(lineOffsets[li] + regionCm.index, regionCm[1].length)) parsed.bareCalls.add(regionCm[1]);
       }
@@ -1623,6 +1794,7 @@ function parseJs(rel, raw) {
       var regionNm;
       while ((regionNm = regionNewRe.exec(l)) !== null) {
         parsed.calls.add('constructor');
+        occurrences.push({ name: 'constructor', line: lineNo2, col: regionNm.index });
         parsed.constructed.add(regionNm[1]);
       }
       for (var rd = 0; rd < l.length; rd++) {
@@ -1709,6 +1881,7 @@ function parseJs(rel, raw) {
       if (skipExportsIds && skipExportsIds.has(id)) return; // the `module.exports` tokens themselves
       if (decChain.has(id)) return;
       parsed.references.add(id);
+      occurrences.push({ name: id, line: lineNo2, col: hit.index });
       // A bare read keeps a same-named local alive; a member name, a
       // property key, or a method's own definition name does not (see
       // isBareAt and isMethodDefAt).
@@ -1723,6 +1896,7 @@ function parseJs(rel, raw) {
       if (boundHere && boundHere.has(cm2[1])) continue;
       if (decChain.has(cm2[1])) continue;
       parsed.calls.add(cm2[1]);
+      occurrences.push({ name: cm2[1], line: lineNo2, col: cm2.index });
       // A bare call `foo()` reads the local `foo`; a member call
       // `obj.foo()` names the member, never the local — and a
       // method's own definition line is not a call at all.
@@ -1737,6 +1911,7 @@ function parseJs(rel, raw) {
     var nm;
     while ((nm = newRe.exec(l)) !== null) {
       parsed.calls.add('constructor');
+      occurrences.push({ name: 'constructor', line: lineNo2, col: nm.index });
       parsed.constructed.add(nm[1]);
     }
   }
@@ -1905,6 +2080,61 @@ function parseJs(rel, raw) {
   // (src/parse-js.js); bareCalls stays a Set, like `calls`.
   parsed.bareReferences = [...parsed.bareReferences].sort();
 
+  // Per-definition reference scopes (same-file cascade), port of
+  // src/parse-js.js pass 4: a reference belongs to the innermost
+  // definition whose body contains it (a method body beats its class,
+  // a nested function beats its outer function); references outside
+  // every definition are top-level uses — module code that runs on
+  // import. Calls contribute their callee name the same way (a `new
+  // Foo()` inside a function is a use of Foo and of `constructor` by
+  // that function, not by the file). Variable definitions are NOT
+  // scopes: an initializer runs in the enclosing scope, so references
+  // inside a variable's range belong to the enclosing definition (or
+  // the top level), never to the variable itself — a dead variable
+  // must not take its initializer's references down with it.
+  // Function-valued variables are kind 'function', not 'variable', so
+  // their bodies still scope to them. `uses` and `topLevelUses` are
+  // plain sorted arrays, so a cached parse round-trips them unchanged.
+  // Line granularity has one known limit the CLI's byte ranges do not:
+  // code after a definition's closing `}` on the same line (`} else {
+  // ... }`, `}; const x = ...`) is outside the definition, and the
+  // close-column rule above handles exactly that — but a `}` inside a
+  // template interpolation on the close line can make the rule read
+  // early, which only ever attributes the use to the enclosing scope
+  // (fail-open, never a new SAFE).
+  var scopeDefsJs = parsed.definitions.filter(function (d) { return d.kind !== 'variable'; })
+    .sort(function (a, b) { return (a.startLine - b.startLine) || ((a.declCol || 0) - (b.declCol || 0)); });
+  var usesByDefJs = new Map();
+  var topLevelUsesJs = new Set();
+  occurrences.forEach(function (occ) {
+    var best = null;
+    var bestSpan = Infinity;
+    var bestStart = -1;
+    var bestCol = -1;
+    for (var oi = 0; oi < scopeDefsJs.length; oi++) {
+      var sd = scopeDefsJs[oi];
+      if (sd.startLine > occ.line) break; // sorted: no later def can contain it
+      var sdCloseLine = sd.closeLine || sd.startLine;
+      if (occ.line > sdCloseLine) continue;
+      if (occ.line === sd.startLine && occ.col < (sd.bodyCol === undefined ? sd.declCol || 0 : sd.bodyCol)) continue;
+      if (occ.line === sdCloseLine && occ.col >= (sd.closeCol === undefined ? Infinity : sd.closeCol)) continue;
+      var span = sdCloseLine - sd.startLine;
+      if (!best || span < bestSpan
+        || (span === bestSpan && (sd.startLine > bestStart
+          || (sd.startLine === bestStart && (sd.bodyCol === undefined ? sd.declCol || 0 : sd.bodyCol) > bestCol)))) {
+        best = sd; bestSpan = span; bestStart = sd.startLine; bestCol = sd.bodyCol === undefined ? sd.declCol || 0 : sd.bodyCol;
+      }
+    }
+    if (best) {
+      if (!usesByDefJs.has(best)) usesByDefJs.set(best, new Set());
+      usesByDefJs.get(best).add(occ.name);
+    } else {
+      topLevelUsesJs.add(occ.name);
+    }
+  });
+  parsed.definitions.forEach(function (d) { d.uses = [...(usesByDefJs.get(d) || [])].sort(); });
+  parsed.topLevelUses = [...topLevelUsesJs].sort();
+
   return parsed;
 }
 
@@ -1943,16 +2173,26 @@ function parsePy(rel, raw) {
     unreachable: [], decorators: [], dunder: new Set(), strings: strings,
   };
 
-  var classStack = []; // {name, indent, model}
+  // One record per class-definition site: the class name, its indent,
+  // whether it is a model class, its direct bases (leading identifier
+  // of each entry, mirroring src/parse-py.js baseNamesOf), and the
+  // methods defined directly in its body. A definition recorded in a
+  // class body keeps a reference to its site's record so the post-pass
+  // below can grade it against its own class (external base, no
+  // methods, a same-class method alias); the reference is deleted
+  // before the parse leaves this function, like the CLI's _classStart.
+  var classStack = []; // {name, indent, model, bases, methods, startLine}
+  var classRecords = []; // every class site, in definition order
   var funcStack = []; // {indent} — def lines, so a local inside a method is not a class field
   var pendingDecorators = [];
   var declaredOnLine = {};
-  // Class-attribute assignment lines that are NOT recorded as
-  // definitions (a plain class attribute, or one in a class nested in
-  // a function): the assigned name is still a definition site, not a
-  // read, so it must not count as a bare reference — the CLI's
-  // tree-sitter parser excludes definition sites. Only the bare
-  // channel consults this; the flat references pass is unchanged.
+  // Chained-assignment targets and value-less annotations are
+  // definition sites, not reads, so they must not count as a bare
+  // reference — the CLI's tree-sitter parser excludes definition
+  // sites. Only the bare channel consults this; the flat references
+  // pass is unchanged. (A plain class attribute used to live here
+  // too; since batch 14 it is recorded as a definition below, so its
+  // own line is excluded by markDeclared instead.)
   var bareDeclaredOnLine = {};
 
   // Bracket depth at the start of each line, counted on the stripped
@@ -1996,6 +2236,128 @@ function parsePy(rel, raw) {
     var m = line.match(/^ */);
     return m ? m[0].length : 0;
   }
+  // The class header starting on lines[firstIdx], joined across
+  // continuation lines (brackets open) so a multi-line base list
+  // resolves; a malformed header stops after 20 lines.
+  function classHeaderOf(firstIdx) {
+    var text = lines[firstIdx];
+    var depth = 0;
+    var di;
+    for (di = 0; di < text.length; di++) {
+      if (text[di] === '(' || text[di] === '[') depth++;
+      else if (text[di] === ')' || text[di] === ']') depth--;
+    }
+    var j = firstIdx;
+    while (depth > 0 && j + 1 < lines.length && j - firstIdx < 20) {
+      j++;
+      text += '\n' + lines[j];
+      for (di = 0; di < lines[j].length; di++) {
+        if (lines[j][di] === '(' || lines[j][di] === '[') depth++;
+        else if (lines[j][di] === ')' || lines[j][di] === ']') depth = Math.max(0, depth - 1);
+      }
+    }
+    return text;
+  }
+  // Direct bases of the class whose header starts on lines[firstIdx]:
+  // the leading identifier of each top-level comma-separated entry
+  // (`CallbackDict[str, t.Any]` -> CallbackDict, `mod.Base` -> mod),
+  // mirroring src/parse-py.js baseNamesOf. A base that is not a bare
+  // identifier (`metaclass=X`) contributes its leading name, exactly
+  // as the CLI does — resolving it as a class simply fails
+  // downstream, fail-open.
+  function classBasesOf(firstIdx) {
+    var m = classHeaderOf(firstIdx).match(/\(([\s\S]*)\)/);
+    if (!m) return [];
+    var parts = [];
+    var d = 0;
+    var cur = '';
+    for (var i2 = 0; i2 < m[1].length; i2++) {
+      var ch2 = m[1][i2];
+      if (ch2 === '[' || ch2 === '(') d++;
+      if (ch2 === ']' || ch2 === ')') d--;
+      if (ch2 === ',' && d === 0) { parts.push(cur); cur = ''; } else cur += ch2;
+    }
+    if (cur.trim()) parts.push(cur);
+    return parts.map(function (p) {
+      var mm = p.trim().match(/^[A-Za-z_][A-Za-z0-9_]*/);
+      return mm ? mm[0] : null;
+    }).filter(Boolean);
+  }
+  // The assignment on a line, if any: `{ name, eq }` where `eq` is the
+  // index of the binding `=`, or null. The `=` must sit at bracket
+  // depth 0 — an `=` inside the annotation's call arguments is not a
+  // binding (`age: Annotated[int, Field(ge=0)]` has no value at all:
+  // the CLI's tree-sitter parser records no definition for it, but
+  // the old `(?::[^=]+)?=` regex matched the `=` inside `Field(...)`
+  // and recorded a phantom definition; pydantic's test models are
+  // full of exactly that shape). The input line is stripped code
+  // (stripPy blanks strings and comments to spaces in place), so a
+  // string value reads as trailing spaces after the `=` — any
+  // character at all after the `=` counts as a value, exactly as the
+  // old regex's `=\s*[^=]` did (its `[^=]` matched a blanked space);
+  // a bare `x =` at end of line has no value and is not an
+  // assignment. A walrus (`x := 1`) is not an assignment either —
+  // neither the CLI nor the old regex recorded one — and neither is
+  // a subscript/attribute target (`x[0] = 1`, `x.y = 1`): an opening
+  // bracket before any annotation means the name is indexed, not
+  // bound. `==`, `!=`, `<=`, `>=` and augmented assignment (`+=`)
+  // are not assignments.
+  function matchAssignPy(line) {
+    var m = /^(\s*)([A-Za-z_]\w*)/.exec(line);
+    if (!m) return null;
+    var i = m[0].length;
+    var depth = 0;
+    var annotated = false;
+    while (i < line.length) {
+      var ch = line[i];
+      if (ch === ' ' || ch === '\t') { i++; continue; }
+      if (ch === '#') return null;
+      if (ch === "'" || ch === '"') {
+        var q = ch;
+        var triple = line.substr(i, 3) === q + q + q;
+        i += triple ? 3 : 1;
+        while (i < line.length) {
+          if (line[i] === '\\') { i += 2; continue; }
+          if (triple) {
+            if (line.substr(i, 3) === q + q + q) { i += 3; break; }
+          } else if (line[i] === q) { i++; break; }
+          i++;
+        }
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') {
+        // Before any annotation, an opening bracket means the name
+        // is indexed or called (`x[0] = 1`), not bound; inside the
+        // annotation it is part of the type (`x: list[int] = ...`).
+        if (depth === 0 && !annotated) return null;
+        depth++; i++; continue;
+      }
+      if (ch === ')' || ch === ']' || ch === '}') { depth = Math.max(0, depth - 1); i++; continue; }
+      if (depth === 0) {
+        if (ch === ':' && !annotated) {
+          if (line[i + 1] === '=') return null; // walrus `:=`, not a binding
+          annotated = true;
+          i++;
+          continue;
+        }
+        if (ch === '=') {
+          if (line[i + 1] === '=') return null;
+          if (i + 1 >= line.length) return null;
+          return { name: m[2], eq: i };
+        }
+        // Inside the annotation (`name: str = ...`, `name:
+        // Annotated[int, ...] = ...`) any other text is the type
+        // itself — keep scanning for the binding `=`. Before any
+        // annotation, a character that is neither `:` nor `=` means
+        // this is not an assignment at all (`x.y = 1`, `x += 1`).
+        if (!annotated) return null;
+        i++;
+        continue;
+      }
+      i++;
+    }
+    return null;
+  }
   // Whether the innermost enclosing scope is a function body: scopes
   // nest by indent, so the deeper of the innermost open def / class
   // is the innermost scope. A definition whose innermost scope is a
@@ -2021,6 +2383,13 @@ function parsePy(rel, raw) {
   // `calls` set, which cannot tell `foo()` from `obj.foo()`.
   var bareReferences = new Set();
   var bareCalls = new Set();
+  // Attribute-lookup names (`obj.name`, `self.name`) read anywhere in
+  // this file, including a decorator's argument and a `self.x = ...`
+  // write: the confidence engine's cross-file attribute rule (FP-6)
+  // credits a class attribute when another file reads it as an
+  // attribute. Mirrors src/parse-py.js attributeRefs; serialized as
+  // a sorted array, like bareReferences.
+  var attributeRefs = new Set();
 
   for (var ln = 0; ln < lines.length; ln++) {
     var line = lines[ln];
@@ -2046,11 +2415,21 @@ function parsePy(rel, raw) {
       // body) is a local function, not a method of the class — the
       // CLI's tree-sitter parser records it the same way.
       var isMethod = classStack.length > 0 && indent > classStack[classStack.length - 1].indent && !innermostIsFunction();
+      // The enclosing class, if any: a def whose innermost scope is
+      // the class body carries the class name (a method, or a nested
+      // class, counts for the override inventory); a def nested inside
+      // a method carries none — the CLI's tree-sitter walk stops at
+      // the function boundary. The method name is recorded on the
+      // class record so a later class attribute can test whether it
+      // aliases a method of the same class.
+      var enclosingRec = (!innermostIsFunction() && classStack.length > 0) ? classStack[classStack.length - 1] : null;
       var def = {
         name: dm[2], kind: isMethod ? 'method' : 'function', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
         local: innermostIsFunction(),
       };
+      if (enclosingRec) def.className = enclosingRec.name;
+      if (isMethod && enclosingRec) enclosingRec.methods.add(dm[2]);
       parsed.definitions.push(def);
       if (/^__.*__$/.test(dm[2])) parsed.dunder.add(dm[2]);
       markDeclared(lineNo, dm[2]);
@@ -2063,47 +2442,65 @@ function parsePy(rel, raw) {
       // A Pydantic BaseModel subclass or a @dataclass is a model class:
       // its class attributes are framework-populated fields (see the
       // assignment branch below).
-      var baseM = line.match(/\(([^)]*)\)/);
-      var bases = baseM ? baseM[1] : '';
-      var isModelClass = /BaseModel|TypedDict/.test(bases) || pendingDecorators.some(function (d) { return /dataclass/.test(d); });
-      parsed.definitions.push({
+      var classBases = classBasesOf(ln);
+      var basesText = classHeaderOf(ln);
+      var isModelClass = /BaseModel|TypedDict/.test(basesText) || pendingDecorators.some(function (d) { return /dataclass/.test(d); });
+      var enclosingRecCls = (!innermostIsFunction() && classStack.length > 0) ? classStack[classStack.length - 1] : null;
+      var classDef = {
         name: cm[2], kind: 'class', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
         local: innermostIsFunction(),
-      });
+      };
+      if (enclosingRecCls) classDef.className = enclosingRecCls.name;
+      parsed.definitions.push(classDef);
       markDeclared(lineNo, cm[2]);
-      classStack.push({ name: cm[2], indent: indent, model: isModelClass });
+      var classRec = { name: cm[2], indent: indent, model: isModelClass, bases: classBases, methods: new Set(), startLine: lineNo };
+      classRecords.push(classRec);
+      classStack.push(classRec);
       pendingDecorators = [];
       continue;
     }
-    // Module-level variable assignment: `NAME = ...` or an annotated
+    // Variable assignment: `NAME = ...` or an annotated
     // `NAME: type = ...`. The name is marked declared so its own line
     // does not count as a use of itself. Dunder names (`__version__`,
     // `__all__`) are packaging/protocol metadata and are kept by the
     // dunder rule. A class attribute inside a Pydantic BaseModel /
     // @dataclass is a framework-populated model field (KEEP, never
-    // SAFE); other class attributes are not module definitions and are
-    // skipped. A variable assigned in a function body IS recorded, as
-    // a local variable definition (the CLI's tree-sitter parser
-    // records it the same way): only then can the bare-reference
-    // grading rule tell a dead local from a live one. A name bound
-    // inside a plain block (`if TYPE_CHECKING:`, `try:`, a version
-    // guard) IS a module definition at any indent — the CLI's
-    // tree-sitter parser records it the same way, with the enclosing
-    // block as the parent — so it is recorded here too, as an
-    // unexported variable.
-    var am = line.match(/^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^=]/);
+    // SAFE). Any other class attribute IS recorded too, as a variable
+    // definition carrying its class name (batch 14: the CLI's
+    // tree-sitter parser records every class-body assignment, and
+    // typer's `command_class` / `group_class` and Django's
+    // `handles_files` were missed SAFE because the web recorded
+    // none of them). A variable assigned in a function body IS
+    // recorded, as a local variable definition (the CLI's tree-sitter
+    // parser records it the same way): only then can the
+    // bare-reference grading rule tell a dead local from a live one.
+    // A name bound inside a plain block (`if TYPE_CHECKING:`, `try:`,
+    // a version guard) IS a module definition at any indent — the
+    // CLI's tree-sitter parser records it the same way, with the
+    // enclosing block as the parent — so it is recorded here too, as
+    // an unexported variable.
+    // The binding `=` must sit at bracket depth 0: an `=` inside the
+    // annotation's call arguments is not a binding (see matchAssignPy).
+    var am = matchAssignPy(line);
+    var amName = am ? am.name : null;
+    var amEq = am ? am.eq : -1;
     // A field is directly in the class body (not inside a method: a
     // local inside a method sits deeper than the enclosing def).
     var inFunction = funcStack.length > 0 && indent > funcStack[funcStack.length - 1].indent;
     var inClassBody = classStack.length > 0 && indent > classStack[classStack.length - 1].indent;
-    var enclosingModel = !inFunction && inClassBody && classStack[classStack.length - 1].model;
     // A local variable is an assignment whose innermost enclosing
     // scope is a function — not merely any assignment inside a
     // function: an assignment directly in a class body nested in a
     // function (`def outer(): class Inner: x = 1`) is a class
     // attribute of Inner, not a local of outer.
     var inFunctionScope = innermostIsFunction();
+    var enclosingModel = inClassBody && !inFunctionScope && classStack[classStack.length - 1].model;
+    // The enclosing class record, if this line sits directly in a
+    // class body: the class boundary wins over an enclosing function
+    // (see inFunctionScope above), so a class nested in a function
+    // still owns its attributes.
+    var enclosingClassRec = (inClassBody && !inFunctionScope) ? classStack[classStack.length - 1] : null;
     // lineDepth === 0: a continuation line inside a call, decorator or
     // def signature (`replace_whitespace=False`, a def parameter) looks
     // like an assignment but is a keyword argument, not a binding.
@@ -2121,7 +2518,7 @@ function parsePy(rel, raw) {
     // before the recording below, because a recorded line continues
     // past everything after it.
     if (am && lineDepth === 0) {
-      var chainPos = line.indexOf('=') + 1;
+      var chainPos = amEq + 1;
       var chainDepth = 0;
       while (chainPos < line.length) {
         while (chainPos < line.length && (line[chainPos] === ' ' || line[chainPos] === '\t')) chainPos++;
@@ -2136,7 +2533,7 @@ function parsePy(rel, raw) {
         chainPos += chainM[0].length;
       }
     }
-    if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel || inFunctionScope)) {
+    if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel || inFunctionScope || enclosingClassRec)) {
       // A TypeVar definition (`GrpType = TypeVar("GrpType", bound=...)`,
       // or `typing.TypeVar(...)`): a generic type variable is part of
       // the module's typing surface — it is declared to be named in
@@ -2145,26 +2542,40 @@ function parsePy(rel, raw) {
       // holds TypeVars at REVIEW, never SAFE (batch 13: typer's
       // _click/decorators.py GrpType was flagged SAFE by the web
       // checker while the CLI grades it REVIEW).
-      var rhsPy = line.slice(line.indexOf('=') + 1).trim();
+      var rhsPy = line.slice(amEq + 1).trim();
       var isTypeVarPy = /^(?:typing\.)?TypeVar\s*\(/.test(rhsPy);
-      parsed.definitions.push({
-        name: am[2], kind: 'variable', exported: false,
+      // The terminal value of a (possibly chained) assignment: the
+      // last segment after a top-level `=` — `x = method` and
+      // `a = b = method` both alias `method`, while `a = b == c` is a
+      // comparison, not a chain. Only the first chain target is
+      // recorded as a definition (the web's existing model), so only
+      // its terminal matters here. The terminal also decides the
+      // kind: the CLI records a class-body `x = lambda: ...` as a
+      // method of the class (a lambda assigned in a class body is a
+      // function, and a function in a class body is a method), never
+      // SAFE — so the web records it as a method too.
+      var terminalPy = rhsPy;
+      var tmPy;
+      while ((tmPy = /^([A-Za-z_]\w*)\s*=(?!=)\s*([\s\S]*)$/.exec(terminalPy))) terminalPy = tmPy[2].trim();
+      var termNamePy = /^([A-Za-z_]\w*)\s*$/.exec(terminalPy);
+      var isLambdaAttrPy = Boolean(enclosingClassRec) && /^lambda\b/.test(terminalPy);
+      var assignDef = {
+        name: amName, kind: isLambdaAttrPy ? 'method' : 'variable', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: [],
         frameworkField: Boolean(enclosingModel),
         local: inFunctionScope,
         typeVar: isTypeVarPy,
-      });
-      if (/^__.*__$/.test(am[2])) parsed.dunder.add(am[2]);
-      markDeclared(lineNo, am[2]);
+      };
+      if (enclosingClassRec) {
+        assignDef.className = enclosingClassRec.name;
+        assignDef._classRec = enclosingClassRec;
+        if (isLambdaAttrPy) enclosingClassRec.methods.add(amName);
+      }
+      if (termNamePy) assignDef.chainedAliasOf = termNamePy[1];
+      parsed.definitions.push(assignDef);
+      if (/^__.*__$/.test(amName)) parsed.dunder.add(amName);
+      markDeclared(lineNo, amName);
       continue;
-    }
-    // A class attribute that is not recorded as a definition is still
-    // a definition site: record its line so the bare channel (below)
-    // does not count the assigned name as a read. A model field is
-    // recorded above, so it never reaches here; a method-body local
-    // is recorded above too (its innermost scope is the method).
-    if (am && lineDepth === 0 && inClassBody && !inFunctionScope && !enclosingModel) {
-      noteBareDecl(lineNo, am[2]);
     }
     // A value-less annotation (`timeout: int` in a class body) is a
     // definition site, not a read: the CLI's tree-sitter parser
@@ -2177,7 +2588,7 @@ function parsePy(rel, raw) {
     // a read, not a declaration.
     if (lineDepth === 0 && !am) {
       var annOnly = line.match(/^(\s*)([A-Za-z_]\w*)\s*:/);
-      if (annOnly && line.indexOf('=') === -1) noteBareDecl(lineNo, annOnly[2]);
+      if (annOnly && matchAssignPy(line) === null) noteBareDecl(lineNo, annOnly[2]);
     }
     if (pendingDecorators.length) pendingDecorators = [];
   }
@@ -2380,6 +2791,42 @@ function parsePy(rel, raw) {
       }, names3, keptPlain, reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt));
     }
   }
+
+  // Class-attribute flags (FP-6, mirrors src/parse-py.js): a class
+  // attribute's grading depends on its own class — whether the class
+  // subclasses an externally-defined base (a base name imported by a
+  // non-relative import; a relative import or a base defined in this
+  // file is in-repo), whether the class body defines any method at
+  // all, whether the assigned value aliases a method of the same
+  // class, and whether a Sphinx `#:` comment documents it. The class
+  // record is per definition site; the internal reference is deleted
+  // here, before the parse leaves this function.
+  (function () {
+    var externalImportLocals = new Set();
+    parsed.imports.forEach(function (imp) {
+      if (imp.fromImport && imp.level) return; // relative import: in-repo
+      (imp.names || []).forEach(function (n) { externalImportLocals.add(n.local); });
+    });
+    parsed.definitions.forEach(function (d) {
+      if (!d._classRec) return;
+      var rec = d._classRec;
+      if (d.kind === 'variable') {
+        d.externalBase = rec.bases.some(function (b) { return externalImportLocals.has(b); });
+        d.configClassAttr = d.externalBase && rec.methods.size === 0;
+        if (d.chainedAliasOf && rec.methods.has(d.chainedAliasOf)) d.chainedAlias = true;
+        var row = d.startLine - 2;
+        while (row >= 0 && /^\s*#:/.test(rawLinesPy[row] || '')) { d.documentedAttr = true; row -= 1; }
+      }
+      delete d._classRec;
+    });
+    // Class inventory for the confidence engine's override rules
+    // (FP-6): per class, its name and direct bases. The grading layer
+    // collapses same-name classes in one file the way the CLI's
+    // classesByFile map does (last wins by name).
+    parsed.classes = classRecords.map(function (rec) {
+      return { name: rec.name, bases: rec.bases.slice(), startLine: rec.startLine };
+    });
+  })();
 
   // --- string annotations in nested / multi-line positions (batch 13) ---
   // The per-line annRe in the references loop below only sees a string
@@ -2743,6 +3190,12 @@ function parsePy(rel, raw) {
           }
         }
       }
+      // Attribute-lookup names are recorded separately (see the
+      // attributeRefs declaration above): a decorator's argument
+      // (`@register(Tags.async_support)`) counts too, and so does a
+      // `self.x = ...` write — the CLI adds every attribute node,
+      // and only the bare-reference channel skips decorator members.
+      if (isAttrPy) attributeRefs.add(idPy);
       var isCallPy = false;
       var ke = idRePy.lastIndex;
       while (ke < rl.length && (rl[ke] === ' ' || rl[ke] === '\t')) ke++;
@@ -2772,6 +3225,28 @@ function parsePy(rel, raw) {
         if (!isAttrPy && !decChainPy.has(idPy) && !isStringPrefixPy && !isBareDeclFirstPy) {
           bareReferences.add(idPy);
           if (isCallPy) bareCalls.add(idPy);
+        }
+        // A later occurrence on the declaration line is a read, so it
+        // counts as a flat reference too — the CLI's tree-sitter walk
+        // excludes only the definition site itself (`x = x + 1` reads
+        // x; `encoding = property(lambda self: self.file.encoding)`
+        // reads the `encoding` attribute). Without this, a
+        // self-referential assignment looked dead to the web while the
+        // CLI saw the use. Two shapes are NOT reads and stay excluded:
+        // a keyword-argument name (`x = f(x=1)` names a parameter, it
+        // does not read x), and anything on a def/class line
+        // (`def foo(x=foo)` binds a parameter named foo, it does not
+        // read the function) — so only assignment lines count, and a
+        // name followed by a lone `=` never does.
+        if (!isStringPrefixPy && !isBareDeclFirstPy && !decChainPy.has(idPy)) {
+          var assignLinePy = /^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^=]/.test(rl);
+          if (assignLinePy) {
+            var afterIdPy = idRePy.lastIndex;
+            while (afterIdPy < rl.length && (rl[afterIdPy] === ' ' || rl[afterIdPy] === '\t')) afterIdPy++;
+            var isKwargPy = afterIdPy < rl.length && rl[afterIdPy] === '='
+              && (afterIdPy + 1 >= rl.length || rl[afterIdPy + 1] !== '=');
+            if (!isKwargPy) parsed.references.add(idPy);
+          }
         }
         continue;
       }
@@ -2899,6 +3374,7 @@ function parsePy(rel, raw) {
   // (src/parse-py.js); bareCalls stays a Set, like `calls`.
   parsed.bareReferences = [...bareReferences].sort();
   parsed.bareCalls = bareCalls;
+  parsed.attributeRefs = [...attributeRefs].sort();
 
   return parsed;
 }
@@ -2980,7 +3456,11 @@ function resolveAlias(fromFile, source, aliases, existingFiles) {
     var p = best.paths[i];
     var rest = null;
     if (p.hasStar) {
-      if (source.indexOf(p.prefix) !== 0 || source.slice(-p.suffix.length) !== p.suffix) continue;
+      // An empty suffix always matches (the CLI uses endsWith, and
+      // ''.endsWith is true): the old slice(-0) check compared the
+      // whole source against '' and never matched, so every `@/*`
+      // import missed its edge and the target's exports looked dead.
+      if (source.indexOf(p.prefix) !== 0 || (p.suffix && source.slice(-p.suffix.length) !== p.suffix)) continue;
       rest = source.slice(p.prefix.length, source.length - p.suffix.length);
     } else if (source === p.prefix) {
       rest = '';
@@ -2989,6 +3469,74 @@ function resolveAlias(fromFile, source, aliases, existingFiles) {
       var mapped = p.hasStar ? p.targets[j].replace('*', rest) : p.targets[j];
       var target = resolveFromBase(joinPosix(best.baseUrl, mapped), existingFiles);
       if (target) return target;
+    }
+  }
+  return null;
+}
+
+/**
+ * Workspace package self-references (port of src/graph.js, FP-8): a
+ * monorepo's own packages are imported by name from inside the repo
+ * (`import { createApp } from 'vue'` in vuejs-core, `@scope/a` from a
+ * sibling package). The name resolves to the package's own source,
+ * not to an npm install: the package directory's src/index
+ * (preferred — dist/ is build output and is skipped from scans) or
+ * the manifest's main / module / types entry when no src/index
+ * exists. Longest name wins, so `@vue` never shadows `@vue/shared`.
+ * A name with no in-repo source returns null and falls through to
+ * the alias / external-dependency handling. Without this, every
+ * export of a self-imported package looked unimported — and the
+ * app-kind exported rule below would grade those live exports SAFE.
+ */
+function loadWorkspacePackages(textFiles, existingFiles) {
+  var byName = Object.create(null); // package name -> {dir, sourceEntry}
+  var names = [];
+  textFiles.forEach(function (f) {
+    if (baseOf(f.rel) !== 'package.json') return;
+    var manifest = null;
+    try { manifest = JSON.parse(f.content); } catch (_) { return; }
+    if (!manifest || typeof manifest.name !== 'string' || !manifest.name) return;
+    if (byName[manifest.name]) return; // first manifest wins; duplicates are a repo error
+    var dir = dirOf(f.rel);
+    var sourceEntry = null;
+    var exts = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'];
+    var i;
+    for (i = 0; i < exts.length; i++) {
+      var cand = joinPosix(dir ? dir + '/src' : 'src', 'index' + exts[i]);
+      if (existingFiles.has(cand)) { sourceEntry = cand; break; }
+    }
+    if (!sourceEntry) {
+      var entries = [];
+      var collect = function (v) {
+        if (typeof v === 'string') entries.push(v);
+        else if (v && typeof v === 'object') Object.keys(v).forEach(function (k) { collect(v[k]); });
+      };
+      collect(manifest.main); collect(manifest.module); collect(manifest.types); collect(manifest.typings);
+      collect(manifest.exports);
+      for (var j = 0; j < entries.length; j++) {
+        var resolved = resolveFromBase(joinPosix(dir, entries[j]), existingFiles);
+        if (resolved) { sourceEntry = resolved; break; }
+      }
+    }
+    if (!sourceEntry) {
+      for (var k = 0; k < exts.length; k++) {
+        var cand2 = joinPosix(dir, 'index' + exts[k]);
+        if (existingFiles.has(cand2)) { sourceEntry = cand2; break; }
+      }
+    }
+    byName[manifest.name] = { dir: dir, sourceEntry: sourceEntry };
+    names.push(manifest.name);
+  });
+  names.sort(function (a, b) { return b.length - a.length; });
+  return names.map(function (name) { return { name: name, dir: byName[name].dir, sourceEntry: byName[name].sourceEntry }; });
+}
+
+function resolveWorkspaceSelfRef(source, workspacePackages, existingFiles) {
+  for (var i = 0; i < workspacePackages.length; i++) {
+    var pkg = workspacePackages[i];
+    if (source === pkg.name) return pkg.sourceEntry;
+    if (source.indexOf(pkg.name + '/') === 0) {
+      return resolveFromBase(joinPosix(pkg.dir, source.slice(pkg.name.length + 1)), existingFiles);
     }
   }
   return null;
@@ -3085,7 +3633,10 @@ function packageJsonEntries(pkg, pkgDir) {
 function looksLikeEntry(rel, abs, pkgEntries, raw) {
   if (pkgEntries[rel]) return { entry: true, reason: pkgEntries[rel] };
   var base = stemOf(rel);
-  if (ENTRY_BASENAMES.has(base)) return { entry: true, reason: 'entry basename "' + base + '"' };
+  // Entry basenames are case-insensitive (mirrors src/discover.js):
+  // Django's `Gruntfile.js` is executed by the grunt CLI exactly
+  // like a lowercase `gruntfile.js`.
+  if (ENTRY_BASENAMES.has(base.toLowerCase())) return { entry: true, reason: 'entry basename "' + base.toLowerCase() + '"' };
   for (var i = 0; i < ENTRY_PATTERNS.length; i++) {
     if (ENTRY_PATTERNS[i].test(rel)) return { entry: true, reason: 'matches entry pattern ' + ENTRY_PATTERNS[i] };
   }
@@ -3333,6 +3884,143 @@ function buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames) {
   };
 }
 
+// JS/Python same-file liveness (port of the scopes block in
+// src/confidence.js). The parsers record, per definition, the names
+// referenced inside its body (`uses`) plus the names referenced by
+// top-level code (`topLevelUses`, which runs on import). Liveness is
+// reachability from live roots over that definition graph: top-level
+// uses, live cross-file uses, and framework-kept definitions (they run
+// via framework dispatch) are conduits, not live roots — a kept
+// definition still gets its own KEEP / REVIEW finding, but the names
+// it uses stay alive through it. A name used only inside another dead
+// definition — or only by itself, as in pure recursion — is not
+// reachable and is graded on its own evidence. Reachability also
+// catches dead cycles (mutual recursion with no entry point), which a
+// purely iterative cascade cannot see. Returns null when the parse
+// predates scopes (no topLevelUses) — the caller then falls back to
+// the old file-level same-file flag, fail-open, never a new SAFE. The
+// shape mirrors the CLI block (and the Java twin above) so a diff of
+// the two stays readable: liveRootDefs, baseKeepDef conduits, the
+// live-class fixpoint, sameFileLiveDefs.
+function buildSameFileLiveness(parsed, ctx) {
+  if (!Array.isArray(parsed.topLevelUses)) return null;
+  var defsByName = Object.create(null);
+  parsed.definitions.forEach(function (d) {
+    if (!defsByName[d.name]) defsByName[d.name] = [];
+    defsByName[d.name].push(d);
+  });
+  var defUses = new Map();
+  parsed.definitions.forEach(function (d) { defUses.set(d, new Set(d.uses || [])); });
+  // Live roots: top-level code (runs on import) and live cross-file
+  // uses. Importers/callers from files already graded SAFE-dead do
+  // NOT seed liveness — the grading loop is a fixpoint (the dead-file
+  // cascade), so a use from a dead file must not keep a symbol live
+  // in a later pass; ctx.deadFiles carries the current dead set, and
+  // a use from a dead file keeps a symbol live only when no dead set
+  // is passed (fail-open, never a new SAFE).
+  var liveRootNames = new Set(parsed.topLevelUses || []);
+  var deadSet = ctx.deadFiles || null;
+  Object.keys(ctx.usageMap || {}).forEach(function (name) {
+    var u = ctx.usageMap[name];
+    if (!u) return;
+    var liveImporters = 0;
+    (u.importedBy || new Set()).forEach(function (f) { if (!deadSet || !deadSet.has(f)) liveImporters++; });
+    var liveCallers = 0;
+    (u.calledIn || new Set()).forEach(function (f) { if (f !== ctx.rel && (!deadSet || !deadSet.has(f))) liveCallers++; });
+    if (liveImporters > 0 || liveCallers > 0) liveRootNames.add(name);
+  });
+  var liveRootDefs = new Set();
+  liveRootNames.forEach(function (name) {
+    (defsByName[name] || []).forEach(function (d) { liveRootDefs.add(d); });
+  });
+  // A kept definition is a CONDUIT, not a live root: it still gets its
+  // own KEEP / REVIEW finding, but the names it uses stay alive through
+  // it. The predicates match the grading loop's own KEEP checks below,
+  // so a conduit is exactly a definition the grader would keep.
+  var baseKeepDef = function (d) {
+    return ctx.keepSymbols
+      || FRAMEWORK_KEEP_EXPORTS.has(d.name)
+      || (d.decorators || []).some(function (dec) {
+        return FRAMEWORK_KEEP_DECORATORS.some(function (kd) { return dec.indexOf(kd) >= 0; });
+      })
+      || (d.frameworkField ? true : false)
+      || (d.ambient ? true : false)
+      || ctx.overloadedNames.has(d.name)
+      || (parsed.dunder && parsed.dunder.has(d.name))
+      || (d.kind === 'method' && d.name.indexOf('__') === 0)
+      || (d.exported && (ctx.fileKind === 'library' || ctx.fileKind === 'unknown'
+        || (ctx.reExportedFiles && ctx.reExportedFiles.has(ctx.rel))));
+  };
+  var baseKeepDefs = new Set();
+  parsed.definitions.forEach(function (d) { if (baseKeepDef(d)) baseKeepDefs.add(d); });
+  var bfsDefs = function (seeds) {
+    var seen = new Set();
+    var queue = [];
+    seeds.forEach(function (d) { queue.push(d); });
+    while (queue.length) {
+      var cur = queue.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      (defUses.get(cur) || new Set()).forEach(function (used) {
+        (defsByName[used] || []).forEach(function (nxt) { if (!seen.has(nxt)) queue.push(nxt); });
+      });
+    }
+    return seen;
+  };
+  var liveDefs = bfsDefs(liveRootDefs);
+  var viaBaseKeptDefs = bfsDefs(baseKeepDefs);
+  var classDefs = parsed.definitions.filter(function (d) { return d.kind === 'class'; });
+  var liveClassNames = new Set();
+  classDefs.forEach(function (d) {
+    if (liveDefs.has(d) || baseKeepDefs.has(d) || viaBaseKeptDefs.has(d)) liveClassNames.add(d.name);
+  });
+  // Line ranges (the web's JS defs carry no byte range): the smallest
+  // class whose [startLine, closeLine] contains the method's start
+  // line. A method with no enclosing class (an object-literal method)
+  // stays a conduit: fail-open, never a new SAFE.
+  var enclosingClassName = function (def) {
+    var best = null;
+    for (var i = 0; i < classDefs.length; i++) {
+      var c = classDefs[i];
+      var cClose = c.closeLine || c.startLine;
+      if (c.startLine <= def.startLine && def.startLine <= cClose) {
+        if (!best || (cClose - c.startLine) < ((best.closeLine || best.startLine) - best.startLine)) best = c;
+      }
+    }
+    return best ? best.name : null;
+  };
+  // A method is a conduit too, but only when its enclosing class is
+  // live: a method of a dead class never runs, so the helper it alone
+  // calls is dead too. When no enclosing class can be found the method
+  // stays a conduit: fail-open, never a new SAFE.
+  var keepDef = function (d) {
+    return baseKeepDef(d)
+      || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d))));
+  };
+  // Fixpoint: a class reached only through a kept method's callees is
+  // live too — its methods are conduits, and the names they use are
+  // reachable. The loop only grows liveClassNames, bounded by the
+  // number of classes in the file, so it always terminates; each round
+  // can only add liveness, never a new SAFE.
+  var keepDefs = new Set();
+  var viaKeptDefs = new Set();
+  for (;;) {
+    keepDefs = new Set();
+    parsed.definitions.forEach(function (d) { if (keepDef(d)) keepDefs.add(d); });
+    viaKeptDefs = bfsDefs(keepDefs);
+    var grew = false;
+    viaKeptDefs.forEach(function (d) {
+      if (d.kind === 'class' && !liveClassNames.has(d.name)) { liveClassNames.add(d.name); grew = true; }
+    });
+    if (!grew) break;
+  }
+  var sameFileLiveDefs = new Set();
+  liveDefs.forEach(function (d) { sameFileLiveDefs.add(d); });
+  viaKeptDefs.forEach(function (d) { sameFileLiveDefs.add(d); });
+  keepDefs.forEach(function (d) { if (!liveDefs.has(d)) sameFileLiveDefs.delete(d); });
+  return { sameFileLiveDefs: sameFileLiveDefs };
+}
+
 // Normalize a docs/parse-java-web.js result into the shape the
 // analyzer's grading loop expects: `calls` is a Set of names (like
 // parseJs), `dunder` is a Set (Java has no dunder methods). The raw
@@ -3453,17 +4141,33 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
   var textFiles = []; // {rel, content} for the string-reference pass
   var pkg = null;
   var pkgDir = '';
+  var pkgDepth = Infinity;
 
   inputFiles.forEach(function (f) {
     if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') return;
     var rel = f.path.replace(/^\.\//, '').replace(/\\/g, '/');
     var parts = rel.split('/');
     if (parts.some(function (p) { return SKIP_DIRS.has(p); })) return;
+    // Hidden directories are not repo code (mirrors the CLI walk in
+    // src/discover.js, which skips dot-directories except .github):
+    // a tool directory such as .changeset/ is never scanned, so its
+    // files can never be flagged. Only directory parts count — a
+    // dotfile at the root (e.g. .eslintrc.js) is still scanned.
+    if (parts.slice(0, -1).some(function (p) { return p.charAt(0) === '.' && p !== '.github'; })) return;
     if (!options.includeFixtures && parts.some(function (p) { return FIXTURE_DIRS.has(p); })) return;
     if (SKIP_FILES.has(baseOf(rel))) return;
     textFiles.push({ rel: rel, content: f.content });
-    if (baseOf(rel) === 'package.json' && !pkg) {
-      try { pkg = JSON.parse(f.content); pkgDir = dirOf(rel); } catch (_) { pkg = null; }
+    // The repo's root package.json (shallowest one wins) feeds the
+    // entry-point list and the dead-dependency check, exactly as the
+    // CLI's discover reads the root manifest — first-in-input-order
+    // would pick a nested docs/ or examples/ package instead (its
+    // dependencies then look dead when nothing in the repo imports
+    // them, as axios's docs-only @splidejs/splide did).
+    if (baseOf(rel) === 'package.json') {
+      var thisDepth = dirOf(rel) ? dirOf(rel).split('/').length : 0;
+      if (!pkg || thisDepth < pkgDepth) {
+        try { var tryPkg = JSON.parse(f.content); pkg = tryPkg; pkgDir = dirOf(rel); pkgDepth = thisDepth; } catch (_) { /* keep the previous (deeper) manifest, if any */ }
+      }
     }
     var ext = extOf(rel);
     var isJava = JAVA_EXTS.indexOf(ext) >= 0;
@@ -3512,6 +4216,84 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       isLibrary = true;
     }
   });
+  // Per-file library / app / unknown kind (port of fileKind in
+  // src/discover.js). The global isLibrary above is wrong for
+  // monorepos: one sub-package with `exports` made EVERY file in the
+  // repo look like published-library surface, so genuinely dead files
+  // in the app part (umami's src/, nestjs' integration/ and sample/
+  // trees) graded REVIEW instead of SAFE. The kind comes from the
+  // nearest manifest above the file: `exports` means a published
+  // library, an app-framework dependency (next, nuxt, ...) or an
+  // `app/` directory with no `main` means an app, a manifest with
+  // only `main` means unknown, and a chain of nothing but `private`
+  // manifests means an app. Python mirrors the CLI too: a
+  // pyproject.toml with a [project] name (or a named setup.py /
+  // setup.cfg) is a library, a manage.py directory is an app.
+  var APP_FRAMEWORK_DEPS = ['next', 'nuxt', 'gatsby', 'astro', '@angular/core', '@sveltejs/kit', '@remix-run/node', 'ember-source'];
+  var jsManifests = Object.create(null); // dir -> {hasExports, isPrivate, hasMain, isAppFramework, hasAppDir}
+  var pyManifests = Object.create(null); // dir -> {isLibrary}
+  var manageDirs = new Set();
+  var allTextRels = textFiles.map(function (f) { return f.rel; });
+  textFiles.forEach(function (f) {
+    var base = baseOf(f.rel);
+    var dir = dirOf(f.rel);
+    if (base === 'package.json') {
+      var m = null;
+      try { m = JSON.parse(f.content); } catch (_) { m = null; }
+      if (!m) return;
+      var deps = Object.assign({}, m.dependencies || {}, m.devDependencies || {});
+      var hasAppDir = allTextRels.some(function (r) {
+        return r.indexOf(dir ? dir + '/app/' : 'app/') === 0 || r.indexOf(dir ? dir + '/src/app/' : 'src/app/') === 0;
+      });
+      jsManifests[dir] = {
+        hasExports: Boolean(m.exports),
+        isPrivate: m.private === true,
+        hasMain: typeof m.main === 'string' || typeof m.module === 'string',
+        isAppFramework: APP_FRAMEWORK_DEPS.some(function (d) { return d in deps; }),
+        hasAppDir: hasAppDir,
+      };
+    } else if (base === 'pyproject.toml') {
+      pyManifests[dir] = { isLibrary: pyprojectHasProjectName(f.content) };
+    } else if (base === 'setup.py' || base === 'setup.cfg') {
+      if (setupHasName(f.rel, f.content)) pyManifests[dir] = { isLibrary: true };
+    } else if (base === 'manage.py') {
+      manageDirs.add(dir);
+    }
+  });
+  function pyprojectHasProjectName(text) {
+    if (!text || text.indexOf('[project]') < 0) return false;
+    var section = text.slice(text.indexOf('[project]'));
+    return /^\s*name\s*=\s*["'][^"']+["']/m.test(section);
+  }
+  function setupHasName(file, text) {
+    if (!text) return false;
+    if (file.slice(-9) === 'setup.py') return /\bname\s*=\s*["'][^"']+["']/.test(text);
+    return /\[metadata\][\s\S]*?^\s*name\s*=\s*\S/m.test(text);
+  }
+  var fileKindCache = Object.create(null);
+  function fileKind(rel) {
+    if (fileKindCache[rel]) return fileKindCache[rel];
+    var kind = 'unknown';
+    var ext = extOf(rel);
+    var dir = dirOf(rel);
+    var sawPrivate = false;
+    for (;;) {
+      if (ext === '.py') {
+        if (pyManifests[dir]) { kind = pyManifests[dir].isLibrary ? 'library' : 'unknown'; break; }
+        if (manageDirs.has(dir)) { kind = 'app'; break; }
+      } else if (jsManifests[dir]) {
+        var m = jsManifests[dir];
+        if (m.hasExports) { kind = 'library'; break; }
+        if (m.isAppFramework || (!m.hasMain && m.hasAppDir)) { kind = 'app'; break; }
+        if (m.isPrivate) sawPrivate = true;
+        else { kind = 'unknown'; break; }
+      }
+      if (dir === '') { if (sawPrivate) kind = 'app'; break; }
+      dir = dirOf(dir);
+    }
+    fileKindCache[rel] = kind;
+    return kind;
+  }
   var entries = Object.create(null); // rel -> reason
   Object.keys(files).forEach(function (rel) {
     var info = files[rel];
@@ -3523,6 +4305,11 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
   // these, every `@/lib/...` import misses its edge and the target's
   // exports look dead (umami's dominant false-positive family).
   var tsAliases = loadTsAliases(textFiles);
+  // Workspace package self-references (`import ... from 'vue'` inside
+  // vuejs-core, `@scope/a` from a sibling package): the package name
+  // resolves to the package's own source (FP-8, see
+  // loadWorkspacePackages above), tried before tsconfig aliases.
+  var workspacePackages = loadWorkspacePackages(textFiles, existingFiles);
 
   // Import edges.
   var importers = Object.create(null); // target rel -> Set of importer rels
@@ -3539,7 +4326,7 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       if (imp.allExport) return;
       if (imp.fromImport && imp.relative) {
         resolvePyRelative(rel, imp.source, imp.names, imp.level || 1, existingFiles, files).forEach(function (t) {
-          edges.push({ target: t.target, source: imp.source, names: t.names });
+          edges.push({ target: t.target, source: imp.source, names: t.names, reExport: Boolean(imp.reExport) });
           addImporter(t.target, rel);
         });
         return;
@@ -3548,10 +4335,13 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       if (imp.source && imp.source.charAt(0) === '.') {
         target = resolveJsRelative(rel, imp.source, existingFiles);
       } else if (info.language !== 'py' && imp.source) {
+        // Workspace self-reference first: the repo's own package name
+        // resolves to its source, never to an npm install (FP-8).
         // tsconfig/jsconfig `paths` aliases (`@/lib/...`): the standard
         // Next.js / Vite / monorepo import style. A bare specifier that
-        // is not an alias is an external dependency.
-        target = resolveAlias(rel, imp.source, tsAliases, existingFiles);
+        // is neither is an external dependency.
+        target = resolveWorkspaceSelfRef(imp.source, workspacePackages, existingFiles);
+        if (!target) target = resolveAlias(rel, imp.source, tsAliases, existingFiles);
       } else if (info.language === 'py' && imp.source) {
         target = resolvePyModule(rel, imp.source, existingFiles);
         if (target && imp.fromImport) {
@@ -3564,19 +4354,49 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
             if (n.imported === '*' || defined.has(n.imported)) return;
             var sub = pyModuleFile(joinPosix(targetDir, n.imported), existingFiles);
             if (sub && sub !== target) {
-              edges.push({ target: sub, source: imp.source, names: [n] });
+              edges.push({ target: sub, source: imp.source, names: [n], reExport: Boolean(imp.reExport) });
               addImporter(sub, rel);
             }
           });
         }
       }
       if (target) {
-        edges.push({ target: target, source: imp.source, names: imp.names });
+        edges.push({ target: target, source: imp.source, names: imp.names, reExport: Boolean(imp.reExport) });
         addImporter(target, rel);
       }
     });
     importsByFile[rel] = edges;
   });
+
+  // Re-exported modules (port of src/graph.js): a module bound by name
+  // through a re-export — Python `from . import colors` in
+  // `__init__.py`, JS `export * as ns from './x'` — is public API of
+  // its package, REVIEW at most. A named re-export binds the module
+  // only when the imported name is the module's own name; a namespace
+  // re-export binds its alias.
+  var reExportedFiles = new Set();
+  (function () {
+    var moduleStem = function (f) {
+      var b = baseOf(f).replace(/\.[^.]*$/, '');
+      return b === '__init__' ? baseOf(dirOf(f)) : b;
+    };
+    Object.keys(files).forEach(function (rel) {
+      var info = files[rel];
+      if (!info.parsed) return;
+      (info.parsed.imports || []).forEach(function (imp) {
+        if (!imp.reExport) return;
+        (importsByFile[rel] || []).forEach(function (e) {
+          if (e.source !== imp.source) return;
+          (e.names || []).forEach(function (n) {
+            var modName = n.kind === 'namespace' ? n.local : (n.imported || '').split('.').pop();
+            if (!modName || modName === '*') return;
+            if (n.kind !== 'namespace' && modName !== moduleStem(e.target)) return;
+            reExportedFiles.add(e.target);
+          });
+        });
+      });
+    });
+  })();
 
   // Reachability from entry points.
   var reachable = new Set(Object.keys(entries));
@@ -3882,23 +4702,203 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     });
   });
 
+  // Python class-attribute rules (FP-6, port of src/confidence.js).
+  // Recording class attributes as definitions (parsePy, batch 14)
+  // is only half the fix: the CLI grades them through these rules,
+  // and skipping any of them would turn a REVIEW/KEEP attribute into
+  // a web-only SAFE. Files without a class inventory (JS/TS) simply
+  // yield no matches: fail-open, never a new SAFE.
+  var pyAttrReaders = Object.create(null); // attr name -> Set<rel> reading it as obj.name
+  var pyClassesByFile = Object.create(null); // rel -> Map<className, {name, bases, file}>
+  var pyClassAttrs = Object.create(null); // "rel\0class" -> Set<attr name defined in that class>
+  Object.keys(files).forEach(function (rel) {
+    var info = files[rel];
+    if (!info.parsed || info.language !== 'py') return;
+    (info.parsed.attributeRefs || []).forEach(function (n) {
+      if (!pyAttrReaders[n]) pyAttrReaders[n] = new Set();
+      pyAttrReaders[n].add(rel);
+    });
+    var byName = new Map();
+    (info.parsed.classes || []).forEach(function (c) { byName.set(c.name, { name: c.name, bases: c.bases || [], file: rel }); });
+    if (byName.size > 0) pyClassesByFile[rel] = byName;
+    (info.parsed.definitions || []).forEach(function (d) {
+      // A @property method (or a nested class) with the same name
+      // overrides a base attribute too, so methods and classes count
+      // in the inventory, exactly as in the CLI.
+      if (!d.className || (d.kind !== 'variable' && d.kind !== 'method' && d.kind !== 'class')) return;
+      var key = rel + '\0' + d.className;
+      if (!pyClassAttrs[key]) pyClassAttrs[key] = new Set();
+      pyClassAttrs[key].add(d.name);
+    });
+  });
+  // Documented class attributes (Django `supports_get_result`): a
+  // Sphinx `.. attribute:: Class.attr` directive in the repo's docs
+  // (.txt / .md) documents the attribute as public API of its class,
+  // even when no code in the repo reads it. Only the exact
+  // `Class.attr` pair counts. Prose files are read here on purpose:
+  // unlike the string-reference pass, this is not a claim that the
+  // docs execute the code — it is a claim that the docs promise the
+  // attribute exists.
+  var pyDocumentedClassAttrs = new Map(); // "Class.attr" -> doc rel path
+  textFiles.forEach(function (f) {
+    var ext = extOf(f.rel).toLowerCase();
+    if (ext !== '.txt' && ext !== '.md') return;
+    var re = /^\s*\.\.\s+(?:attribute|autoattribute)::\s+([\w.]+)\s*$/gm;
+    var m;
+    while ((m = re.exec(f.content)) !== null) {
+      var parts = m[1].split('.');
+      if (parts.length < 2) continue;
+      var key = parts[parts.length - 2] + '.' + parts[parts.length - 1];
+      if (!pyDocumentedClassAttrs.has(key)) pyDocumentedClassAttrs.set(key, f.rel);
+    }
+  });
+  // Resolve a base-class name to the class that defines it: the same
+  // file first, then an import edge of the importing file. Dotted
+  // bases (`mod.Base`) are recorded by their leading name and do not
+  // resolve: a known gap, fail-open. Only successful resolutions are
+  // cached; a miss is recomputed, so a resolution that failed only
+  // because of a cycle guard is never frozen in.
+  var pyClassDefCache = new Map();
+  function pyResolveClass(fromFile, name, seen) {
+    var key = fromFile + '\0' + name;
+    if (pyClassDefCache.has(key)) return pyClassDefCache.get(key);
+    var found = null;
+    var local = pyClassesByFile[fromFile];
+    if (local && local.has(name)) found = { file: fromFile, name: name };
+    if (!found) {
+      var nextSeen = new Set(seen || []);
+      nextSeen.add(key);
+      var edges = importsByFile[fromFile] || [];
+      for (var i = 0; i < edges.length; i++) {
+        var hit = (edges[i].names || []).find(function (n) { return n.local === name; });
+        if (!hit || hit.kind === 'namespace') continue;
+        var targetClasses = pyClassesByFile[edges[i].target];
+        if (targetClasses && targetClasses.has(hit.imported)) { found = { file: edges[i].target, name: hit.imported }; break; }
+        if (!nextSeen.has(edges[i].target + '\0' + hit.imported)) {
+          var via = pyResolveClass(edges[i].target, hit.imported, nextSeen);
+          if (via) { found = via; break; }
+        }
+      }
+    }
+    if (found) pyClassDefCache.set(key, found);
+    return found;
+  }
+  // Transitive ancestors of a class, as "file\0name" -> {file, name}.
+  var pyAncestorsCache = new Map();
+  function pyAncestorsOf(file, name) {
+    var key = file + '\0' + name;
+    if (pyAncestorsCache.has(key)) return pyAncestorsCache.get(key);
+    var out = new Map();
+    var cls = pyClassesByFile[file] ? pyClassesByFile[file].get(name) : null;
+    var queue = (cls ? cls.bases : []).map(function (b) { return { fromFile: file, base: b }; });
+    var seen = new Set([key]);
+    while (queue.length > 0) {
+      var item = queue.pop();
+      var parent = pyResolveClass(item.fromFile, item.base);
+      if (!parent) continue;
+      var pkey = parent.file + '\0' + parent.name;
+      if (seen.has(pkey)) continue;
+      seen.add(pkey);
+      out.set(pkey, parent);
+      var pcls = pyClassesByFile[parent.file] ? pyClassesByFile[parent.file].get(parent.name) : null;
+      (pcls ? pcls.bases : []).forEach(function (b) { queue.push({ fromFile: parent.file, base: b }); });
+    }
+    pyAncestorsCache.set(key, out);
+    return out;
+  }
+  // Transitive descendants, via the inverted parent links.
+  var pyChildrenOf = new Map(); // "file\0class" -> Set<"file\0class">
+  Object.keys(pyClassesByFile).forEach(function (cfile) {
+    pyClassesByFile[cfile].forEach(function (cls) {
+      cls.bases.forEach(function (b) {
+        var parent = pyResolveClass(cfile, b);
+        if (!parent) return;
+        var pkey = parent.file + '\0' + parent.name;
+        if (!pyChildrenOf.has(pkey)) pyChildrenOf.set(pkey, new Set());
+        pyChildrenOf.get(pkey).add(cfile + '\0' + cls.name);
+      });
+    });
+  });
+  var pyDescendantsCache = new Map();
+  function pyDescendantsOf(file, name) {
+    var key = file + '\0' + name;
+    if (pyDescendantsCache.has(key)) return pyDescendantsCache.get(key);
+    var out = new Set();
+    var queue = Array.from(pyChildrenOf.get(key) || []);
+    var seen = new Set([key]);
+    while (queue.length > 0) {
+      var cur = queue.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      out.add(cur);
+      (pyChildrenOf.get(cur) || []).forEach(function (next) { if (!seen.has(next)) queue.push(next); });
+    }
+    pyDescendantsCache.set(key, out);
+    return out;
+  }
+  function pyAttrsOfClass(file, name) { return pyClassAttrs[file + '\0' + name] || new Set(); }
+  var pyOverrideCache = new Map(); // "file\0class\0attr" -> {fromAncestor, bySubclass} | null
+  function pyClassAttrOverride(file, className, attr) {
+    var key = file + '\0' + className + '\0' + attr;
+    if (pyOverrideCache.has(key)) return pyOverrideCache.get(key);
+    var result = null;
+    var fromAncestor = null;
+    pyAncestorsOf(file, className).forEach(function (a) {
+      if (!fromAncestor && pyAttrsOfClass(a.file, a.name).has(attr)) fromAncestor = a;
+    });
+    var bySubclass = null;
+    pyDescendantsOf(file, className).forEach(function (dkey) {
+      if (bySubclass) return;
+      var sep = dkey.indexOf('\0');
+      var d = { file: dkey.slice(0, sep), name: dkey.slice(sep + 1) };
+      if (pyAttrsOfClass(d.file, d.name).has(attr)) bySubclass = d;
+    });
+    if (fromAncestor || bySubclass) result = { fromAncestor: fromAncestor, bySubclass: bySubclass };
+    pyOverrideCache.set(key, result);
+    return result;
+  }
+  // Other files that read `attr` as an attribute. The CLI excludes
+  // files already graded SAFE-dead (dead code citing dead code does
+  // not keep an attribute alive); the web grades in a single pass
+  // with no dead-file set yet, so every other file counts — fail-open
+  // toward REVIEW, never toward a new SAFE.
+  function pyAttrReadElsewhere(file, attr) {
+    var readers = pyAttrReaders[attr];
+    if (!readers) return [];
+    var out = [];
+    readers.forEach(function (f) { if (f !== file) out.push(f); });
+    return out.sort();
+  }
+
   // Grading, mirroring the CLI confidence engine.
+  // Cascade fixpoint (port of src/confidence.js): one pass cannot see
+  // second-order dead code — a file whose only importer is itself a
+  // dead file looks used in the first pass. So grading repeats, each
+  // time ignoring usage that comes only from files already graded
+  // SAFE-dead, until no new SAFE file appears (at most 6 passes).
+  // Within a pass the findings are fresh; across passes the merge
+  // below keeps the FIRST finding per id unless its grade changes
+  // (REVIEW -> SAFE in a later pass replaces the old verdict, exactly
+  // like the CLI's findingsById). A file already graded SAFE-dead
+  // keeps its pass-1 symbol findings: its symbols are graded once,
+  // before any file is known dead — a symbol in a dead file whose only
+  // caller sat in another dead file gets no finding in the CLI either,
+  // so re-grading it with dead callers filtered out would invent a
+  // web-only SAFE. Findings that appear only in a later pass carry
+  // evidence.cascade = { iteration, via: [dead files] }.
+  var deadFiles = new Set(); // rel paths graded SAFE as files
+  var mergedById = new Map(); // finding id -> finding
   var findings = [];
-  var seenFindings = new Set();
+  var currentFindings = findings;
+  var currentSeenFindings = new Set();
+  var currentSeenKeys = new Set();
   // One finding per key: the same name can be defined many times in one
   // file (Django's 114 `Meta` classes, 52 `http_options` variables),
   // and each definition used to emit its own finding. Unreachable
   // findings dedupe per block instead (see blockLine): a hoisted-
   // function block after a return fires once per line without this.
-  var seenKeys = new Set();
-  function add(f) {
-    f.id = f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0);
-    // The same finding must never repeat: a symbol can be reached by
-    // several passes (file loop, symbol loop, dependency loop), and a
-    // duplicated finding used to repeat up to 444x on real repos.
-    if (seenFindings.has(f.id)) return null;
-    seenFindings.add(f.id);
-    var key = f.category === 'unreachable'
+  function findingKey(f) {
+    return f.category === 'unreachable'
       ? 'unreachable:' + f.file + ':' + (f.blockLine || f.startLine || 0)
       // Java: the same symbol can legitimately carry several findings
       // at different lines with different grades (two constructors, a
@@ -3909,13 +4909,29 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       : /\.java$/.test(f.file)
         ? f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0)
         : f.category + ':' + f.file + ':' + (f.symbol || '');
-    if (seenKeys.has(key)) return null;
-    seenKeys.add(key);
-    findings.push(f);
+  }
+  function add(f) {
+    f.id = f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0);
+    // The same finding must never repeat: a symbol can be reached by
+    // several passes (file loop, symbol loop, dependency loop), and a
+    // duplicated finding used to repeat up to 444x on real repos.
+    if (currentSeenFindings.has(f.id)) return null;
+    currentSeenFindings.add(f.id);
+    var key = findingKey(f);
+    if (currentSeenKeys.has(key)) return null;
+    currentSeenKeys.add(key);
+    currentFindings.push(f);
     return f;
   }
 
-  Object.keys(files).forEach(function (rel) {
+  // Cascade fixpoint loop (port of src/confidence.js): grade, collect
+  // the newly SAFE files, and grade again with those files' usage
+  // ignored, until a pass adds no new dead file.
+  for (var iteration = 1; iteration <= 6; iteration++) {
+    currentFindings = [];
+    currentSeenFindings = new Set();
+    currentSeenKeys = new Set();
+    Object.keys(files).forEach(function (rel) {
     var info = files[rel];
     if (!info.parsed || info.parseError) return; // never flag what we could not parse
     var parsed = info.parsed;
@@ -3924,9 +4940,19 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     var isConfig = CONFIG_FILE.test(rel);
     var isManualScript = /(^|\/)(scripts|tools)\//.test(rel);
     var isRouteFile = ROUTE_DIR.test(rel);
-    var keepFile = isEntry || isTest || isConfig || isRouteFile;
-    var keepSymbols = isTest || isConfig || isManualScript || isRouteFile;
-    var importerCount = (importers[rel] || new Set()).size;
+    // Next.js instrumentation file (frameworks/next.json keepFiles):
+    // Next.js calls `register()` in instrumentation.ts at server
+    // startup, so the file and its exports are framework-resolved.
+    var isInstrumentationFile = /instrumentation\.(js|ts)$/.test(rel);
+    var fwKeepReason = frameworkKeepReason(rel);
+    var keepFile = isEntry || isTest || isConfig || isRouteFile || isInstrumentationFile || Boolean(fwKeepReason);
+    var keepSymbols = isTest || isConfig || isManualScript || isRouteFile || isInstrumentationFile || Boolean(fwKeepReason);
+    // Importers that are themselves dead do not keep a file alive: if
+    // the only importer of B is dead file A, B is dead in the same run
+    // (port of src/confidence.js).
+    var liveImporters = [];
+    (importers[rel] || new Set()).forEach(function (f) { if (!deadFiles.has(f)) liveImporters.push(f); });
+    var importerCount = liveImporters.length;
 
     // Dead file. Java files are never dead-file candidates in this
     // landing (mirrors the CLI): there is no Java import resolution
@@ -3937,26 +4963,49 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         add({
           category: 'file', file: rel, symbol: null, grade: 'KEEP',
           startLine: 1, endLine: null, size: info.size,
-          reason: isEntry ? 'entry point: ' + (entries[rel] || '') : isTest ? 'test file' : isConfig ? 'config file' : 'framework route file',
+          reason: isEntry ? 'entry point: ' + (entries[rel] || '') : isTest ? 'test file' : isConfig ? 'config file' : isInstrumentationFile ? 'framework instrumentation file (next.json keepFiles)' : fwKeepReason ? fwKeepReason : 'framework route file',
           evidence: { importers: 0, reachable: false, stringRefs: [] },
         });
       } else {
+        // String mentions from dead files do not keep a file alive
+        // either (dead code mentioning dead code) — but they are the
+        // cascade trail. Only top-level symbols count: a local (a
+        // `const url` inside a component) is not the file's public
+        // name, and its mentions in unrelated files are coincidences
+        // — umami's SettingsButton.tsx was kept at REVIEW by its
+        // local `url` matching 116 files, though neither the file
+        // nor the component is referenced anywhere. Locals never keep
+        // a file alive (port of src/confidence.js).
         var stringRefs = [];
+        var deadStringRefs = [];
         var baseHits = filesMentioning(stemOf(rel));
-        baseHits.forEach(function (f) { if (f !== rel) stringRefs.push(f); });
+        baseHits.forEach(function (f) {
+          if (f === rel) return;
+          if (deadFiles.has(f)) deadStringRefs.push(f);
+          else stringRefs.push(f);
+        });
+        var symbolStringRefs = [];
+        var deadSymbolStringRefs = [];
         parsed.definitions.forEach(function (d) {
+          if (d.local) return;
           filesMentioning(d.name).forEach(function (f) {
-            if (f !== rel && stringRefs.indexOf(f) < 0) stringRefs.push(f);
+            if (f === rel) return;
+            if (deadFiles.has(f)) {
+              if (deadSymbolStringRefs.indexOf(f) < 0) deadSymbolStringRefs.push(f);
+            } else if (stringRefs.indexOf(f) < 0 && symbolStringRefs.indexOf(f) < 0) {
+              symbolStringRefs.push(f);
+            }
           });
         });
-        if (stringRefs.length > 0) {
+        var allStringRefs = stringRefs.concat(symbolStringRefs);
+        if (allStringRefs.length > 0) {
           add({
             category: 'file', file: rel, symbol: null, grade: 'REVIEW',
             startLine: 1, endLine: null, size: info.size,
             reason: 'no importers, but referenced by name as a string elsewhere',
-            evidence: { importers: 0, reachable: false, stringRefs: stringRefs },
+            evidence: { importers: 0, reachable: false, stringRefs: allStringRefs },
           });
-        } else if (isLibrary) {
+        } else if (fileKind(rel) === 'library') {
           add({
             category: 'file', file: rel, symbol: null, grade: 'REVIEW',
             startLine: 1, endLine: null, size: info.size,
@@ -3964,16 +5013,32 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
             evidence: { importers: 0, reachable: false, stringRefs: [] },
           });
         } else {
-          add({
+          var fileFinding = {
             category: 'file', file: rel, symbol: null, grade: 'SAFE',
             startLine: 1, endLine: null, size: info.size,
             reason: 'no importers, not an entry point, not referenced by name anywhere',
             evidence: { importers: 0, reachable: false, stringRefs: [] },
             deleteDiff: 'delete ' + rel + ' (' + info.size + ' bytes)',
-          });
+          };
+          if (iteration > 1) {
+            var fileVia = [];
+            (importers[rel] || new Set()).forEach(function (f) {
+              if (deadFiles.has(f) && fileVia.indexOf(f) < 0) fileVia.push(f);
+            });
+            deadStringRefs.forEach(function (f) { if (fileVia.indexOf(f) < 0) fileVia.push(f); });
+            deadSymbolStringRefs.forEach(function (f) { if (fileVia.indexOf(f) < 0) fileVia.push(f); });
+            if (fileVia.length > 0) {
+              fileFinding.evidence = Object.assign({}, fileFinding.evidence, { cascade: { iteration: iteration, via: fileVia } });
+            }
+          }
+          add(fileFinding);
         }
       }
     }
+    // In a later cascade pass, a file already graded SAFE-dead keeps
+    // its pass-1 findings; re-grading its symbols would only add noise
+    // inside an already-dead file (port of src/confidence.js).
+    if (deadFiles.has(rel)) return;
 
     // Dead symbols.
     var usageMap = symbolUsage[rel] || Object.create(null);
@@ -4000,6 +5065,15 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     var javaCtx = info.language === 'java'
       ? buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames)
       : null;
+    // Same-file liveness for JS/Python (see buildSameFileLiveness):
+    // the live-root BFS over the definition graph. Null when the parse
+    // predates scopes — the grading below then falls back to the old
+    // file-level same-file flag, fail-open, never a new SAFE.
+    var relKind = fileKind(rel);
+    var scopesCtx = info.language === 'java' ? null : buildSameFileLiveness(parsed, {
+      keepSymbols: keepSymbols, fileKind: relKind, overloadedNames: overloadedNames,
+      usageMap: usageMap, rel: rel, reExportedFiles: reExportedFiles, deadFiles: deadFiles,
+    });
     // Bare-name channel for locals (batch 12): the parsers record
     // `bareReferences` (bare identifier reads only — never a member
     // name or a property key) and `bareCalls` (bare calls only —
@@ -4013,7 +5087,13 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     var bareCallSet = parsed.bareCalls instanceof Set ? parsed.bareCalls : null;
     parsed.definitions.forEach(function (def) {
       if (importLocals.has(def.name)) return;
-      if (def.kind === 'method' && /^__.*__$/.test(def.name)) {
+      // A method with no callers is a candidate only when it is not an
+      // override / protocol method. Dunder methods are recorded as KEEP
+      // (considered, never flagged) for transparency — any method whose
+      // name starts with `__`, not only `__x__` (port of
+      // src/confidence.js: a Node stream's `__transform` is invoked by
+      // the runtime, never by name).
+      if (def.kind === 'method' && def.name.indexOf('__') === 0) {
         add({
           category: 'method', file: rel, symbol: def.name, grade: 'KEEP',
           startLine: def.startLine, endLine: def.endLine, size: 0,
@@ -4023,7 +5103,11 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         return;
       }
       var usage = usageMap[def.name] || { importedBy: new Set(), calledIn: new Set(), sameFile: false };
-      var importedBy = Array.from(usage.importedBy);
+      // Cascade: usage from dead files does not count. A symbol whose
+      // only importers/callers are dead files is dead in the same run
+      // (port of src/confidence.js).
+      var importedBy = Array.from(usage.importedBy).filter(function (f) { return !deadFiles.has(f); });
+      var deadImporters = Array.from(usage.importedBy).filter(function (f) { return deadFiles.has(f); });
       // A call from another file is a real caller too: the classic-script
       // global pass above records bare-name calls from other classic
       // scripts against the unique repo-wide definition (Django admin
@@ -4031,7 +5115,12 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       // from the symbol's own file is same-file use, not an external
       // caller.
       var calledElsewhere = [];
-      usage.calledIn.forEach(function (f) { if (f !== rel) calledElsewhere.push(f); });
+      var deadCallers = [];
+      usage.calledIn.forEach(function (f) {
+        if (f === rel) return;
+        if (deadFiles.has(f)) deadCallers.push(f);
+        else calledElsewhere.push(f);
+      });
       // A local definition can only be read by its bare name (port of
       // src/confidence.js, batch 11): a member call `obj.foo()` names
       // the member, not the local, so the old name-keyed flag — any
@@ -4099,6 +5188,11 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         } else {
           sameFileUseEffective = false;
         }
+      } else if (scopesCtx && !def.local) {
+        // JS/Python: same-file use counts only from live code (see
+        // buildSameFileLiveness). Locals keep the bare-name rule
+        // above, exactly as in the CLI.
+        sameFileUseEffective = scopesCtx.sameFileLiveDefs.has(def);
       }
       // Same-file use is real use: a symbol called or referenced in its
       // own file is alive, full stop — never a finding. (It used to be
@@ -4128,7 +5222,18 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
 
       var stringHits = filesMentioning(def.name);
       var stringElsewhere = [];
-      stringHits.forEach(function (f) { if (f !== rel) stringElsewhere.push(f); });
+      var deadStringRefs = [];
+      stringHits.forEach(function (f) {
+        if (f === rel) return;
+        if (deadFiles.has(f)) deadStringRefs.push(f);
+        else stringElsewhere.push(f);
+      });
+      // Cascade trail for a SAFE finding that only exists because dead
+      // files were removed as users (port of src/confidence.js).
+      var cascadeVia = [];
+      deadImporters.concat(deadCallers, deadStringRefs).forEach(function (f) {
+        if (cascadeVia.indexOf(f) < 0) cascadeVia.push(f);
+      });
       var common = {
         category: categoryOf(def.kind), file: rel, symbol: def.name, grade: 'REVIEW',
         startLine: def.startLine, endLine: def.endLine, size: 0,
@@ -4199,8 +5304,82 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         return;
       }
       if (keepSymbols) {
-        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : 'in a framework route file' }));
+        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : isInstrumentationFile ? 'in a framework instrumentation file (next.json keepFiles)' : fwKeepReason ? fwKeepReason : 'in a framework route file' }));
         return;
+      }
+      // Class-attribute rules (FP-6, port of src/confidence.js).
+      // These sit AFTER the dunder and test/config KEEP checks above
+      // on purpose: a dunder or a test-file attribute keeps its
+      // existing KEEP reason, and these rules only ever demote a
+      // finding that would otherwise be SAFE (or a REVIEW
+      // string-mention) — never a KEEP.
+      if (info.language === 'py' && def.className && def.kind === 'variable') {
+        // Alias of a method defined in the same class (`x = method`,
+        // or a chained assignment ending in one): the names are one
+        // object with a live method, part of the class's interface —
+        // never SAFE.
+        if (def.chainedAlias) {
+          add(Object.assign({}, common, { grade: 'KEEP', reason: 'alias of ' + (def.chainedAliasOf || 'a method') + ' in the same class — the name is the same object as the method, part of the class interface' }));
+          return;
+        }
+        // A class that subclasses an externally-defined base and
+        // defines only attributes (no methods) is a framework-consumed
+        // config class: the framework reads the attributes at runtime,
+        // so they are KEEP, never SAFE.
+        if (def.configClassAttr) {
+          add(Object.assign({}, common, { grade: 'KEEP', reason: 'config class: subclass of an externally-defined base that defines only attributes — the framework reads the attributes at runtime' }));
+          return;
+        }
+        // Class-attribute override family. A class attribute that
+        // overrides one defined on an ancestor class, or that a
+        // subclass overrides, is part of the inherited class
+        // interface: the framework reads it via attribute lookup on
+        // instances, not via a code reference to the defining file.
+        // REVIEW, never SAFE.
+        var pyOvr = pyClassAttrOverride(rel, def.className, def.name);
+        if (pyOvr && pyOvr.fromAncestor) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'class attribute overrides ' + def.name + ' defined on ancestor class ' + pyOvr.fromAncestor.name + ' (' + pyOvr.fromAncestor.file + ') — part of the inherited interface, read via attribute lookup' }));
+          return;
+        }
+        if (pyOvr && pyOvr.bySubclass) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'class attribute overridden by subclass ' + pyOvr.bySubclass.name + ' (' + pyOvr.bySubclass.file + ') — part of the class interface, read via attribute lookup' }));
+          return;
+        }
+        // Cross-file attribute read: another file reads this name as
+        // an attribute (`obj.<name>` / `self.<name>`). Only attribute
+        // syntax counts — a bare-name match elsewhere is not the same
+        // evidence — and the grade is REVIEW, never KEEP: the same
+        // attribute name can exist on an unrelated object, so a human
+        // still checks, but the attribute is never auto-deleted.
+        var pyReaders = pyAttrReadElsewhere(rel, def.name);
+        if (pyReaders.length > 0) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'read as .' + def.name + ' in ' + pyReaders.length + ' other file' + (pyReaders.length === 1 ? '' : 's') + ' (' + pyReaders.slice(0, 3).join(', ') + (pyReaders.length > 3 ? ', ...' : '') + ') — attribute lookup, not a code reference', evidence: Object.assign({}, common.evidence, { attrReaders: pyReaders }) }));
+          return;
+        }
+        // Documented in the repo's docs (Sphinx `.. attribute::`):
+        // the docs promise the attribute exists, so it is public API
+        // even when no code in the repo reads it.
+        var pyDocPath = pyDocumentedClassAttrs.get(def.className + '.' + def.name);
+        if (pyDocPath) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'documented as ' + def.className + '.' + def.name + ' in ' + pyDocPath + ' — public API, review before deleting' }));
+          return;
+        }
+        // A class attribute documented with a Sphinx `#:` comment is
+        // part of the class's documented public API (an
+        // extension-facing flag): REVIEW, never SAFE.
+        if (def.documentedAttr) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'documented class attribute (Sphinx #: comment) — part of the class public API' }));
+          return;
+        }
+        // A class attribute assigned in a subclass of an
+        // externally-defined base may override a parent attribute
+        // that parent-framework code outside this repo reads: the
+        // parent source is not here to prove it dead, so REVIEW,
+        // never SAFE.
+        if (def.externalBase) {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'class attribute in a subclass of an externally-defined base — may override a parent attribute read by the parent framework' }));
+          return;
+        }
       }
       if (parsed.dynamic) {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: '0 callers, but file uses dynamic imports/reflection (' + (parsed.dynamicReasons[0] || 'dynamic') + ') — cannot prove safe' }));
@@ -4222,7 +5401,11 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       if (info.language === 'java') {
         var javaSize = def.range ? def.range.endIndex - def.range.startIndex : 0;
         var javaCommon = function (grade, reason) {
-          return Object.assign({}, common, { grade: grade, reason: reason, size: javaSize });
+          var f = Object.assign({}, common, { grade: grade, reason: reason, size: javaSize });
+          if (iteration > 1 && grade === 'SAFE' && cascadeVia.length > 0) {
+            f.evidence = Object.assign({}, f.evidence, { cascade: { iteration: iteration, via: cascadeVia } });
+          }
+          return f;
         };
         // Locals and parameters grade on binding-resolved reads, not
         // on the file-level reference set.
@@ -4349,9 +5532,32 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: '0 callers, but referenced by name as a string elsewhere' }));
         return;
       }
-      if (def.exported) {
+      // A module re-exported from a package __init__ (Python
+      // `from . import colors as colors`) or a JS barrel is public API:
+      // its contents are REVIEW at most, never SAFE — even in an app
+      // (port of src/confidence.js).
+      if (def.exported && reExportedFiles.has(rel)) {
+        add(Object.assign({}, common, { grade: 'REVIEW', reason: 'exported via a package re-export — public API, never auto-deleted' }));
+        return;
+      }
+      // Exported but never imported: in a published library (or a
+      // repo with no manifest signal either way) the export is public
+      // surface — REVIEW, never SAFE. In an app repo there is no
+      // published public surface to protect, so an app-internal export
+      // with 0 callers is SAFE (port of src/confidence.js fileKind).
+      // Python keeps the old rule (see the header note): top-level
+      // public names are importable, so they are REVIEW at worst.
+      if (def.exported && info.language !== 'js') {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: 'exported but never imported by any file in the repo' }));
         return;
+      }
+      if (def.exported && info.language === 'js') {
+        var kind = fileKind(rel);
+        if (kind === 'library' || kind === 'unknown') {
+          add(Object.assign({}, common, { grade: 'REVIEW', reason: 'exported but never imported by any file in the repo' }));
+          return;
+        }
+        // kind === 'app': fall through to SAFE below.
       }
       if (def.kind === 'method') {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: 'method with 0 in-repo callers — could be called via an object or framework' }));
@@ -4366,7 +5572,14 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: 'TypeVar definition — a generic type variable, part of the module\'s typing surface; never auto-deleted' }));
         return;
       }
-      add(Object.assign({}, common, { grade: 'SAFE', reason: 'unexported, 0 callers, 0 references, 0 string mentions' }));
+      var safeFinding = Object.assign({}, common, {
+        grade: 'SAFE',
+        reason: def.exported ? 'exported in an app repo, 0 callers, 0 references, 0 string mentions' : 'unexported, 0 callers, 0 references, 0 string mentions',
+      });
+      if (iteration > 1 && cascadeVia.length > 0) {
+        safeFinding.evidence = Object.assign({}, safeFinding.evidence, { cascade: { iteration: iteration, via: cascadeVia } });
+      }
+      add(safeFinding);
     });
 
     // Dead imports.
@@ -4431,7 +5644,29 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         deleteDiff: u.snippet || '',
       });
     });
-  });
+    });
+    // Merge this pass into the cross-pass findings, keeping the FIRST
+    // finding per id unless its grade changed (REVIEW -> SAFE in a
+    // later pass replaces the old verdict), and collect the files
+    // that became SAFE-dead this pass for the next iteration.
+    var addedDead = false;
+    currentFindings.forEach(function (f) {
+      var prev = mergedById.get(f.id);
+      if (prev && prev.grade === f.grade) return;
+      mergedById.set(f.id, f);
+      if (f.grade === 'SAFE' && f.category === 'file' && !deadFiles.has(f.file)) {
+        deadFiles.add(f.file);
+        addedDead = true;
+      }
+    });
+    if (!addedDead) break;
+  }
+  findings = Array.from(mergedById.values());
+  // The dead-dependency pass below still uses add(): point it at the
+  // merged findings, with dedup sets rebuilt from them.
+  currentFindings = findings;
+  currentSeenFindings = new Set(findings.map(function (f) { return f.id; }));
+  currentSeenKeys = new Set(findings.map(function (f) { return findingKey(f); }));
 
   // Dead dependencies (JS only). A dependency is used when a real
   // import/require names it (exact or subpath: lodash/fp, @scope/pkg/sub),

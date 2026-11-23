@@ -299,9 +299,16 @@ test('batch12 (py): a class attribute in a function is not a local', () => {
     '',
     'outer()',
   ].join('\n'));
-  // The class attribute is not recorded as a definition at all (only
-  // model fields are), and the class itself is the local.
-  assert.equal(parsed.definitions.some((d) => d.name === 'x'), false, 'a class attribute is not a local variable definition');
+  // The class attribute IS recorded as a definition (batch 14: the
+  // CLI's tree-sitter parser records every class-body assignment,
+  // and the web matches it) — but it is a class attribute of Inner,
+  // not a local of outer: the class boundary wins over the enclosing
+  // function. The class itself is the local.
+  const x = parsed.definitions.find((d) => d.name === 'x');
+  assert.ok(x, 'a class attribute is recorded as a definition');
+  assert.equal(x.kind, 'variable');
+  assert.equal(x.local, false, 'a class attribute is not a local variable definition');
+  assert.equal(x.className, 'Inner', 'the attribute belongs to the Inner class');
   assert.equal(parsed.definitions.find((d) => d.name === 'Inner').local, true, 'the class itself is a local');
 });
 
