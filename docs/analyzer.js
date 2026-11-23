@@ -164,6 +164,10 @@ var ENTRY_PATTERNS = [
   /\.stories\.[jt]sx?$/,
   /\.config\.[jt]s$/, /\.config\.mjs$/, /\.config\.cjs$/,
   /\/migrations\//, /\/seeds?\//,
+  // Worker entry scripts (Node worker_threads / Web Workers): loaded by
+  // the runtime via a string path (new Worker('...')), never imported,
+  // so without this they read as dead files with only a string mention.
+  /-worker\.[jt]sx?$/, /\.worker\.[jt]sx?$/,
   /setup\.py$/, /conftest\.py$/, /\/__init__\.py$/,
   /webpack\.config\./, /vite\.config\./, /rollup\.config\./,
   /tailwind\.config\./, /jest\.config\./, /babel\.config\./,
@@ -186,6 +190,18 @@ var FRAMEWORK_KEEP_EXPORTS = new Set([
 var FRAMEWORK_KEEP_DECORATORS = [
   'app.route', 'app.errorhandler', 'app.before_request', 'app.after_request',
   'blueprint.route', 'pytest.fixture', 'pytest.mark.parametrize', 'pytest.mark.skip',
+  // Django (frameworks/django.json): template-tag / check / lookup
+  // registration, signal receivers, view guards, and admin actions
+  // and display callables — all invoked by the framework, never by
+  // in-repo code. The match is a substring over the decorator text,
+  // exactly as the CLI's frameworkKeepSymbol does it
+  // (src/confidence.js): `@register.filter` and
+  // `@Field.register_lookup` both contain "register", and
+  // `@bp.route("/register", ...)` contains it in its route path —
+  // the raw decorator text (decoratorsRaw, see parsePy) is what
+  // carries that, because the stripper blanks string contents.
+  'receiver', 'register', 'admin.register', 'login_required',
+  'permission_required', 'admin.action', 'admin.display',
   // Typer / Click CLI entry points and pytest hooks.
   'app.command', 'app.callback', 'app.cli.command', 'click.command', 'click.group',
   'click.pass_context', 'typer.Typer', 'pytest.hookimpl', 'hookimpl',
@@ -274,8 +290,8 @@ var JAVA_SERIALIZATION_CALLBACKS = {
 // order wins a key, matching the CLI's first-reason rule in
 // frameworkKeepSymbol (src/confidence.js).
 var JAVA_PACK_KEEP_EXPORTS_LIST = [['config', 'next.json'], ['default', 'next.json'], ['generateMetadata', 'next.json'], ['generateStaticParams', 'next.json'], ['getServerSideProps', 'next.json'], ['getStaticPaths', 'next.json'], ['getStaticProps', 'next.json'], ['middleware', 'next.json']];
-var JAVA_PACK_KEEP_NAMES_LIST = [['__call__', 'fastapi.json'], ['__init__', 'django.json'], ['__str__', 'django.json'], ['clean', 'django.json'], ['get_absolute_url', 'django.json'], ['save', 'django.json']];
-var JAVA_PACK_KEEP_DECORATORS_LIST = [['receiver', 'django.json'], ['register', 'django.json'], ['admin.register', 'django.json'], ['login_required', 'django.json'], ['permission_required', 'django.json'], ['app.get', 'fastapi.json'], ['app.post', 'fastapi.json'], ['app.put', 'fastapi.json'], ['app.delete', 'fastapi.json'], ['app.patch', 'fastapi.json'], ['app.route', 'fastapi.json'], ['router.get', 'fastapi.json'], ['router.post', 'fastapi.json'], ['router.put', 'fastapi.json'], ['router.delete', 'fastapi.json'], ['router.patch', 'fastapi.json'], ['router.route', 'fastapi.json'], ['app.on_event', 'fastapi.json'], ['app.middleware', 'fastapi.json'], ['app.errorhandler', 'flask.json'], ['app.before_request', 'flask.json'], ['app.after_request', 'flask.json'], ['blueprint.route', 'flask.json'], ['JsonProperty', 'jackson-jpa.json'], ['JsonIgnore', 'jackson-jpa.json'], ['JsonIgnoreProperties', 'jackson-jpa.json'], ['JsonCreator', 'jackson-jpa.json'], ['JsonValue', 'jackson-jpa.json'], ['JsonGetter', 'jackson-jpa.json'], ['JsonSetter', 'jackson-jpa.json'], ['JsonSerialize', 'jackson-jpa.json'], ['JsonDeserialize', 'jackson-jpa.json'], ['JsonInclude', 'jackson-jpa.json'], ['JsonFormat', 'jackson-jpa.json'], ['JsonTypeInfo', 'jackson-jpa.json'], ['JsonSubTypes', 'jackson-jpa.json'], ['JsonTypeName', 'jackson-jpa.json'], ['JsonAnyGetter', 'jackson-jpa.json'], ['JsonAnySetter', 'jackson-jpa.json'], ['JsonAlias', 'jackson-jpa.json'], ['JsonView', 'jackson-jpa.json'], ['JsonPropertyOrder', 'jackson-jpa.json'], ['JsonUnwrapped', 'jackson-jpa.json'], ['JsonRawValue', 'jackson-jpa.json'], ['JsonManagedReference', 'jackson-jpa.json'], ['JsonBackReference', 'jackson-jpa.json'], ['JsonIdentityInfo', 'jackson-jpa.json'], ['Entity', 'jackson-jpa.json'], ['Table', 'jackson-jpa.json'], ['Column', 'jackson-jpa.json'], ['Id', 'jackson-jpa.json'], ['GeneratedValue', 'jackson-jpa.json'], ['Embeddable', 'jackson-jpa.json'], ['Embedded', 'jackson-jpa.json'], ['EmbeddedId', 'jackson-jpa.json'], ['MappedSuperclass', 'jackson-jpa.json'], ['OneToMany', 'jackson-jpa.json'], ['ManyToOne', 'jackson-jpa.json'], ['OneToOne', 'jackson-jpa.json'], ['ManyToMany', 'jackson-jpa.json'], ['JoinColumn', 'jackson-jpa.json'], ['JoinTable', 'jackson-jpa.json'], ['PrePersist', 'jackson-jpa.json'], ['PreUpdate', 'jackson-jpa.json'], ['PostLoad', 'jackson-jpa.json'], ['PostPersist', 'jackson-jpa.json'], ['PostRemove', 'jackson-jpa.json'], ['PostUpdate', 'jackson-jpa.json'], ['Enumerated', 'jackson-jpa.json'], ['Temporal', 'jackson-jpa.json'], ['Transient', 'jackson-jpa.json'], ['Lob', 'jackson-jpa.json'], ['Version', 'jackson-jpa.json'], ['ElementCollection', 'jackson-jpa.json'], ['CollectionTable', 'jackson-jpa.json'], ['OrderBy', 'jackson-jpa.json'], ['DiscriminatorColumn', 'jackson-jpa.json'], ['Inheritance', 'jackson-jpa.json'], ['NamedQuery', 'jackson-jpa.json'], ['NamedQueries', 'jackson-jpa.json'], ['SequenceGenerator', 'jackson-jpa.json'], ['TableGenerator', 'jackson-jpa.json'], ['model_validator', 'pydantic.json'], ['field_validator', 'pydantic.json'], ['computed_field', 'pydantic.json'], ['root_validator', 'pydantic.json'], ['validator', 'pydantic.json'], ['pytest.fixture', 'pytest.json'], ['pytest.mark.parametrize', 'pytest.json'], ['pytest.mark.skip', 'pytest.json'], ['pytest.hookimpl', 'pytest.json'], ['hookimpl', 'pytest.json'], ['Component', 'spring.json'], ['Service', 'spring.json'], ['Repository', 'spring.json'], ['Controller', 'spring.json'], ['RestController', 'spring.json'], ['ControllerAdvice', 'spring.json'], ['RestControllerAdvice', 'spring.json'], ['Configuration', 'spring.json'], ['SpringBootApplication', 'spring.json'], ['SpringBootConfiguration', 'spring.json'], ['EnableAutoConfiguration', 'spring.json'], ['ComponentScan', 'spring.json'], ['EnableFeignClients', 'spring.json'], ['EnableWebMvc', 'spring.json'], ['EnableScheduling', 'spring.json'], ['EnableAsync', 'spring.json'], ['EnableCaching', 'spring.json'], ['EnableTransactionManagement', 'spring.json'], ['Autowired', 'spring.json'], ['Qualifier', 'spring.json'], ['Value', 'spring.json'], ['Bean', 'spring.json'], ['PostConstruct', 'spring.json'], ['PreDestroy', 'spring.json'], ['Primary', 'spring.json'], ['Lazy', 'spring.json'], ['Scope', 'spring.json'], ['Profile', 'spring.json'], ['Conditional', 'spring.json'], ['Import', 'spring.json'], ['PropertySource', 'spring.json'], ['ConfigurationProperties', 'spring.json'], ['EnableConfigurationProperties', 'spring.json'], ['RequestMapping', 'spring.json'], ['GetMapping', 'spring.json'], ['PostMapping', 'spring.json'], ['PutMapping', 'spring.json'], ['DeleteMapping', 'spring.json'], ['PatchMapping', 'spring.json'], ['RequestParam', 'spring.json'], ['PathVariable', 'spring.json'], ['RequestBody', 'spring.json'], ['ResponseBody', 'spring.json'], ['ResponseStatus', 'spring.json'], ['ExceptionHandler', 'spring.json'], ['ModelAttribute', 'spring.json'], ['CrossOrigin', 'spring.json'], ['RequestHeader', 'spring.json'], ['CookieValue', 'spring.json'], ['Scheduled', 'spring.json'], ['Async', 'spring.json'], ['EventListener', 'spring.json'], ['Transactional', 'spring.json'], ['Cacheable', 'spring.json'], ['CacheEvict', 'spring.json'], ['CachePut', 'spring.json'], ['Retryable', 'spring.json'], ['Secured', 'spring.json'], ['PreAuthorize', 'spring.json'], ['PostAuthorize', 'spring.json'], ['FeignClient', 'spring.json'], ['app.command', 'typer.json'], ['app.callback', 'typer.json'], ['app.cli.command', 'typer.json'], ['click.command', 'typer.json'], ['click.group', 'typer.json'], ['click.pass_context', 'typer.json'], ['typer.Typer', 'typer.json'], ['overload', 'typing.json']];
+var JAVA_PACK_KEEP_NAMES_LIST = [['__call__', 'fastapi.json'], ['__init__', 'django.json'], ['__str__', 'django.json'], ['clean', 'django.json'], ['get_absolute_url', 'django.json'], ['save', 'django.json'], ['ready', 'django.json']];
+var JAVA_PACK_KEEP_DECORATORS_LIST = [['receiver', 'django.json'], ['register', 'django.json'], ['admin.register', 'django.json'], ['login_required', 'django.json'], ['permission_required', 'django.json'], ['admin.action', 'django.json'], ['admin.display', 'django.json'], ['app.get', 'fastapi.json'], ['app.post', 'fastapi.json'], ['app.put', 'fastapi.json'], ['app.delete', 'fastapi.json'], ['app.patch', 'fastapi.json'], ['app.route', 'fastapi.json'], ['router.get', 'fastapi.json'], ['router.post', 'fastapi.json'], ['router.put', 'fastapi.json'], ['router.delete', 'fastapi.json'], ['router.patch', 'fastapi.json'], ['router.route', 'fastapi.json'], ['app.on_event', 'fastapi.json'], ['app.middleware', 'fastapi.json'], ['app.errorhandler', 'flask.json'], ['app.before_request', 'flask.json'], ['app.after_request', 'flask.json'], ['blueprint.route', 'flask.json'], ['JsonProperty', 'jackson-jpa.json'], ['JsonIgnore', 'jackson-jpa.json'], ['JsonIgnoreProperties', 'jackson-jpa.json'], ['JsonCreator', 'jackson-jpa.json'], ['JsonValue', 'jackson-jpa.json'], ['JsonGetter', 'jackson-jpa.json'], ['JsonSetter', 'jackson-jpa.json'], ['JsonSerialize', 'jackson-jpa.json'], ['JsonDeserialize', 'jackson-jpa.json'], ['JsonInclude', 'jackson-jpa.json'], ['JsonFormat', 'jackson-jpa.json'], ['JsonTypeInfo', 'jackson-jpa.json'], ['JsonSubTypes', 'jackson-jpa.json'], ['JsonTypeName', 'jackson-jpa.json'], ['JsonAnyGetter', 'jackson-jpa.json'], ['JsonAnySetter', 'jackson-jpa.json'], ['JsonAlias', 'jackson-jpa.json'], ['JsonView', 'jackson-jpa.json'], ['JsonPropertyOrder', 'jackson-jpa.json'], ['JsonUnwrapped', 'jackson-jpa.json'], ['JsonRawValue', 'jackson-jpa.json'], ['JsonManagedReference', 'jackson-jpa.json'], ['JsonBackReference', 'jackson-jpa.json'], ['JsonIdentityInfo', 'jackson-jpa.json'], ['Entity', 'jackson-jpa.json'], ['Table', 'jackson-jpa.json'], ['Column', 'jackson-jpa.json'], ['Id', 'jackson-jpa.json'], ['GeneratedValue', 'jackson-jpa.json'], ['Embeddable', 'jackson-jpa.json'], ['Embedded', 'jackson-jpa.json'], ['EmbeddedId', 'jackson-jpa.json'], ['MappedSuperclass', 'jackson-jpa.json'], ['OneToMany', 'jackson-jpa.json'], ['ManyToOne', 'jackson-jpa.json'], ['OneToOne', 'jackson-jpa.json'], ['ManyToMany', 'jackson-jpa.json'], ['JoinColumn', 'jackson-jpa.json'], ['JoinTable', 'jackson-jpa.json'], ['PrePersist', 'jackson-jpa.json'], ['PreUpdate', 'jackson-jpa.json'], ['PostLoad', 'jackson-jpa.json'], ['PostPersist', 'jackson-jpa.json'], ['PostRemove', 'jackson-jpa.json'], ['PostUpdate', 'jackson-jpa.json'], ['Enumerated', 'jackson-jpa.json'], ['Temporal', 'jackson-jpa.json'], ['Transient', 'jackson-jpa.json'], ['Lob', 'jackson-jpa.json'], ['Version', 'jackson-jpa.json'], ['ElementCollection', 'jackson-jpa.json'], ['CollectionTable', 'jackson-jpa.json'], ['OrderBy', 'jackson-jpa.json'], ['DiscriminatorColumn', 'jackson-jpa.json'], ['Inheritance', 'jackson-jpa.json'], ['NamedQuery', 'jackson-jpa.json'], ['NamedQueries', 'jackson-jpa.json'], ['SequenceGenerator', 'jackson-jpa.json'], ['TableGenerator', 'jackson-jpa.json'], ['model_validator', 'pydantic.json'], ['field_validator', 'pydantic.json'], ['computed_field', 'pydantic.json'], ['root_validator', 'pydantic.json'], ['validator', 'pydantic.json'], ['pytest.fixture', 'pytest.json'], ['pytest.mark.parametrize', 'pytest.json'], ['pytest.mark.skip', 'pytest.json'], ['pytest.hookimpl', 'pytest.json'], ['hookimpl', 'pytest.json'], ['Component', 'spring.json'], ['Service', 'spring.json'], ['Repository', 'spring.json'], ['Controller', 'spring.json'], ['RestController', 'spring.json'], ['ControllerAdvice', 'spring.json'], ['RestControllerAdvice', 'spring.json'], ['Configuration', 'spring.json'], ['SpringBootApplication', 'spring.json'], ['SpringBootConfiguration', 'spring.json'], ['EnableAutoConfiguration', 'spring.json'], ['ComponentScan', 'spring.json'], ['EnableFeignClients', 'spring.json'], ['EnableWebMvc', 'spring.json'], ['EnableScheduling', 'spring.json'], ['EnableAsync', 'spring.json'], ['EnableCaching', 'spring.json'], ['EnableTransactionManagement', 'spring.json'], ['Autowired', 'spring.json'], ['Qualifier', 'spring.json'], ['Value', 'spring.json'], ['Bean', 'spring.json'], ['PostConstruct', 'spring.json'], ['PreDestroy', 'spring.json'], ['Primary', 'spring.json'], ['Lazy', 'spring.json'], ['Scope', 'spring.json'], ['Profile', 'spring.json'], ['Conditional', 'spring.json'], ['Import', 'spring.json'], ['PropertySource', 'spring.json'], ['ConfigurationProperties', 'spring.json'], ['EnableConfigurationProperties', 'spring.json'], ['RequestMapping', 'spring.json'], ['GetMapping', 'spring.json'], ['PostMapping', 'spring.json'], ['PutMapping', 'spring.json'], ['DeleteMapping', 'spring.json'], ['PatchMapping', 'spring.json'], ['RequestParam', 'spring.json'], ['PathVariable', 'spring.json'], ['RequestBody', 'spring.json'], ['ResponseBody', 'spring.json'], ['ResponseStatus', 'spring.json'], ['ExceptionHandler', 'spring.json'], ['ModelAttribute', 'spring.json'], ['CrossOrigin', 'spring.json'], ['RequestHeader', 'spring.json'], ['CookieValue', 'spring.json'], ['Scheduled', 'spring.json'], ['Async', 'spring.json'], ['EventListener', 'spring.json'], ['Transactional', 'spring.json'], ['Cacheable', 'spring.json'], ['CacheEvict', 'spring.json'], ['CachePut', 'spring.json'], ['Retryable', 'spring.json'], ['Secured', 'spring.json'], ['PreAuthorize', 'spring.json'], ['PostAuthorize', 'spring.json'], ['FeignClient', 'spring.json'], ['app.command', 'typer.json'], ['app.callback', 'typer.json'], ['app.cli.command', 'typer.json'], ['click.command', 'typer.json'], ['click.group', 'typer.json'], ['click.pass_context', 'typer.json'], ['typer.Typer', 'typer.json'], ['overload', 'typing.json']];
 
 // Null-prototype lookup maps built from the lists above: symbol names
 // come from user code, so a plain {} would return inherited members
@@ -307,6 +323,32 @@ function javaFrameworkKeepSymbol(name, decorators) {
     }
   }
   return '';
+}
+
+// True when a framework pack keeps this JS/Python definition by
+// decorator (port of the CLI's frameworkKeepSymbol keepDecorators
+// check, src/confidence.js): a substring match over the decorator
+// text. Both decorator texts are tested — the stripped text and the
+// raw text (parsePy records both as decorators / decoratorsRaw). The
+// raw text keeps the string arguments the stripper blanks, so the
+// CLI's match over the full decorator text is reproduced: the route
+// path in `@bp.route("/register", ...)` contains "register", and a
+// multi-line `@app.command(...)` keeps its name across its
+// continuation lines. The CLI's keepNames check for JS/Python lives
+// next to this one at the call sites (JAVA_PACK_KEEP_NAMES — the
+// union of keepNames is language-agnostic in the CLI, so the web
+// reuses the same pack-derived map).
+function hasFrameworkKeepDecorator(def) {
+  var lists = [def.decorators, def.decoratorsRaw];
+  for (var li = 0; li < lists.length; li++) {
+    var arr = lists[li] || [];
+    for (var i = 0; i < arr.length; i++) {
+      for (var j = 0; j < FRAMEWORK_KEEP_DECORATORS.length; j++) {
+        if (arr[i].indexOf(FRAMEWORK_KEEP_DECORATORS[j]) >= 0) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2146,6 +2188,11 @@ function parsePy(rel, raw) {
   var strings = [];
   var code = stripPy(raw, strings);
   var lines = code.split('\n');
+  // The raw lines, for the places that need string contents the
+  // stripper blanks: decorator text (below), string annotations, and
+  // the reference pass. Defined here so the main definition loop can
+  // use it too (it used to be defined after that loop).
+  var rawLinesPy = raw.split('\n');
   // Absolute offset of each stripped line: the stripper blanks strings
   // and comments in place, so offsets match the raw source.
   var lineOffsetsPy = [];
@@ -2185,6 +2232,19 @@ function parsePy(rel, raw) {
   var classRecords = []; // every class site, in definition order
   var funcStack = []; // {indent} — def lines, so a local inside a method is not a class field
   var pendingDecorators = [];
+  // The raw text of the pending decorators (parallel to
+  // pendingDecorators): the decorator as written, strings intact and
+  // multi-line decorators joined across their continuation lines.
+  // The CLI's tree-sitter decorator node is the whole text including
+  // arguments, so the framework-decorator substring match reads it:
+  // `@bp.route("/register", ...)` contains "register" only in its
+  // string argument, which the stripper blanks. A decorator is
+  // complete when its brackets balance (openDecoratorDepth, counted
+  // on the stripped lines so brackets inside strings cannot corrupt
+  // it); openDecoratorRaw holds the in-progress text until then.
+  var pendingDecoratorsRaw = [];
+  var openDecoratorRaw = null;
+  var openDecoratorDepth = 0;
   var declaredOnLine = {};
   // Chained-assignment targets and value-less annotations are
   // definition sites, not reads, so they must not count as a bare
@@ -2235,6 +2295,21 @@ function parsePy(rel, raw) {
   function indentOf(line) {
     var m = line.match(/^ */);
     return m ? m[0].length : 0;
+  }
+  // Net open-bracket count of a stripped line: `(` / `[` / `{` count
+  // +1, their closers -1. Strings and comments are already blanked
+  // in the stripped code, so brackets inside them cannot corrupt the
+  // count; f-string {...} expressions are kept as code and their
+  // braces balance. Used to tell when a multi-line decorator is
+  // complete (see the @ branch in the main loop below).
+  function bracketNet(strippedLine) {
+    var net = 0;
+    for (var bi = 0; bi < strippedLine.length; bi++) {
+      var bc = strippedLine[bi];
+      if (bc === '(' || bc === '[' || bc === '{') net++;
+      else if (bc === ')' || bc === ']' || bc === '}') net--;
+    }
+    return net;
   }
   // The class header starting on lines[firstIdx], joined across
   // continuation lines (brackets open) so a multi-line base list
@@ -2403,9 +2478,53 @@ function parsePy(rel, raw) {
     while (lineDepth === 0 && classStack.length && indent <= classStack[classStack.length - 1].indent) classStack.pop();
     while (lineDepth === 0 && funcStack.length && indent <= funcStack[funcStack.length - 1].indent) funcStack.pop();
 
+    // Continuation lines of a multi-line decorator (`@app.command(`
+    // with its arguments on the next lines): append the raw line to
+    // the in-progress decorator text until its brackets balance. The
+    // references pass below scans every line independently, so
+    // skipping the rest of this loop body here loses no references —
+    // only the definition recording below is skipped, and a
+    // continuation line is never a definition site (lineDepth > 0).
+    // A def / class line while a decorator is still open means the
+    // decorator was malformed (never balanced): flush what was
+    // accumulated and let the def / class branch below attach it.
+    if (openDecoratorRaw !== null) {
+      if (/^(?:async\s+)?def\s/.test(trimmed) || /^class\s/.test(trimmed)) {
+        pendingDecoratorsRaw.push(openDecoratorRaw);
+        openDecoratorRaw = null;
+      } else {
+        openDecoratorRaw += ' ' + annBlankComment(rawLinesPy[ln] || '').trim();
+        openDecoratorDepth += bracketNet(trimmed);
+        if (openDecoratorDepth <= 0) {
+          pendingDecoratorsRaw.push(openDecoratorRaw);
+          openDecoratorRaw = null;
+        }
+        continue;
+      }
+    }
+
     if (/^@/.test(trimmed)) {
+      // A second @ line while the previous decorator is still open:
+      // the previous one was malformed — flush it and start fresh.
+      if (openDecoratorRaw !== null) {
+        pendingDecoratorsRaw.push(openDecoratorRaw);
+        openDecoratorRaw = null;
+      }
       pendingDecorators.push(trimmed);
       parsed.decorators.push(trimmed);
+      // The raw text (strings intact, trailing comment blanked) is
+      // what the framework-decorator match reads: the CLI's
+      // tree-sitter decorator node includes the arguments, so
+      // `@bp.route("/register", ...)` must still contain "register"
+      // here, where the stripped line has it blanked away. A
+      // decorator whose brackets do not balance on this line stays
+      // open for its continuation lines (see above).
+      openDecoratorRaw = annBlankComment(rawLinesPy[ln] || '').trim();
+      openDecoratorDepth = bracketNet(trimmed);
+      if (openDecoratorDepth <= 0) {
+        pendingDecoratorsRaw.push(openDecoratorRaw);
+        openDecoratorRaw = null;
+      }
       continue;
     }
     var dm = line.match(/^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/);
@@ -2426,6 +2545,7 @@ function parsePy(rel, raw) {
       var def = {
         name: dm[2], kind: isMethod ? 'method' : 'function', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
+        decoratorsRaw: pendingDecoratorsRaw.slice(),
         local: innermostIsFunction(),
       };
       if (enclosingRec) def.className = enclosingRec.name;
@@ -2435,6 +2555,7 @@ function parsePy(rel, raw) {
       markDeclared(lineNo, dm[2]);
       funcStack.push({ indent: indent });
       pendingDecorators = [];
+      pendingDecoratorsRaw = [];
       continue;
     }
     var cm = line.match(/^(\s*)class\s+([A-Za-z_]\w*)/);
@@ -2449,6 +2570,7 @@ function parsePy(rel, raw) {
       var classDef = {
         name: cm[2], kind: 'class', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
+        decoratorsRaw: pendingDecoratorsRaw.slice(),
         local: innermostIsFunction(),
       };
       if (enclosingRecCls) classDef.className = enclosingRecCls.name;
@@ -2458,6 +2580,7 @@ function parsePy(rel, raw) {
       classRecords.push(classRec);
       classStack.push(classRec);
       pendingDecorators = [];
+      pendingDecoratorsRaw = [];
       continue;
     }
     // Variable assignment: `NAME = ...` or an annotated
@@ -2590,7 +2713,10 @@ function parsePy(rel, raw) {
       var annOnly = line.match(/^(\s*)([A-Za-z_]\w*)\s*:/);
       if (annOnly && matchAssignPy(line) === null) noteBareDecl(lineNo, annOnly[2]);
     }
-    if (pendingDecorators.length) pendingDecorators = [];
+    // A decorator followed by something that is not a def / class is
+    // stale: drop it (and any uncompleted multi-line fragment) so it
+    // cannot attach to a later definition.
+    if (pendingDecorators.length) { pendingDecorators = []; pendingDecoratorsRaw = []; openDecoratorRaw = null; }
   }
 
   // __all__ makes names public exports — and listing a name there is a
@@ -2622,10 +2748,9 @@ function parsePy(rel, raw) {
   // (Mirrors src/parse-py.js.)
   var isPackageInit = baseOf(rel) === '__init__.py';
   var isCompatShimPy = /(^|\/)(_?compat)(\.py)?$/.test(rel) || /(^|\/)_?compat\//.test(rel);
-  // Raw lines, defined here (not in the references pass below) because
-  // the import loop needs them: a `# noqa` marker lives in a comment,
+  // Raw lines (defined at the top of parsePy, since the definition
+  // loop uses them too): a `# noqa` marker lives in a comment,
   // which the stripped code has blanked.
-  var rawLinesPy = raw.split('\n');
   function reExportPy(stmt, redundantAlias, rawStmt) {
     // The noqa marker lives in a comment, which the stripped code has
     // blanked — so it is invisible in `stmt`. Check the raw statement
@@ -3940,9 +4065,8 @@ function buildSameFileLiveness(parsed, ctx) {
   var baseKeepDef = function (d) {
     return ctx.keepSymbols
       || FRAMEWORK_KEEP_EXPORTS.has(d.name)
-      || (d.decorators || []).some(function (dec) {
-        return FRAMEWORK_KEEP_DECORATORS.some(function (kd) { return dec.indexOf(kd) >= 0; });
-      })
+      || (d.name && JAVA_PACK_KEEP_NAMES[d.name])
+      || hasFrameworkKeepDecorator(d)
       || (d.frameworkField ? true : false)
       || (d.ambient ? true : false)
       || ctx.overloadedNames.has(d.name)
@@ -4946,7 +5070,20 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     var isInstrumentationFile = /instrumentation\.(js|ts)$/.test(rel);
     var fwKeepReason = frameworkKeepReason(rel);
     var keepFile = isEntry || isTest || isConfig || isRouteFile || isInstrumentationFile || Boolean(fwKeepReason);
-    var keepSymbols = isTest || isConfig || isManualScript || isRouteFile || isInstrumentationFile || Boolean(fwKeepReason);
+    // Symbols are NOT kept by the route directory alone (port of
+    // src/confidence.js): the CLI's entry patterns make a file under
+    // pages/ / app/ / routes/ / views/ an entry FILE (never a dead
+    // file, see keepFile above), but only test / config / manual /
+    // framework files keep their SYMBOLS — the framework resolves
+    // those symbols, not merely the file. A NestJS controller under
+    // src/views/ is the proof: the CLI has no NestJS pack, so its
+    // @Get / @Render methods are not framework-kept and grade REVIEW
+    // (string-referenced by the route paths in tests), while the web
+    // used to KEEP the whole file's symbols for sitting under views/.
+    // Next.js pages/ and app/ files still keep their symbols, via
+    // fwKeepReason (frameworks/next.json entryPatterns), exactly as
+    // in the CLI.
+    var keepSymbols = isTest || isConfig || isManualScript || isInstrumentationFile || Boolean(fwKeepReason);
     // Importers that are themselves dead do not keep a file alive: if
     // the only importer of B is dead file A, B is dead in the same run
     // (port of src/confidence.js).
@@ -5293,9 +5430,7 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: 'Next.js middleware/proxy export "' + def.name + '"' }));
         return;
       }
-      if ((def.decorators || []).some(function (d) {
-        return FRAMEWORK_KEEP_DECORATORS.some(function (kd) { return d.indexOf(kd) >= 0; });
-      })) {
+      if (hasFrameworkKeepDecorator(def)) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: 'framework decorator on ' + def.name }));
         return;
       }
@@ -5303,8 +5438,21 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: 'dunder / protocol method ' + def.name }));
         return;
       }
+      // Framework-resolved name (port of the CLI's frameworkKeepSymbol
+      // keepNames check, src/confidence.js): Django calls
+      // AppConfig.ready() at app load, Model.clean() from full_clean(),
+      // Model.save() from the ORM, and get_absolute_url() from
+      // templates and the admin — never by in-repo code. The map is
+      // the pack-derived JAVA_PACK_KEEP_NAMES (the union of keepNames
+      // is language-agnostic in the CLI). It sits after the dunder
+      // check on purpose, so `__init__` / `__str__` keep their
+      // dunder reason.
+      if (def.name && JAVA_PACK_KEEP_NAMES[def.name]) {
+        add(Object.assign({}, common, { grade: 'KEEP', reason: 'framework pack ' + JAVA_PACK_KEEP_NAMES[def.name] + ': name "' + def.name + '" is framework-resolved' }));
+        return;
+      }
       if (keepSymbols) {
-        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : isInstrumentationFile ? 'in a framework instrumentation file (next.json keepFiles)' : fwKeepReason ? fwKeepReason : 'in a framework route file' }));
+        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : isInstrumentationFile ? 'in a framework instrumentation file (next.json keepFiles)' : fwKeepReason ? fwKeepReason : 'framework-resolved file' }));
         return;
       }
       // Class-attribute rules (FP-6, port of src/confidence.js).

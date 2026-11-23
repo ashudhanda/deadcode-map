@@ -3,84 +3,221 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="deadcode-map web checker — paste a public GitHub repo link and see its dead code, file by file, in your browser." />
-  <title>deadcode-map — Web Checker</title>
+  <meta name="description" content="deadcode-map — interactive browser workbench to find dead code in GitHub repositories or local folders." />
+  <title>deadcode-map — Interactive Dead Code Workbench</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <h1>deadcode-map<span>.</span> web checker</h1>
-      <p>Paste a public GitHub repo link. See its dead code, file by file, right here.</p>
-    </header>
-
-    <div class="notice">
-      <strong>Lightweight browser analyzer.</strong> JS / TypeScript and
-      Python are analyzed with regular expressions; Java is parsed with
-      tree-sitter (WASM, vendored in this page and loaded lazily only
-      when a <code>.java</code> file is present — still fully offline, no
-      CDN). It is not the full tree-sitter CLI, so it can miss exotic
-      syntax and it cannot run your tests (<code>--prove</code>).
-      For full accuracy, use the CLI:
-      <a href="https://github.com/ashudhanda/deadcode-map">github.com/ashudhanda/deadcode-map</a>.
-      Public repos only. Nothing is uploaded anywhere — files are fetched from
-      GitHub and analyzed in your browser.
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot" aria-hidden="true"></span>
+        <span class="brand-name">deadcode-map</span>
+        <span class="version-pill">v0.2</span>
+      </div>
+      <nav class="topnav">
+        <button id="engine-info-btn" type="button" class="nav-btn" aria-expanded="false">Engine info</button>
+        <a href="https://github.com/ashudhanda/deadcode-map#install" target="_blank" rel="noreferrer" class="nav-link">CLI</a>
+        <a href="https://github.com/ashudhanda/deadcode-map" target="_blank" rel="noreferrer" class="nav-link">GitHub</a>
+      </nav>
     </div>
+  </header>
 
-    <section class="card">
-      <label for="repo-url">GitHub repo URL</label>
-      <input id="repo-url" type="text" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false" />
-      <p class="hint">Example: https://github.com/ashudhanda/deadcode-map — a /tree/branch/path link works too.</p>
-
-      <label for="gh-token">GitHub token (optional)</label>
-      <input id="gh-token" type="password" placeholder="ghp_… — only for a higher rate limit" autocomplete="off" spellcheck="false" />
-      <p class="hint">Without a token, GitHub allows 60 API requests per hour. Your token is never stored — it is sent only to api.github.com, in memory, for this one check. Leave it empty to stay anonymous.</p>
-
-      <p class="hint"><label><input id="include-fixtures" type="checkbox" /> Include fixture/test-data directories (<code>fixtures/</code>, <code>__fixtures__/</code>) — off by default, they hold planted dead code on purpose.</label></p>
-
-      <div class="row">
-        <button id="analyze-btn" type="button">Analyze repo</button>
-        <button id="try-btn" type="button" class="secondary">Try deadcode-map itself</button>
-        <span id="status" class="status" role="status"></span>
-      </div>
-    </section>
-
-    <div id="error" class="error" hidden></div>
-
-    <section id="results" hidden>
-      <h2 id="results-title">Results</h2>
-      <p id="results-meta" class="status"></p>
-
-      <div class="summary">
-        <div class="stat"><div class="num" id="stat-total">0</div><div class="lbl">Findings</div></div>
-        <div class="stat safe"><div class="num" id="stat-safe">0</div><div class="lbl">Safe</div></div>
-        <div class="stat review"><div class="num" id="stat-review">0</div><div class="lbl">Review</div></div>
-        <div class="stat keep"><div class="num" id="stat-keep">0</div><div class="lbl">Keep</div></div>
-      </div>
-
-      <div class="filters" id="filters">
-        <button type="button" data-grade="ALL" class="active">All</button>
-        <button type="button" data-grade="SAFE">SAFE — provably dead</button>
-        <button type="button" data-grade="REVIEW">REVIEW — check first</button>
-        <button type="button" data-grade="KEEP">KEEP — never delete</button>
-      </div>
-
-      <div class="card">
-        <h3>Map</h3>
-        <p class="hint">Each dot is a file. Red = has SAFE dead code, amber = REVIEW only, green = clean or kept. Click a dot to see that file.</p>
-        <div class="map-wrap" id="map"></div>
-        <p class="map-legend" id="map-legend"></p>
-      </div>
-
-      <div id="findings"></div>
-    </section>
-
-    <footer>
-      <p>deadcode-map v0.1.0 — JS / TypeScript + Python + Java (Java parsed with tree-sitter WASM, lazy-loaded, offline). MIT licensed.
-      <a href="https://github.com/ashudhanda/deadcode-map">GitHub</a> ·
-      <a href="https://github.com/ashudhanda/deadcode-map#readme">CLI README</a></p>
-    </footer>
+  <div id="engine-drawer" class="engine-drawer" hidden>
+    <div class="engine-drawer-inner">
+      <p>
+        <strong>Zero-upload browser engine.</strong> JS / TypeScript and Python run in a background Web Worker; Java uses vendored offline
+        <code>tree-sitter.wasm</code> (loaded lazily only when <code>.java</code> files are present). Nothing leaves your browser.
+        Caps: 500 code files / 5 MB total / 200 KB per file. For full tree-sitter accuracy, <code>--prove</code>, and <code>--fix</code>,
+        run <code>npx deadcode-map .</code> locally.
+      </p>
+      <button id="engine-drawer-close" type="button" class="icon-btn" aria-label="Close">&times;</button>
+    </div>
   </div>
+
+  <main class="shell">
+    <section class="hero">
+      <div class="hero-copy">
+        <h1>Find dead code.<br /><span>See the blast radius.</span></h1>
+        <p class="subtitle">
+          Confidence-graded static analysis for JS/TS, Python, and Java — directly in your browser.
+        </p>
+      </div>
+
+      <div class="command-panel">
+        <div class="panel-top">
+          <div class="mode-tabs" role="tablist" aria-label="Scan source">
+            <button type="button" class="mode-tab active" data-mode="github" role="tab" aria-selected="true">GitHub Repo</button>
+            <button type="button" class="mode-tab" data-mode="local" role="tab" aria-selected="false">Local Folder <span class="tab-tag">Private</span></button>
+          </div>
+          <button id="options-toggle" type="button" class="ghost-toggle" aria-expanded="false">Options</button>
+        </div>
+
+        <!-- GitHub mode -->
+        <div id="mode-github" class="mode-body">
+          <div class="input-group">
+            <input
+              id="repo-url"
+              type="text"
+              placeholder="https://github.com/owner/repo  or  owner/repo"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="GitHub repository URL"
+            />
+            <button id="analyze-btn" type="button" class="btn-primary">Analyze</button>
+          </div>
+          <div class="presets">
+            <span class="presets-label">Try:</span>
+            <button type="button" class="preset-chip" data-repo="https://github.com/ashudhanda/deadcode-map">deadcode-map</button>
+            <button type="button" class="preset-chip" data-repo="https://github.com/pmndrs/zustand">zustand</button>
+            <button type="button" class="preset-chip" data-repo="https://github.com/pallets/flask">flask</button>
+            <button type="button" class="preset-chip" data-repo="https://github.com/psf/requests">requests</button>
+          </div>
+        </div>
+
+        <!-- Local folder mode -->
+        <div id="mode-local" class="mode-body" hidden>
+          <div id="dropzone" class="dropzone">
+            <input id="local-folder-input" type="file" webkitdirectory directory multiple hidden />
+            <div class="dropzone-title">Select a local project folder</div>
+            <div class="dropzone-sub">
+              Analyzed 100% locally in a Web Worker — zero network calls, works on private repositories.
+            </div>
+            <button id="pick-folder-btn" type="button" class="btn-primary">Choose folder</button>
+          </div>
+        </div>
+
+        <!-- Collapsible options -->
+        <div id="options-panel" class="options-panel" hidden>
+          <div class="option-row" id="token-row">
+            <label for="gh-token">GitHub Personal Access Token (optional)</label>
+            <input
+              id="gh-token"
+              type="password"
+              placeholder="ghp_…  (raises API rate limit from 60 to 5,000 req/hr; memory-only)"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <label class="checkbox-row">
+            <input id="include-fixtures" type="checkbox" />
+            <span>Include fixture directories (<code>fixtures/</code>, <code>__fixtures__/</code>) — excluded by default</span>
+          </label>
+        </div>
+
+        <div id="progress-wrap" class="progress-wrap" hidden>
+          <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+          <span id="status" class="status-text" role="status"></span>
+        </div>
+      </div>
+
+      <div id="error" class="error-banner" hidden></div>
+    </section>
+
+    <section id="results" class="results" hidden>
+      <div class="results-header">
+        <div>
+          <h2 id="results-title">Results</h2>
+          <p id="results-meta" class="results-meta"></p>
+        </div>
+        <div class="results-actions">
+          <button id="export-json-btn" type="button" class="btn-secondary">Export JSON</button>
+          <button id="copy-cli-btn" type="button" class="btn-secondary">Copy CLI command</button>
+        </div>
+      </div>
+
+      <!-- KPI strip + health bar -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Files Scanned</div>
+          <div class="kpi-value" id="stat-files">0</div>
+          <div class="kpi-sub" id="stat-clean-sub">0% clean</div>
+        </div>
+        <div class="kpi-card kpi-safe">
+          <div class="kpi-label">SAFE — Provably Dead</div>
+          <div class="kpi-value" id="stat-safe">0</div>
+          <div class="kpi-sub" id="stat-safe-bytes">0 B reclaimable</div>
+        </div>
+        <div class="kpi-card kpi-review">
+          <div class="kpi-label">REVIEW — Check First</div>
+          <div class="kpi-value" id="stat-review">0</div>
+          <div class="kpi-sub">Needs human eye</div>
+        </div>
+        <div class="kpi-card kpi-keep">
+          <div class="kpi-label">KEEP — Protected</div>
+          <div class="kpi-value" id="stat-keep">0</div>
+          <div class="kpi-sub">Entries &amp; framework rules</div>
+        </div>
+      </div>
+
+      <div class="health-bar-wrap" aria-label="Repository health breakdown">
+        <div class="health-bar">
+          <div id="bar-clean" class="hb-seg hb-clean" style="width:100%"></div>
+          <div id="bar-review" class="hb-seg hb-review" style="width:0%"></div>
+          <div id="bar-safe" class="hb-seg hb-safe" style="width:0%"></div>
+        </div>
+        <div class="health-legend" id="health-legend"></div>
+      </div>
+
+      <!-- Dual Map Panel -->
+      <div class="viz-card">
+        <div class="viz-header">
+          <div>
+            <h3>Codebase Map</h3>
+            <p class="viz-sub" id="map-legend">Click any file to filter findings below.</p>
+          </div>
+          <div class="viz-controls">
+            <div class="seg-control" id="viz-tabs">
+              <button type="button" class="seg-btn active" data-viz="heatmap">Directory Map</button>
+              <button type="button" class="seg-btn" data-viz="graph">Cluster Graph</button>
+            </div>
+            <button id="graph-fit-btn" type="button" class="btn-secondary btn-xs" hidden>Fit view</button>
+          </div>
+        </div>
+        <div id="viz-heatmap" class="heatmap-stage"></div>
+        <div id="viz-graph" class="graph-stage" hidden>
+          <canvas id="graph-canvas"></canvas>
+          <div id="graph-tooltip" class="graph-tooltip" hidden></div>
+        </div>
+      </div>
+
+      <!-- Filter Toolbar -->
+      <div class="toolbar">
+        <div class="search-wrap">
+          <input id="finding-search" type="text" placeholder="Filter by symbol, file, or reason…  ( / )" autocomplete="off" />
+        </div>
+        <div class="seg-control" id="filters">
+          <button type="button" class="seg-btn active" data-grade="ALL">All</button>
+          <button type="button" class="seg-btn" data-grade="SAFE">SAFE</button>
+          <button type="button" class="seg-btn" data-grade="REVIEW">REVIEW</button>
+          <button type="button" class="seg-btn" data-grade="KEEP">KEEP</button>
+        </div>
+        <select id="category-filter" class="select-input" aria-label="Filter by category">
+          <option value="ALL">All categories</option>
+        </select>
+      </div>
+
+      <!-- IDE Split Workbench -->
+      <div class="workbench">
+        <aside class="file-sidebar">
+          <div class="sidebar-head">
+            <span>Files</span>
+            <button id="reset-file-btn" type="button" class="text-btn" hidden>Show all</button>
+          </div>
+          <div id="file-tree" class="file-tree"></div>
+        </aside>
+        <section class="findings-pane">
+          <div id="active-file-banner" class="active-file-banner" hidden></div>
+          <div id="findings" class="findings-list"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>deadcode-map · MIT License · Zero-upload static analysis</span>
+    <span><code>npx deadcode-map .</code> for full tree-sitter CLI + <code>--prove</code> + MCP server</span>
+  </footer>
 
   <script src="vendor/tree-sitter.js"></script>
   <script src="parse-java-web.js"></script>
