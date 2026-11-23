@@ -277,11 +277,14 @@ function joinPosix(dir, rel) {
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-function identifiers(text) {
+// Every identifier in a line of stripped code, with each name's start
+// index, so the bare-reference pass can tell a member name (`obj.foo`)
+// from a bare read (`foo`): the characters around the name decide.
+function identifiersWithPos(text) {
   var out = [];
   var re = /[A-Za-z_$][\w$]*/g;
   var m;
-  while ((m = re.exec(text)) !== null) out.push(m[0]);
+  while ((m = re.exec(text)) !== null) out.push({ name: m[0], index: m.index });
   return out;
 }
 
@@ -606,12 +609,202 @@ function parseJs(rel, raw) {
     calls: new Set(), constructed: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
     unreachable: [], decorators: [], dunder: new Set(), strings: strings, hasJsx: hasJsx,
     hasModuleSyntax: hasModuleSyntax,
+    // Bare-name channel (batch 12, port of src/parse-js.js): bare
+    // identifier reads only — never a member/property name
+    // (`obj.foo` names the member, not a variable `foo`) and never a
+    // property definition site (`{ foo: 1 }`). The flat `references`
+    // set keeps every name (methods must stay live through
+    // `obj.method()`), but a LOCAL definition can only be read by its
+    // bare name. `bareCalls` is the same distinction for calls: a bare
+    // call `foo()` only, never a member call `obj.foo()`. Both are
+    // Sets of names, like `calls`; the grading loop reads them
+    // fail-open (a parse without them falls back to the old flag).
+    bareReferences: new Set(), bareCalls: new Set(),
   };
+  // Absolute offset of each line in the stripped code, so the
+  // bare-reference pass can look at the characters around a name even
+  // across a line break (`obj\n.foo()` is still a member name).
+  var lineOffsets = [];
+  (function () {
+    var off = 0;
+    for (var loi = 0; loi < lines.length; loi++) { lineOffsets.push(off); off += lines[loi].length + 1; }
+  })();
+  // True when the identifier at absolute index `idx` (length `len`) in
+  // the stripped code is a bare read: not a member/property name and
+  // not a property definition site. The nearest non-space characters
+  // around the name decide. A spread (`...foo`) IS a bare read — the
+  // dots are three, not one — and a member chain split across lines
+  // still counts (`obj\n.foo()`). Anything the check cannot classify
+  // is bare (fail open): a false negative keeps a local alive, while
+  // a false exclusion would flag it SAFE.
+  function isBareAt(idx, len) {
+    var p = idx - 1;
+    while (p >= 0 && /\s/.test(code[p])) p--;
+    if (p >= 0 && code[p] === '.') {
+      // A member name (`obj.foo`, `a?.foo`, `this.foo`) — unless the
+      // dot is the third of a spread (`...foo` reads `foo`).
+      if (p - 1 < 0 || code[p - 1] !== '.') return false;
+    }
+    var prev = p >= 0 ? code[p] : '';
+    var q = idx + len;
+    while (q < code.length && /\s/.test(code[q])) q++;
+    // A property definition site: an object key or a label
+    // (`{ foo: 1 }`, `{ foo: bar }`, a block label `foo:`) names the
+    // property or the label, not a variable of that name. A ternary
+    // operand (`cond ? a : b`) has `?` or `:` before it, never `{`
+    // or `,`, so it stays a bare read.
+    if ((prev === '{' || prev === ',') && code[q] === ':') return false;
+    return true;
+  }
+  // True when the identifier at absolute index `idx` (length `len`)
+  // starts a method definition (`foo() {`, `foo(): Type {` in an
+  // object literal or a class body): the identifier opens an object
+  // entry (previous non-space char `{` or `,`, past an optional
+  // `async` / `get` / `set` modifier or a `*` generator mark) and the
+  // signature's closing paren is followed by `{` (or a `:` return
+  // type). A call in the same spot (`{ foo(); }` — a block holding a
+  // call statement) has `;` after its paren, so it stays a bare call.
+  // The check is positional, so a later occurrence on the same line
+  // is still a use (`foo() { return foo(); }` — the recursive call
+  // reads `foo`). Class methods need no check here: the definition
+  // loop records them, so `declared` already skips their name.
+  function isMethodDefAt(idx, len, li) {
+    var p = idx - 1;
+    while (p >= 0 && /\s/.test(code[p])) p--;
+    if (p < 0) return false;
+    if (code[p] === '*') {
+      // Generator method: `*foo() {`.
+      p--;
+      while (p >= 0 && /\s/.test(code[p])) p--;
+    } else if (/[\w$]/.test(code[p])) {
+      // Maybe a modifier word (`async` / `get` / `set`) before the name.
+      var wEnd = p;
+      while (p >= 0 && /[\w$]/.test(code[p])) p--;
+      var word = code.slice(p + 1, wEnd + 1);
+      if (word === 'async' || word === 'get' || word === 'set') {
+        while (p >= 0 && /\s/.test(code[p])) p--;
+      } else {
+        // Not a modifier: the char before the name is a word char, so
+        // this is not an entry position at all.
+        return false;
+      }
+    }
+    if (p < 0 || (code[p] !== '{' && code[p] !== ',')) return false;
+    var q = idx + len;
+    while (q < code.length && /\s/.test(code[q])) q++;
+    if (code[q] !== '(') return false;
+    // Scan the signature's parens (up to 6 lines ahead, like
+    // methodDefFollows): the body `{` — or a `:` return type — must
+    // follow the closing paren. Whitespace skipped here spans lines,
+    // so a `)` with its `{` on the next line still counts.
+    var scanEnd = (li + 6 < lineOffsets.length) ? lineOffsets[li + 6] : code.length;
+    var depth = 0;
+    var seenOpen = false;
+    for (var s = q; s < scanEnd; s++) {
+      var ch = code[s];
+      if (ch === '(') { depth++; seenOpen = true; }
+      else if (ch === ')') {
+        depth--;
+        if (seenOpen && depth === 0) {
+          var r = s + 1;
+          while (r < scanEnd && /\s/.test(code[r])) r++;
+          return code[r] === '{' || code[r] === ':';
+        }
+      }
+    }
+    return false;
+  }
+  // Where the signature starting at `parenIdx` (the index of its
+  // opening paren) on `line` opens its body: 'same' when the
+  // signature closes on this line and a `{` follows it on this line
+  // (the body `{`, or a return-type object `{` — either way the depth
+  // after the line is the body depth), 'pending' when the signature
+  // runs past the line (the body `{` lands on a later line), 'none'
+  // when the signature closes with no `{` after it (an overload
+  // signature with no body).
+  function bodyOpensOnLine(line, parenIdx) {
+    var depth = 0;
+    for (var bi = parenIdx; bi < line.length; bi++) {
+      if (line[bi] === '(') depth++;
+      else if (line[bi] === ')') {
+        depth--;
+        if (depth === 0) {
+          return line.slice(bi + 1).indexOf('{') >= 0 ? 'same' : 'none';
+        }
+      }
+    }
+    return 'pending';
+  }
 
   var braceDepth = 0;
   var classStack = []; // {name, depth}
   var ambientStack = []; // {depth} — declare module/global blocks
   var declaredOnLine = {}; // lineNo (1-based) -> Set of declared names
+  // Function/class scopes, for the `local` flag on definitions (port
+  // of the ancestor walk in src/parse-js.js): a definition nested
+  // inside a function body is a local of that function. Each entry
+  // holds the brace depth inside the scope; it pops when the depth
+  // drops below it. `pendingScopeKind` is a declaration whose body
+  // `{` lands on a later line (a signature split across lines) — the
+  // first line after it that opens a brace is the body.
+  var scopeStack = []; // {kind: 'function'|'class', depth}
+  var pendingScopeKind = null;
+  // True when a definition on the current line sits inside a function
+  // body: walk the scope stack from the innermost scope out — the
+  // first function or class entry decides (a bare block pushes
+  // nothing, so the walk passes through it to the enclosing function,
+  // like the CLI's walk past statement wrappers; a class boundary
+  // ends the walk, so a method is never a local).
+  function isLocalHere() {
+    for (var si = scopeStack.length - 1; si >= 0; si--) {
+      if (scopeStack[si].kind === 'function') return true;
+      if (scopeStack[si].kind === 'class') return false;
+    }
+    return false;
+  }
+  // True when the `name(` line at `lines[ln]` starts a method
+  // definition, not a call: the signature's closing paren must be
+  // followed by `{` (or a `:` return-type annotation). A call line
+  // such as `handleOptionValue(val, ...);` or a nested call
+  // `parseNumericPattern(x, y),` used to be recorded as a phantom
+  // method — which also suppressed the real call, so the real
+  // definition looked dead (commander, date-fns MonthParser). The
+  // signature may span lines, so the scan follows the parens a few
+  // lines down. Shared by the class-method branch below and the
+  // references pass (an object-literal method's name is a definition
+  // site, not a bare read, exactly like a class method's).
+  function methodDefFollows(ln) {
+    var depth = 0;
+    var seenOpen = false;
+    for (var sli = ln; sli < Math.min(lines.length, ln + 6); sli++) {
+      var sl = lines[sli];
+      var from = sli === ln ? sl.indexOf('(') : 0;
+      for (var sci = from; sci < sl.length; sci++) {
+        var sch = sl[sci];
+        if (sch === '(') { depth++; seenOpen = true; }
+        else if (sch === ')') {
+          depth--;
+          if (seenOpen && depth === 0) {
+            // The character after the closing paren decides: `{`
+            // (or a `:` return type) starts a method body; `;`, `,`,
+            // `)`, `.` or an operator continues an expression — a call.
+            var rest = sl.slice(sci + 1).trim();
+            if (rest === '') {
+              // The `{` may sit on the next line (`) \n {`).
+              for (var nj = sli + 1; nj < Math.min(lines.length, sli + 3); nj++) {
+                var nx = lines[nj].trim();
+                if (nx === '') continue;
+                return nx.charAt(0) === '{';
+              }
+              return false;
+            }
+            return rest.charAt(0) === '{' || rest.charAt(0) === ':';
+          }
+        }
+      }
+    }
+    return false;
+  }
 
   function markDeclared(lineNo, name) {
     if (!declaredOnLine[lineNo]) declaredOnLine[lineNo] = new Set();
@@ -626,9 +819,16 @@ function parseJs(rel, raw) {
 
     // Pop class contexts whose block closed.
     while (classStack.length && braceDepth < classStack[classStack.length - 1].depth) classStack.pop();
+    // Pop function/class scopes whose block closed on an earlier line.
+    while (scopeStack.length && braceDepth < scopeStack[scopeStack.length - 1].depth) scopeStack.pop();
     // A definition inside a `declare module` / `declare global` block is
     // a declaration-merging augmentation, not a standalone definition.
     var inAmbient = ambientStack.length > 0;
+    // Where the body of a function/method declared on this line opens
+    // ('same' / 'pending' / 'none', see bodyOpensOnLine): the scope
+    // push at the end of the line reads these.
+    var fnBodyHere = null;
+    var methodBodyHere = null;
 
     // Class declaration.
     m = line.match(/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/);
@@ -636,59 +836,43 @@ function parseJs(rel, raw) {
       parsed.definitions.push({
         name: m[1], kind: 'class', exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+        local: isLocalHere(),
       });
       markDeclared(lineNo, m[1]);
     } else if (classStack.length) {
       // Method inside a class body — but only when the `name(` line
-      // starts a definition, not a call. The signature's closing paren
-      // must be followed by `{` (or a `:` return-type annotation). A
-      // call line such as `handleOptionValue(val, ...);` or a nested
-      // call `parseNumericPattern(x, y),` used to be recorded as a
-      // phantom method — which also suppressed the real call (a
-      // declaration line is not a use), so the real definition looked
-      // dead (commander, date-fns MonthParser). The signature may span
-      // lines, so the scan follows the parens a few lines down.
+      // starts a definition, not a call (see methodDefFollows).
       var mm = line.match(/^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+|get\s+|set\s+)*(?:#)?([A-Za-z_$][\w$]*)\s*\(/);
-      if (mm && !JS_KEYWORDS.has(mm[1]) && mm[1] !== 'if' && mm[1] !== 'for' && mm[1] !== 'while' && mm[1] !== 'switch' && mm[1] !== 'catch') {
-        var isDef = (function () {
-          var depth = 0;
-          var seenOpen = false;
-          for (var sli = ln; sli < Math.min(lines.length, ln + 6); sli++) {
-            var sl = lines[sli];
-            var from = sli === ln ? sl.indexOf('(') : 0;
-            for (var sci = from; sci < sl.length; sci++) {
-              var sch = sl[sci];
-              if (sch === '(') { depth++; seenOpen = true; }
-              else if (sch === ')') {
-                depth--;
-                if (seenOpen && depth === 0) {
-                  // The character after the closing paren decides: `{`
-                  // (or a `:` return type) starts a method body; `;`,
-                  // `,`, `)`, `.` or an operator continues an
-                  // expression — a call.
-                  var rest = sl.slice(sci + 1).trim();
-                  if (rest === '') {
-                    // The `{` may sit on the next line (`) \n {`).
-                    for (var nj = sli + 1; nj < Math.min(lines.length, sli + 3); nj++) {
-                      var nx = lines[nj].trim();
-                      if (nx === '') continue;
-                      return nx.charAt(0) === '{';
-                    }
-                    return false;
-                  }
-                  return rest.charAt(0) === '{' || rest.charAt(0) === ':';
-                }
-              }
-            }
-          }
-          return false;
-        })();
+      // A method may legally be named like a keyword (`get`, `set`,
+      // `async`, `static` are property names, not reserved words in
+      // this position), so the name is excluded only for the shapes
+      // that are statements, not methods: the control headers
+      // if/for/while/switch/catch, a `case (x):` label, and a
+      // `super()` call inside a constructor. The old
+      // !JS_KEYWORDS check also dropped every method named `get` /
+      // `set` / `async` — and with it, the isGetter flag for a
+      // getter named `get`. methodDefFollows (the `{` after the
+      // closing paren) is what separates a definition from a call.
+      if (mm && mm[1] !== 'if' && mm[1] !== 'for' && mm[1] !== 'while' && mm[1] !== 'switch' && mm[1] !== 'catch' && mm[1] !== 'case' && mm[1] !== 'super') {
+        var isDef = methodDefFollows(ln);
         if (isDef) {
-          parsed.definitions.push({
+          // A getter/setter is invoked by property access, not by a
+          // call: `ctx.slots` runs `get slots()`. The modifier before
+          // the name decides (a method literally named `get` has no
+          // modifier — the text before its name is blank). Mirrors
+          // src/parse-js.js, which reads the first child of the
+          // method_definition node.
+          var modPart = mm[0].slice(0, mm[0].length - mm[1].length - 1);
+          var methodDef = {
             name: mm[1], kind: 'method', exported: false,
             startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
-          });
+            local: isLocalHere(),
+          };
+          if (/\bget\s*$/.test(modPart)) methodDef.isGetter = true;
+          if (/\bset\s*$/.test(modPart)) methodDef.isSetter = true;
+          parsed.definitions.push(methodDef);
           markDeclared(lineNo, mm[1]);
+          methodBodyHere = bodyOpensOnLine(line, mm.index + mm[0].length - 1);
         }
       }
     }
@@ -699,8 +883,10 @@ function parseJs(rel, raw) {
       parsed.definitions.push({
         name: m[1], kind: 'function', exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+        local: isLocalHere(),
       });
       markDeclared(lineNo, m[1]);
+      fnBodyHere = bodyOpensOnLine(line, m.index + m[0].length - 1);
     }
 
     // const / let / var binding (arrow function, function, or value).
@@ -711,6 +897,7 @@ function parseJs(rel, raw) {
       parsed.definitions.push({
         name: m[1], kind: kind, exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+        local: isLocalHere(),
       });
       markDeclared(lineNo, m[1]);
     }
@@ -726,6 +913,7 @@ function parseJs(rel, raw) {
       parsed.definitions.push({
         name: m[1], kind: 'type', exported: /^\s*export\b/.test(line),
         startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+        local: isLocalHere(),
       });
       markDeclared(lineNo, m[1]);
     }
@@ -742,6 +930,39 @@ function parseJs(rel, raw) {
     // Re-detect class start depth: a class line opens a block at depthBefore.
     var cm = line.match(/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/);
     if (cm && opens > 0) classStack.push({ name: cm[1], depth: braceDepth });
+    // Function/class scope tracking for `local` (see isLocalHere): a
+    // scope opens on the line whose `{` starts its body, at the depth
+    // after that line, and pops when the depth drops below it. A push
+    // at the post-line depth can only pop early, never late — a body
+    // that opens mid-line sits at or below that depth — so a missed
+    // or early-popped scope costs a missed local (fail open), never a
+    // top-level definition misread as local.
+    var netOpens = opens - closes;
+    if (cm && netOpens > 0) scopeStack.push({ kind: 'class', depth: braceDepth });
+    else if (cm && !pendingScopeKind && line.indexOf('{', cm.index + cm[0].length) === -1) pendingScopeKind = 'class';
+    var pushedFnScope = false;
+    var pushFnScope = function () {
+      if (pushedFnScope || netOpens <= 0) return;
+      pushedFnScope = true;
+      scopeStack.push({ kind: 'function', depth: braceDepth });
+    };
+    if (fnBodyHere === 'same' || methodBodyHere === 'same') pushFnScope();
+    else if ((fnBodyHere === 'pending' || methodBodyHere === 'pending') && !pendingScopeKind) pendingScopeKind = 'function';
+    if (!pushedFnScope && /=>\s*\{/.test(line)) pushFnScope();
+    if (!pushedFnScope) {
+      // An anonymous function expression (`setTimeout(function () {`,
+      // `.then(function (x) {`): same signature scan as a declaration.
+      var fnex = /function\s*[A-Za-z_$]*\s*\(/.exec(line);
+      if (fnex) {
+        var fnexBody = bodyOpensOnLine(line, fnex.index + fnex[0].length - 1);
+        if (fnexBody === 'same') pushFnScope();
+        else if (fnexBody === 'pending' && !pendingScopeKind) pendingScopeKind = 'function';
+      }
+    }
+    if (pendingScopeKind && netOpens > 0) {
+      scopeStack.push({ kind: pendingScopeKind, depth: braceDepth });
+      pendingScopeKind = null;
+    }
     void depthBefore;
   }
 
@@ -1261,6 +1482,10 @@ function parseJs(rel, raw) {
         }
         if (regionDepth === 1 && isExportEntryName(l, regionIdM.index, regionId.length)) continue;
         parsed.references.add(regionId);
+        // A method's own definition name is not a bare read (see
+        // isMethodDefAt); a value or shorthand in the export object is.
+        if (!isMethodDefAt(lineOffsets[li] + regionIdM.index, regionId.length, li)
+          && isBareAt(lineOffsets[li] + regionIdM.index, regionId.length)) parsed.bareReferences.add(regionId);
       }
       // Every call on an export-object line is a real use: a top-level
       // entry name is never followed by `(`.
@@ -1271,6 +1496,8 @@ function parseJs(rel, raw) {
         if (regionDeclared.has(regionCm[1])) continue;
         if (regionSkipIds && regionSkipIds.has(regionCm[1])) continue;
         parsed.calls.add(regionCm[1]);
+        if (!isMethodDefAt(lineOffsets[li] + regionCm.index, regionCm[1].length, li)
+          && isBareAt(lineOffsets[li] + regionCm.index, regionCm[1].length)) parsed.bareCalls.add(regionCm[1]);
       }
       var regionNewRe = /\bnew\s+([A-Za-z_$][\w$]*)\s*\(/g;
       var regionNm;
@@ -1351,7 +1578,8 @@ function parseJs(rel, raw) {
     // Skip only the first occurrence of each declared name per line;
     // later occurrences are uses.
     var skippedDecl = new Set();
-    identifiers(l).forEach(function (id) {
+    identifiersWithPos(l).forEach(function (hit) {
+      var id = hit.name;
       if (JS_KEYWORDS.has(id) && !keywordUseNames.has(id)) return;
       if (declared.has(id)) {
         if (skippedDecl.has(id)) { /* later occurrence: a real use, fall through */ }
@@ -1361,6 +1589,11 @@ function parseJs(rel, raw) {
       if (skipExportsIds && skipExportsIds.has(id)) return; // the `module.exports` tokens themselves
       if (decChain.has(id)) return;
       parsed.references.add(id);
+      // A bare read keeps a same-named local alive; a member name, a
+      // property key, or a method's own definition name does not (see
+      // isBareAt and isMethodDefAt).
+      if (!isMethodDefAt(lineOffsets[li] + hit.index, id.length, li)
+        && isBareAt(lineOffsets[li] + hit.index, id.length)) parsed.bareReferences.add(id);
     });
     var callRe = /([A-Za-z_$][\w$]*)\s*\(/g;
     var cm2;
@@ -1370,6 +1603,11 @@ function parseJs(rel, raw) {
       if (boundHere && boundHere.has(cm2[1])) continue;
       if (decChain.has(cm2[1])) continue;
       parsed.calls.add(cm2[1]);
+      // A bare call `foo()` reads the local `foo`; a member call
+      // `obj.foo()` names the member, never the local — and a
+      // method's own definition line is not a call at all.
+      if (!isMethodDefAt(lineOffsets[li] + cm2.index, cm2[1].length, li)
+        && isBareAt(lineOffsets[li] + cm2.index, cm2[1].length)) parsed.bareCalls.add(cm2[1]);
     }
     // `new Client()` invokes the class constructor: without this, a
     // constructor method was flagged REVIEW ("0 callers") even though
@@ -1525,6 +1763,10 @@ function parseJs(rel, raw) {
     }
   }
 
+  // Bare references serialize as a sorted array, like the CLI
+  // (src/parse-js.js); bareCalls stays a Set, like `calls`.
+  parsed.bareReferences = [...parsed.bareReferences].sort();
+
   return parsed;
 }
 
@@ -1546,6 +1788,13 @@ function parsePy(rel, raw) {
   var funcStack = []; // {indent} — def lines, so a local inside a method is not a class field
   var pendingDecorators = [];
   var declaredOnLine = {};
+  // Class-attribute assignment lines that are NOT recorded as
+  // definitions (a plain class attribute, or one in a class nested in
+  // a function): the assigned name is still a definition site, not a
+  // read, so it must not count as a bare reference — the CLI's
+  // tree-sitter parser excludes definition sites. Only the bare
+  // channel consults this; the flat references pass is unchanged.
+  var bareDeclaredOnLine = {};
 
   // Bracket depth at the start of each line, counted on the stripped
   // code (strings and comments are already blanked, so brackets inside
@@ -1577,10 +1826,42 @@ function parsePy(rel, raw) {
     if (!declaredOnLine[lineNo]) declaredOnLine[lineNo] = new Set();
     declaredOnLine[lineNo].add(name);
   }
+  // A name that is a definition site for the bare channel only (the
+  // flat references pass is unchanged): a class-attribute target, a
+  // chained-assignment target, a value-less annotation.
+  function noteBareDecl(lineNo, name) {
+    if (!bareDeclaredOnLine[lineNo]) bareDeclaredOnLine[lineNo] = new Set();
+    bareDeclaredOnLine[lineNo].add(name);
+  }
   function indentOf(line) {
     var m = line.match(/^ */);
     return m ? m[0].length : 0;
   }
+  // Whether the innermost enclosing scope is a function body: scopes
+  // nest by indent, so the deeper of the innermost open def / class
+  // is the innermost scope. A definition whose innermost scope is a
+  // function is a local of that function (a nested function, a class
+  // defined in a function, a variable assigned in a body); a
+  // definition directly in a class body is not — the class boundary
+  // is found first. Mirrors the CLI parsers' walk to the nearest
+  // function / class boundary (src/parse-py.js, src/parse-js.js).
+  function innermostIsFunction() {
+    if (funcStack.length === 0) return false;
+    if (classStack.length === 0) return true;
+    return funcStack[funcStack.length - 1].indent > classStack[classStack.length - 1].indent;
+  }
+  // Bare-name references: bare identifier reads only — never an
+  // attribute name (`obj.foo` names the member `foo`, not a variable
+  // `foo`) and never the member name of a member call. The object of
+  // a member call (`obj` in `obj.foo()`) IS a bare read: the object
+  // is read. The flat `references` set keeps every name (a method
+  // stays live through `obj.method()`), but a LOCAL definition can
+  // only be read by its bare name. Serialized as a sorted array, like
+  // the CLI (src/parse-py.js). bareCalls is the parallel record for
+  // calls: names called bare (`foo()`), as opposed to the name-only
+  // `calls` set, which cannot tell `foo()` from `obj.foo()`.
+  var bareReferences = new Set();
+  var bareCalls = new Set();
 
   for (var ln = 0; ln < lines.length; ln++) {
     var line = lines[ln];
@@ -1601,10 +1882,15 @@ function parsePy(rel, raw) {
     }
     var dm = line.match(/^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/);
     if (dm) {
-      var isMethod = classStack.length > 0 && indent > classStack[classStack.length - 1].indent;
+      // A method is a def whose innermost enclosing scope is the class:
+      // a function nested inside a method (`def nested()` in a method
+      // body) is a local function, not a method of the class — the
+      // CLI's tree-sitter parser records it the same way.
+      var isMethod = classStack.length > 0 && indent > classStack[classStack.length - 1].indent && !innermostIsFunction();
       var def = {
         name: dm[2], kind: isMethod ? 'method' : 'function', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
+        local: innermostIsFunction(),
       };
       parsed.definitions.push(def);
       if (/^__.*__$/.test(dm[2])) parsed.dunder.add(dm[2]);
@@ -1624,6 +1910,7 @@ function parsePy(rel, raw) {
       parsed.definitions.push({
         name: cm[2], kind: 'class', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: pendingDecorators.slice(),
+        local: innermostIsFunction(),
       });
       markDeclared(lineNo, cm[2]);
       classStack.push({ name: cm[2], indent: indent, model: isModelClass });
@@ -1636,30 +1923,91 @@ function parsePy(rel, raw) {
     // `__all__`) are packaging/protocol metadata and are kept by the
     // dunder rule. A class attribute inside a Pydantic BaseModel /
     // @dataclass is a framework-populated model field (KEEP, never
-    // SAFE); other class attributes and function locals are not module
-    // definitions and are skipped. A name bound inside a plain block
-    // (`if TYPE_CHECKING:`, `try:`, a version guard) IS a module
-    // definition at any indent — the CLI's tree-sitter parser records
-    // it the same way, with the enclosing block as the parent — so it
-    // is recorded here too, as an unexported variable.
+    // SAFE); other class attributes are not module definitions and are
+    // skipped. A variable assigned in a function body IS recorded, as
+    // a local variable definition (the CLI's tree-sitter parser
+    // records it the same way): only then can the bare-reference
+    // grading rule tell a dead local from a live one. A name bound
+    // inside a plain block (`if TYPE_CHECKING:`, `try:`, a version
+    // guard) IS a module definition at any indent — the CLI's
+    // tree-sitter parser records it the same way, with the enclosing
+    // block as the parent — so it is recorded here too, as an
+    // unexported variable.
     var am = line.match(/^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^=]/);
     // A field is directly in the class body (not inside a method: a
     // local inside a method sits deeper than the enclosing def).
     var inFunction = funcStack.length > 0 && indent > funcStack[funcStack.length - 1].indent;
     var inClassBody = classStack.length > 0 && indent > classStack[classStack.length - 1].indent;
     var enclosingModel = !inFunction && inClassBody && classStack[classStack.length - 1].model;
+    // A local variable is an assignment whose innermost enclosing
+    // scope is a function — not merely any assignment inside a
+    // function: an assignment directly in a class body nested in a
+    // function (`def outer(): class Inner: x = 1`) is a class
+    // attribute of Inner, not a local of outer.
+    var inFunctionScope = innermostIsFunction();
     // lineDepth === 0: a continuation line inside a call, decorator or
     // def signature (`replace_whitespace=False`, a def parameter) looks
     // like an assignment but is a keyword argument, not a binding.
-    if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel)) {
+    // Chained assignment targets (`first = second = make_default`)
+    // are definition sites too, not reads: the CLI's tree-sitter
+    // parser records every chain target as a definition. The web
+    // records only the first chain target as a definition — that model
+    // is unchanged — but the bare channel must not count the later
+    // targets as reads, or a dead local sharing the name would look
+    // live. Only the bare channel consults this; the flat references
+    // pass is unchanged. A chain target follows the first `=` at
+    // bracket depth 0 (`a = b.c = 1` and `a = b[0] = 1` assign an
+    // attribute / an item, so `b` is a read, not a target;
+    // `a = b == c` is a comparison, not a chain). This scan runs
+    // before the recording below, because a recorded line continues
+    // past everything after it.
+    if (am && lineDepth === 0) {
+      var chainPos = line.indexOf('=') + 1;
+      var chainDepth = 0;
+      while (chainPos < line.length) {
+        while (chainPos < line.length && (line[chainPos] === ' ' || line[chainPos] === '\t')) chainPos++;
+        if (chainPos >= line.length) break;
+        var chainCh = line[chainPos];
+        if (chainCh === '(' || chainCh === '[' || chainCh === '{') { chainDepth++; chainPos++; continue; }
+        if (chainCh === ')' || chainCh === ']' || chainCh === '}') { chainDepth = Math.max(0, chainDepth - 1); chainPos++; continue; }
+        if (chainDepth !== 0) { chainPos++; continue; }
+        var chainM = /^([A-Za-z_]\w*)\s*=(?!=)/.exec(line.slice(chainPos));
+        if (!chainM) break;
+        noteBareDecl(lineNo, chainM[1]);
+        chainPos += chainM[0].length;
+      }
+    }
+    if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel || inFunctionScope)) {
       parsed.definitions.push({
         name: am[2], kind: 'variable', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: [],
         frameworkField: Boolean(enclosingModel),
+        local: inFunctionScope,
       });
       if (/^__.*__$/.test(am[2])) parsed.dunder.add(am[2]);
       markDeclared(lineNo, am[2]);
       continue;
+    }
+    // A class attribute that is not recorded as a definition is still
+    // a definition site: record its line so the bare channel (below)
+    // does not count the assigned name as a read. A model field is
+    // recorded above, so it never reaches here; a method-body local
+    // is recorded above too (its innermost scope is the method).
+    if (am && lineDepth === 0 && inClassBody && !inFunctionScope && !enclosingModel) {
+      noteBareDecl(lineNo, am[2]);
+    }
+    // A value-less annotation (`timeout: int` in a class body) is a
+    // definition site, not a read: the CLI's tree-sitter parser
+    // excludes an annotation-only name from references entirely. The
+    // web records no annotation-only name as a definition — that model
+    // is unchanged — but the bare channel must not count the name as a
+    // read. Only the bare channel consults this; the flat references
+    // pass is unchanged. The line has no `=` at all, and it must sit
+    // at bracket depth 0 — a dict key line (`x: y` inside `{...}`) is
+    // a read, not a declaration.
+    if (lineDepth === 0 && !am) {
+      var annOnly = line.match(/^(\s*)([A-Za-z_]\w*)\s*:/);
+      if (annOnly && line.indexOf('=') === -1) noteBareDecl(lineNo, annOnly[2]);
     }
     if (pendingDecorators.length) pendingDecorators = [];
   }
@@ -1877,6 +2225,7 @@ function parsePy(rel, raw) {
     if (importLines[rNo]) continue;
     if (/^\s*(import|from)\b/.test(rl)) continue;
     var declared = declaredOnLine[rNo] || new Set();
+    var bareDeclared = bareDeclaredOnLine[rNo] || new Set();
     // Decorator line (`@app.command()`): the dotted member chain after
     // the decorator object is dropped — `command` is a member of the
     // decorator object, not a reference to a same-named local function.
@@ -1890,12 +2239,95 @@ function parsePy(rel, raw) {
         (chainPy[2].match(/[A-Za-z_]\w*/g) || []).forEach(function (n) { decChainPy.add(n); });
       }
     }
-    identifiers(rl).forEach(function (id) {
-      if (PY_KEYWORDS.has(id)) return;
-      if (declared.has(id)) return;
-      if (decChainPy.has(id)) return;
-      parsed.references.add(id);
-    });
+    // Position-aware identifier scan: the flat `references` set keeps
+    // the old behaviour exactly (every non-keyword identifier except
+    // declaration-site and decorator-member names), and the same scan
+    // records the bare channel. An identifier is a bare read unless
+    // the nearest non-space character before it is a dot — an
+    // attribute name (`obj.foo`, or a multi-line member access whose
+    // dot closes the previous line inside brackets, `obj.\nfoo`). A
+    // name declared on this line is dropped only at its first
+    // occurrence (the declaration itself: `foo = ...`, `def foo(...)`);
+    // a later occurrence on the same line is a read (`foo = foo()`, a
+    // def default `def f(x=foo)`), so it counts as bare. The flat
+    // references pass keeps its old whole-line skip for declared
+    // names. A bare call is a bare read whose next non-space character
+    // is `(` — `foo()` reads foo, `obj.foo()` does not.
+    var declaredSeenPy = Object.create(null);
+    var bareDeclaredSeenPy = Object.create(null);
+    var firstIdOnLine = true;
+    var idRePy = /[A-Za-z_]\w*/g;
+    var idmPy;
+    while ((idmPy = idRePy.exec(rl)) !== null) {
+      var idPy = idmPy[0];
+      var idIdxPy = idmPy.index;
+      var isFirstPy = firstIdOnLine;
+      firstIdOnLine = false;
+      if (PY_KEYWORDS.has(idPy)) continue;
+      var isAttrPy = false;
+      var kb = idIdxPy - 1;
+      while (kb >= 0 && (rl[kb] === ' ' || rl[kb] === '\t')) kb--;
+      if (kb >= 0 && rl[kb] === '.') isAttrPy = true;
+      else if (isFirstPy && kb < 0 && ri > 0) {
+        // The dot may close the previous line (`obj.\nfoo` inside
+        // brackets). It is a member-access dot only when it follows
+        // an identifier, `]` or `)` — a line ending in a float
+        // literal (`x = 1.`) ends a statement, it does not continue
+        // a member access, so the next line starts a new statement
+        // and its first identifier is a bare read.
+        var prevPy = lines[ri - 1] || '';
+        var pk = prevPy.length - 1;
+        while (pk >= 0 && (prevPy[pk] === ' ' || prevPy[pk] === '\t')) pk--;
+        if (pk >= 0 && prevPy[pk] === '.') {
+          var pq = pk - 1;
+          while (pq >= 0 && (prevPy[pq] === ' ' || prevPy[pq] === '\t')) pq--;
+          if (pq >= 0 && (prevPy[pq] === ']' || prevPy[pq] === ')')) isAttrPy = true;
+          else if (pq >= 0 && /[A-Za-z0-9_]/.test(prevPy[pq])) {
+            var ps = pq;
+            while (ps >= 0 && /[A-Za-z0-9_]/.test(prevPy[ps])) ps--;
+            if (/[A-Za-z_]/.test(prevPy[ps + 1])) isAttrPy = true;
+          }
+        }
+      }
+      var isCallPy = false;
+      var ke = idRePy.lastIndex;
+      while (ke < rl.length && (rl[ke] === ' ' || rl[ke] === '\t')) ke++;
+      if (ke < rl.length && rl[ke] === '(') isCallPy = true;
+      // A string prefix (`f` in f"...", `rf` in rf"...") is part of
+      // the string literal, not a read of a same-named variable: the
+      // raw line has a quote immediately after it (positions are
+      // preserved by stripping). The flat references pass keeps its
+      // old behaviour (the prefix stays a reference); only the bare
+      // channel excludes it — without this, any f-string in a file
+      // kept a dead local named `f` alive.
+      var isStringPrefixPy = false;
+      var rawPy = rawLinesPy[ri] || '';
+      var afterPy = rawPy[idIdxPy + idPy.length];
+      if (afterPy === "'" || afterPy === '"') isStringPrefixPy = true;
+      // A class-attribute definition site: the first occurrence of
+      // the assigned name is the definition, not a read — it stays a
+      // flat reference (old behaviour) but is not a bare read. Later
+      // occurrences on the same line (`x = x + 1`) are reads.
+      var isBareDeclFirstPy = false;
+      if (bareDeclared.has(idPy) && !bareDeclaredSeenPy[idPy]) {
+        bareDeclaredSeenPy[idPy] = true;
+        isBareDeclFirstPy = true;
+      }
+      if (declared.has(idPy)) {
+        if (!declaredSeenPy[idPy]) { declaredSeenPy[idPy] = true; continue; }
+        if (!isAttrPy && !decChainPy.has(idPy) && !isStringPrefixPy && !isBareDeclFirstPy) {
+          bareReferences.add(idPy);
+          if (isCallPy) bareCalls.add(idPy);
+        }
+        continue;
+      }
+      if (decChainPy.has(idPy)) continue;
+      parsed.references.add(idPy);
+      if (!isAttrPy && !isStringPrefixPy && !isBareDeclFirstPy) {
+        bareReferences.add(idPy);
+        if (isCallPy) bareCalls.add(idPy);
+      }
+    }
     var callRe2 = /([A-Za-z_]\w*)\s*\(/g;
     var cm3;
     while ((cm3 = callRe2.exec(rl)) !== null) {
@@ -1923,7 +2355,12 @@ function parsePy(rel, raw) {
       if (!/[A-Z]/.test(ann[1])) continue;
       var annIds = ann[1].match(/[A-Za-z_]\w*/g) || [];
       annIds.forEach(function (id) {
-        if (!PY_KEYWORDS.has(id)) parsed.references.add(id);
+        if (PY_KEYWORDS.has(id)) return;
+        parsed.references.add(id);
+        // A string annotation is a use of the type it names (the CLI
+        // records annotation-string identifiers as bare references),
+        // so it keeps a same-named local alive too.
+        bareReferences.add(id);
       });
     }
     // A TypeAlias value is a type expression: `HookType: TypeAlias =
@@ -1935,7 +2372,11 @@ function parsePy(rel, raw) {
       while ((ta = taRe.exec(rawLinesPy[ri] || '')) !== null) {
         if (!/[A-Z]/.test(ta[1])) continue;
         (ta[1].match(/[A-Za-z_]\w*/g) || []).forEach(function (id) {
-          if (!PY_KEYWORDS.has(id)) parsed.references.add(id);
+          if (PY_KEYWORDS.has(id)) return;
+          parsed.references.add(id);
+          // A TypeAlias value is a type expression (see the annotation
+          // pass above), so its identifiers are bare references too.
+          bareReferences.add(id);
         });
       }
     }
@@ -1999,6 +2440,11 @@ function parsePy(rel, raw) {
       if (depthPy <= 0 && !/\\\s*$/.test(ul2)) { terminatedIndent = ind2; terminatedLinePy = ui2; }
     }
   }
+
+  // Bare references serialize as a sorted array, like the CLI
+  // (src/parse-py.js); bareCalls stays a Set, like `calls`.
+  parsed.bareReferences = [...bareReferences].sort();
+  parsed.bareCalls = bareCalls;
 
   return parsed;
 }
@@ -3100,6 +3546,17 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
     var javaCtx = info.language === 'java'
       ? buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames)
       : null;
+    // Bare-name channel for locals (batch 12): the parsers record
+    // `bareReferences` (bare identifier reads only — never a member
+    // name or a property key) and `bareCalls` (bare calls only —
+    // `foo()`, never `obj.foo()`). Keyed on the channel being present,
+    // not on language, so the Python parse layer plugs in with no
+    // further grading change. A parse without them (stale cache, or a
+    // language whose parser has not ported the channel yet) leaves
+    // the sets null, and the grading below falls back to the old
+    // name-based flag — fail open, never a new SAFE.
+    var bareRefSet = Array.isArray(parsed.bareReferences) ? new Set(parsed.bareReferences) : null;
+    var bareCallSet = parsed.bareCalls instanceof Set ? parsed.bareCalls : null;
     parsed.definitions.forEach(function (def) {
       if (importLocals.has(def.name)) return;
       if (def.kind === 'method' && /^__.*__$/.test(def.name)) {
@@ -3121,18 +3578,38 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       // caller.
       var calledElsewhere = [];
       usage.calledIn.forEach(function (f) { if (f !== rel) calledElsewhere.push(f); });
-      var sameFileUse = usage.sameFile || usage.calledIn.has(rel);
+      // A local definition can only be read by its bare name (port of
+      // src/confidence.js, batch 11): a member call `obj.foo()` names
+      // the member, not the local, so the old name-keyed flag — any
+      // reference or call in the file — swallowed a dead local
+      // whenever the file also called a same-named method. A bare
+      // call `foo()` still counts, via the bare-call channel (or the
+      // old flag when the parse predates it). A getter/setter is
+      // invoked by property access, not by a call — `ctx.slots` runs
+      // `get slots()` — so an accessor keeps the old flag: a
+      // same-file reference by that name, a property read or write,
+      // is a use. A local is still part of its enclosing function's
+      // implementation — the cascade must not flag it merely because
+      // its enclosing function is dead — only the use channel is
+      // bare-name now. Java locals skip this entirely: the Java
+      // branch below grades them on binding-resolved reads
+      // (readCount), so a same-named method call must not keep a dead
+      // Java local alive.
+      var isJavaLocal = info.language === 'java' && def.local;
+      var bareCallInFile = !isJavaLocal && (bareCallSet ? bareCallSet.has(def.name) : usage.calledIn.has(rel));
+      var isAccessor = def.kind === 'method' && (def.isGetter || def.isSetter);
+      var localSameFileUse = isJavaLocal
+        ? false
+        : isAccessor
+          ? usage.sameFile
+          : (bareRefSet ? bareRefSet.has(def.name) : usage.sameFile) || bareCallInFile;
+      var sameFileUse = def.local ? localSameFileUse : (usage.sameFile || usage.calledIn.has(rel));
       // Java: name-based same-file use cannot tell overloads apart, and
       // assumed-live roots (non-private methods, classes) must not be
       // rescued by their own same-file callers — the CLI computes both
       // from the arity-aware live-scope BFS instead (buildJavaLiveness
       // above). Private methods get sameFileUse false here; the Java
-      // branch below decides them with javaArityIsLive. Non-Java locals
-      // keep the file-level rule: a local is part of its enclosing
-      // function's implementation, so any reference in the file keeps
-      // it alive. Java locals do not: the Java branch below grades
-      // them on binding-resolved reads (readCount), so a same-named
-      // method call must not keep a dead Java local alive. With no
+      // branch below decides them with javaArityIsLive. With no
       // liveness data (stale parse), sameFileUse is false too: the Java
       // branch then falls back to REVIEW, never SAFE.
       var javaPrivateMethod = info.language === 'java' && def.kind === 'method' && def.visibility === 'private';
@@ -3173,10 +3650,25 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       // own file is alive, full stop — never a finding. (It used to be
       // flagged REVIEW as "unexport-to-local", which turned every
       // module's own helpers into noise.)
-      if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUseEffective) {
+      //
+      // Cross-file credit never belongs to a non-exported VARIABLE
+      // local (port of src/confidence.js): a nested variable cannot be
+      // imported or called by name from another file, so an importer
+      // or caller under the same name is using a same-named top-level
+      // symbol instead (or the namespace-import over-approximation,
+      // which credits every definition of the target file). Function
+      // and method locals are different: they CAN escape — a factory
+      // that returns an object of helpers — so they keep their
+      // cross-file credit. (An exported local keeps it too:
+      // `export { localFn }` names it as public surface, so it is
+      // graded as an export.)
+      var isNonExportedVariableLocal = def.local && !def.exported && def.kind === 'variable';
+      var crossFileImporters = isNonExportedVariableLocal ? [] : importedBy;
+      var crossFileCallers = isNonExportedVariableLocal ? [] : calledElsewhere;
+      if (crossFileImporters.length === 0 && crossFileCallers.length === 0 && sameFileUseEffective) {
         return;
       }
-      if (importedBy.length > 0 || calledElsewhere.length > 0) {
+      if (crossFileImporters.length > 0 || crossFileCallers.length > 0) {
         return;
       }
 

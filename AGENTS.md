@@ -49,7 +49,7 @@ node bin/deadcode-map.js .
 
 It must report **0 findings**. If your change introduces a finding, fix the
 code (or the analyzer) — do not add a baseline to hide it. With
-`--include-fixtures` the planted fixture data still reports (413 findings,
+`--include-fixtures` the planted fixture data still reports (420 findings,
 0 in `src/`); that is expected.
 
 ## Rules for changes
