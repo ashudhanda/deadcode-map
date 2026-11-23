@@ -15,9 +15,12 @@
     </header>
 
     <div class="notice">
-      <strong>Lightweight browser analyzer.</strong> This page runs a regex-based
-      analyzer in your browser — it is not the full tree-sitter CLI, so it can
-      miss exotic syntax and it cannot run your tests (<code>--prove</code>).
+      <strong>Lightweight browser analyzer.</strong> JS / TypeScript and
+      Python are analyzed with regular expressions; Java is parsed with
+      tree-sitter (WASM, vendored in this page and loaded lazily only
+      when a <code>.java</code> file is present — still fully offline, no
+      CDN). It is not the full tree-sitter CLI, so it can miss exotic
+      syntax and it cannot run your tests (<code>--prove</code>).
       For full accuracy, use the CLI:
       <a href="https://github.com/ashudhanda/deadcode-map">github.com/ashudhanda/deadcode-map</a>.
       Public repos only. Nothing is uploaded anywhere — files are fetched from
@@ -73,12 +76,14 @@
     </section>
 
     <footer>
-      <p>deadcode-map v0.1.0 — JS / TypeScript + Python. MIT licensed.
+      <p>deadcode-map v0.1.0 — JS / TypeScript + Python + Java (Java parsed with tree-sitter WASM, lazy-loaded, offline). MIT licensed.
       <a href="https://github.com/ashudhanda/deadcode-map">GitHub</a> ·
       <a href="https://github.com/ashudhanda/deadcode-map#readme">CLI README</a></p>
     </footer>
   </div>
 
+  <script src="vendor/tree-sitter.js"></script>
+  <script src="parse-java-web.js"></script>
   <script src="analyzer.js"></script>
   <script src="app.js"></script>
 </body>

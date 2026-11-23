@@ -210,6 +210,45 @@ function modifiersOf(node, src) {
   return mods;
 }
 
+// Comments are named nodes in tree-sitter-java, so they appear as
+// named children of argument_list and formal_parameters: a `//`
+// comment after an argument (or between parameters) inflates
+// namedChildCount, and a call's recorded arity no longer matches its
+// declaration — a 3-arg call with trailing `//` comments records
+// arity 7 and its private callee looks uncalled. Count only real
+// nodes, never comments.
+const COMMENT_NODE_TYPES = new Set(['line_comment', 'block_comment', 'comment']);
+function isComment(node) {
+  return Boolean(node) && COMMENT_NODE_TYPES.has(node.type);
+}
+function firstNonCommentChild(node) {
+  if (!node) return null;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const c = node.namedChild(i);
+    if (!isComment(c)) return c;
+  }
+  return null;
+}
+function lastNonCommentChild(node) {
+  if (!node) return null;
+  for (let i = node.namedChildCount - 1; i >= 0; i--) {
+    const c = node.namedChild(i);
+    if (!isComment(c)) return c;
+  }
+  return null;
+}
+// Number of real arguments in an argument_list: every named child
+// except comments. (Arguments are expressions; nothing else legal
+// sits in the list.)
+function argumentArity(args) {
+  if (!args) return 0;
+  let n = 0;
+  for (let i = 0; i < args.namedChildCount; i++) {
+    if (!isComment(args.namedChild(i))) n++;
+  }
+  return n;
+}
+
 // (name, arity) of a method/constructor declaration. The last
 // parameter of a varargs method is a spread_parameter: it still counts
 // as one parameter, and fixedArity is the count before it — a call
@@ -217,11 +256,16 @@ function modifiersOf(node, src) {
 function arityOf(node) {
   const params = childByField(node, 'parameters');
   if (!params) return { arity: 0, varargs: false, fixedArity: 0 };
+  let arity = 0;
   let varargs = false;
   for (let i = 0; i < params.namedChildCount; i++) {
-    if (params.namedChild(i).type === 'spread_parameter') varargs = true;
+    const p = params.namedChild(i);
+    if (p.type === 'spread_parameter') { varargs = true; arity++; }
+    else if (p.type === 'formal_parameter') arity++;
+    // Comments and receiver parameters are not parameters a caller
+    // passes: a `//` comment between parameters, or an explicit
+    // receiver (`Foo this`), must not inflate the arity.
   }
-  const arity = params.namedChildCount;
   return { arity, varargs, fixedArity: varargs ? arity - 1 : arity };
 }
 
@@ -301,6 +345,14 @@ function parseJava(filePath, src) {
   // class (anonymous classes have no name and inherit the outer
   // class's annotations for the framework check).
   const classStack = [];
+  // Anonymous-class depth: an anonymous class body (an
+  // object_creation_expression with a class body, or an enum constant
+  // with a class body) is not a class_declaration node, so the class
+  // stack never sees it — without this counter every method declared
+  // inside `new TypeAdapter<..>() { ... }` was attributed to the
+  // outer class as a direct instance member, and anonymousClass was
+  // always false. traverse() maintains it; addDef reads it.
+  let anonDepth = 0;
   const currentClass = () => {
     for (let i = classStack.length - 1; i >= 0; i--) {
       if (classStack[i].name) return classStack[i];
@@ -322,6 +374,18 @@ function parseJava(filePath, src) {
       visibility: 'public',
       className: cls.name,
       classAnnotations: [...cls.annotations],
+      // Kind of the nearest named enclosing class ('class_declaration',
+      // 'enum_declaration', ...) — the enum-constructor rule in
+      // confidence.js needs it (an enum's constants invoke its
+      // constructor at class-load time, with no call-graph edge).
+      classKind: cls.kind || null,
+      // True when the member is declared inside an anonymous class
+      // body: its className is the outer named class (anonymous
+      // classes have no name), so the utility-class check must not
+      // count it as a direct member of that outer class, and the
+      // method-conduit rule in confidence.js treats it as dispatched
+      // by interface, never by name.
+      anonymousClass: anonDepth > 0,
       isTestFile,
       _readCount: 0,
       _writeCount: 0,
@@ -341,7 +405,7 @@ function parseJava(filePath, src) {
     if (isClass) {
       const nameNode = childByField(node, 'name');
       const mods = modifiersOf(node, src);
-      pushed = { name: nameNode ? text(nameNode, src) : null, annotations: mods.annotations, node };
+      pushed = { name: nameNode ? text(nameNode, src) : null, annotations: mods.annotations, node, kind: node.type };
       classStack.push(pushed);
       // A public class is part of the file's public surface (its
       // members may be called from outside the repo); a
@@ -362,9 +426,26 @@ function parseJava(filePath, src) {
         if (def) def.exported = hasPublicModifier(node, src);
       }
     }
+    const anonPushed = opensAnonymousClass(node);
+    if (anonPushed) anonDepth++;
     collectMember(node);
     for (let i = 0; i < node.namedChildCount; i++) traverse(node.namedChild(i));
+    if (anonPushed) anonDepth--;
     if (pushed) classStack.pop();
+  }
+
+  // True when this node opens an anonymous class body: an
+  // object_creation_expression with a class body (`new Foo() { ... }`)
+  // or an enum constant with a class body (`A { ... }`). The body is
+  // a plain `class_body` child, not a named field, so it is found by
+  // scanning children. traverse() bumps anonDepth for the subtree,
+  // so defs declared inside are marked anonymousClass (see addDef).
+  function opensAnonymousClass(node) {
+    if (node.type !== 'object_creation_expression' && node.type !== 'enum_constant') return false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      if (node.namedChild(i).type === 'class_body') return true;
+    }
+    return false;
   }
 
   // True when the declaration carries a `public` modifier (the
@@ -392,10 +473,10 @@ function parseJava(filePath, src) {
         annotations: mods.annotations,
         decorators: mods.decorators,
         native: mods.native,
+        static: mods.static,
         arity, varargs, fixedArity,
         isConstructor: isCtor,
         javaName: isCtor ? (nameNode ? text(nameNode, src) : cls.name) : name,
-        anonymousClass: classStack.length > 0 && classStack[classStack.length - 1].name === null,
       });
       // Formal parameters are definitions only when the method has a
       // body: a native / abstract / interface method's parameters are
@@ -432,6 +513,7 @@ function parseJava(filePath, src) {
           visibility: mods.private ? 'private' : (hasPublicModifier(node, src) ? 'public' : 'package'),
           annotations: mods.annotations,
           decorators: mods.decorators,
+          static: mods.static,
           multiDeclarator: declarators.length > 1,
           // The whole declaration, so --fix can delete the statement
           // when every declarator in it is dead (see fix.js).
@@ -461,6 +543,13 @@ function parseJava(filePath, src) {
           privateMethod: enclosing ? enclosing.private : false,
           multiDeclarator: declarators.length > 1,
           statementRange: declarators.length > 1 ? rangeOf(node) : null,
+          // True when the initializer may run user code or change
+          // state (a method call, an object creation, an assignment
+          // or update inside it): deleting the declaration would
+          // remove that call, so the local is load-bearing, not dead
+          // (FJ-3). A pure initializer (a literal, a name, arithmetic
+          // over locals) is false and grades normally.
+          initHasEffect: initializerHasEffect(childByField(d, 'value')),
         });
       }
     } else if (node.type === 'import_declaration') {
@@ -480,6 +569,37 @@ function parseJava(filePath, src) {
     } else if (node.type === 'marker_annotation' || node.type === 'annotation') {
       result.decorators.push(`@${annotationSimpleName(node, src)}`);
     }
+  }
+
+  // True when a local variable's initializer may run user code or
+  // change state, so the declaration is load-bearing even when the
+  // variable is never read (FJ-3): a method invocation, an object
+  // creation (its constructor runs), an assignment or an update
+  // expression anywhere in the initializer. The walk descends into
+  // arguments and operands — they evaluate when the declaration
+  // runs — but never into a lambda body or an anonymous class body:
+  // that code runs later, if ever, so a call inside it is not an
+  // effect of this declaration. A null value (no initializer) and a
+  // pure initializer (a literal, a name, arithmetic) are false.
+  function initializerHasEffect(valueNode) {
+    if (!valueNode) return false;
+    let effect = false;
+    const visit = (n) => {
+      if (!n || effect) return;
+      if (n.type === 'lambda_expression') return;
+      if (n.type === 'method_invocation' || n.type === 'object_creation_expression'
+        || n.type === 'assignment_expression' || n.type === 'update_expression') {
+        effect = true;
+      }
+      const anonBody = n.type === 'object_creation_expression' ? childByField(n, 'body') : null;
+      for (let i = 0; i < n.namedChildCount; i++) {
+        const c = n.namedChild(i);
+        if (anonBody && sameNode(c, anonBody)) continue;
+        visit(c);
+      }
+    };
+    visit(valueNode);
+    return effect;
   }
 
   function firstNamed(node, type) {
@@ -654,13 +774,15 @@ function parseJava(filePath, src) {
     if (p.type === 'catch_formal_parameter' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'instanceof_expression' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'type_pattern' && sameNode(childByField(p, 'name'), node)) return true;
-    if (p.type === 'labeled_statement' && sameNode(p.namedChild(0), node)) return true;
+    if (p.type === 'labeled_statement' && sameNode(firstNonCommentChild(p), node)) return true;
     if (p.type === 'resource' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'method_invocation' && sameNode(childByField(p, 'name'), node)) return true;
     if (p.type === 'method_reference') {
       // The LAST named child is the referenced method name; earlier
       // children are the object (a real read, e.g. `obj::m` reads obj).
-      const last = p.namedChild(p.namedChildCount - 1);
+      // A trailing comment would otherwise be picked up as the last
+      // child and the name treated as a reference.
+      const last = lastNonCommentChild(p);
       if (last && sameNode(last, node)) return true;
     }
     return false;
@@ -736,17 +858,20 @@ function parseJava(filePath, src) {
       if (nameNode) {
         const name = text(nameNode, src);
         const args = childByField(node, 'arguments');
-        const arity = args ? args.namedChildCount : 0;
+        const arity = argumentArity(args);
         result.calls.push({ name, full: name, line: node.startPosition.row + 1, startIndex: node.startIndex, arity });
         addRef(name, nameNode);
         addArityOcc(`${name}/${arity}`, node.startIndex);
       }
     } else if (node.type === 'method_reference') {
-      const last = node.namedChild(node.namedChildCount - 1);
+      // First / last named child, skipping comments: a `//` comment
+      // before the type or after the name would otherwise be picked
+      // up as the name or the type and the reference silently dropped.
+      const last = lastNonCommentChild(node);
       if (last && last.type === 'identifier') {
         const name = text(last, src);
         if (name === 'new') {
-          const first = node.namedChild(0);
+          const first = firstNonCommentChild(node);
           const forClass = first ? text(first, src).split(/[^A-Za-z0-9_$]/).filter(Boolean).pop() : null;
           result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity: null, forClass, methodRef: true });
           addArityOcc(`constructor/*@${forClass || 'super'}`, node.startIndex);
@@ -762,14 +887,14 @@ function parseJava(filePath, src) {
       if (typeNode) {
         const rawType = text(typeNode, src);
         const forClass = rawType.split(/[^A-Za-z0-9_$]/).filter(Boolean).pop();
-        const arity = args ? args.namedChildCount : 0;
+        const arity = argumentArity(args);
         result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity, forClass });
         addArityOcc(`constructor/${arity}@${forClass || 'super'}`, node.startIndex);
       }
     } else if (node.type === 'explicit_constructor_invocation') {
       const ctor = childByField(node, 'constructor');
       const args = childByField(node, 'arguments');
-      const arity = args ? args.namedChildCount : 0;
+      const arity = argumentArity(args);
       const raw = ctor ? text(ctor, src) : '';
       if (raw === 'this') {
         const cls = currentClass();
@@ -779,6 +904,17 @@ function parseJava(filePath, src) {
         result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity, forClass: null });
         addArityOcc(`constructor/${arity}@super`, node.startIndex);
       }
+    } else if (node.type === 'enum_constant') {
+      // An enum constant invokes its enum's constructor: `FOO(1, 2)`
+      // calls the 2-arg constructor, and a bare `FOO` (or one with a
+      // class body but no arguments) calls the no-arg one.
+      // Constructors are never called by name, so without this the
+      // enum's constructor looks uncalled and is flagged SAFE.
+      const args = childByField(node, 'arguments');
+      const cls = currentClass();
+      const arity = argumentArity(args);
+      result.calls.push({ name: 'constructor', full: 'constructor', line: node.startPosition.row + 1, startIndex: node.startIndex, arity, forClass: cls.name });
+      addArityOcc(`constructor/${arity}@${cls.name || 'super'}`, node.startIndex);
     }
   }
 
@@ -787,7 +923,7 @@ function parseJava(filePath, src) {
     if (isClass) {
       const nameNode = childByField(node, 'name');
       const mods = modifiersOf(node, src);
-      classStack.push({ name: nameNode ? text(nameNode, src) : null, annotations: mods.annotations, node });
+      classStack.push({ name: nameNode ? text(nameNode, src) : null, annotations: mods.annotations, node, kind: node.type });
     }
     let pushed = false;
     if (SCOPE_NODE_TYPES.has(node.type) && scopesByStart.has(node.startIndex)) {
@@ -825,8 +961,12 @@ function parseJava(filePath, src) {
     }
     if (node.type === 'if_statement') {
       const cond = childByField(node, 'condition');
+      // First real child of the parenthesized condition: a comment
+      // before `false` would otherwise be namedChild(0) and the
+      // `if (false)` branch missed.
+      const firstCond = cond && cond.type === 'parenthesized_expression' ? firstNonCommentChild(cond) : null;
       const isFalse = Boolean(cond
-        && ((cond.type === 'parenthesized_expression' && cond.namedChildCount > 0 && cond.namedChild(0).type === 'false')
+        && ((firstCond && firstCond.type === 'false')
           || cond.type === 'false'));
       if (isFalse) {
         result.unreachable.push({ range: rangeOf(node), line: node.startPosition.row + 1, reason: 'if (false) branch is never taken', snippet: text(node, src).slice(0, 120) });

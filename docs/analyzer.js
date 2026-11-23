@@ -3,12 +3,20 @@
 /**
  * deadcode-map web analyzer — lightweight, browser-safe.
  *
- * This is a regex-based analyzer for the web checker. It mirrors the CLI's
- * grading model (SAFE / REVIEW / KEEP with evidence) and its core rules:
- * a real import graph from entry points, a repo-wide string-reference pass,
- * framework keeps, and dynamic-import downgrades. It is NOT the full CLI:
- * the CLI parses with tree-sitter; this version parses with regular
- * expressions, so it can miss exotic syntax. The UI says so honestly.
+ * JS / Python are parsed with regular expressions; Java is parsed with
+ * tree-sitter (docs/parse-java-web.js, web-tree-sitter 0.22.5 +
+ * tree-sitter-java 0.23.5 wasm, vendored in docs/vendor/ and lazy-loaded only
+ * when a .java file is present). The Java grading below ports the CLI's
+ * Java branch from src/confidence.js — private-only SAFE, arity-aware
+ * liveness — so a web SAFE is a SAFE the CLI would emit too (the web
+ * IS the opted-in surface: there is no --java-safe gate here). When the
+ * wasm parser cannot load, Java files are skipped, never regex-parsed.
+ *
+ * It mirrors the CLI's grading model (SAFE / REVIEW / KEEP with
+ * evidence) and its core rules: a real import graph from entry points,
+ * a repo-wide string-reference pass, framework keeps, and dynamic-import
+ * downgrades. It is NOT the full CLI: the regex JS/Python parsers can
+ * miss exotic syntax. The UI says so honestly.
  *
  * Deliberate parity notes (matching CLI v0.1.0 behaviour):
  * - Dynamic import() sets the dynamic flag but creates no import edge, so a
@@ -27,6 +35,9 @@
  *
  * No browser-only APIs in this file: it runs in Node and in the browser.
  * UMD wrapper: module.exports in Node, window.DeadcodeMap in the browser.
+ * The Java parser is loaded lazily (see analyzeFilesAsync): in Node via
+ * require('./parse-java-web'), in the browser via window.DeadcodeJava
+ * (docs/parse-java-web.js, loaded by a <script> tag in index.html).
  */
 
 (function (root, factory) {
@@ -39,6 +50,7 @@
 
 var JS_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
 var PY_EXTS = ['.py'];
+var JAVA_EXTS = ['.java'];
 var SKIP_DIRS = new Set([
   'node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'out', '.next',
   'coverage', '.coverage', '__pycache__', '.venv', 'venv', '.tox',
@@ -96,7 +108,7 @@ var JSX_PRAGMA_NAMES = [
 // references pass. 200 lines still bounds a malformed statement.
 var IMPORT_STMT_MAX_LINES = 200;
 
-var TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$)/;
+var TEST_FILE = /(\.test\.|\.spec\.|\.e2e-spec\.|_test\.py$|test_[^/]+\.py$|conftest\.py$|(^|\/)test\.[jt]sx?$|Test\.java$)/;
 // `.e2e-spec.` is the NestJS / vitest end-to-end marker (each sample
 // runs `e2e/**/*.e2e-spec.ts` via its own vitest.config.e2e.mts): a
 // test entry point like `.spec.` / `.test.`, never a dead file —
@@ -127,6 +139,11 @@ var ENTRY_PATTERNS = [
   /middleware\.(js|jsx|ts|tsx)$/, /proxy\.(js|jsx|ts|tsx)$/,
   // Build-task files and example scripts are standalone entry points.
   /(^|\/)gulpfile\.(js|ts)$/, /(^|\/)gruntfile\.(js|ts)$/, /(^|\/)examples\//,
+  // Manually-run tools (scripts/ or tools/ at any depth): invoked by
+  // the operator, never imported — mirrors isManualScriptPath in
+  // src/discover.js. They are entry points (never dead files) and
+  // their symbols are kept (see keepSymbols below).
+  /(^|\/)(scripts|tools)\//,
 ];
 var ROUTE_DIR = /(^|\/)(pages|app|routes|views)\//;
 var FRAMEWORK_KEEP_EXPORTS = new Set([
@@ -144,6 +161,86 @@ var FRAMEWORK_KEEP_DECORATORS = [
   'model_validator', 'field_validator', 'computed_field', 'root_validator',
   'validator', 'overload',
 ];
+
+// Java framework stereotypes on an enclosing class: the framework
+// reflects over the class's private members, so members are REVIEW at
+// most, never SAFE. The union of three sources, kept in sync by the
+// 'web java: framework stereotype lists match the packs' test:
+// - the hardcoded fallback in src/parse-java.js
+//   FRAMEWORK_CLASS_ANNOTATIONS (core stereotypes + Lombok),
+// - frameworks/spring.json keepClassAnnotations,
+// - frameworks/jackson-jpa.json keepClassAnnotations.
+// A pack-only stereotype such as @ControllerAdvice or
+// @JsonIgnoreProperties keeps members at REVIEW too, with no
+// annotation list hardcoded here for the new packs beyond this union.
+var JAVA_FRAMEWORK_CLASS_ANNOTATIONS = new Set([
+  // src/parse-java.js FRAMEWORK_CLASS_ANNOTATIONS (core + Lombok).
+  'Data', 'Getter', 'Setter', 'Value', 'Builder',
+  'AllArgsConstructor', 'NoArgsConstructor', 'RequiredArgsConstructor',
+  'EqualsAndHashCode', 'ToString',
+  'Service', 'Component', 'Controller', 'RestController', 'Repository',
+  'SpringBootApplication', 'Configuration', 'Entity', 'Embeddable',
+  'MappedSuperclass',
+  // frameworks/spring.json keepClassAnnotations (beyond the core set).
+  'ControllerAdvice', 'RestControllerAdvice', 'SpringBootConfiguration',
+  'EnableAutoConfiguration', 'ComponentScan', 'ConfigurationProperties',
+  'FeignClient', 'EnableFeignClients', 'EnableWebMvc', 'EnableScheduling',
+  'EnableAsync', 'EnableCaching', 'EnableTransactionManagement',
+  // frameworks/jackson-jpa.json keepClassAnnotations (beyond the core set).
+  'Table', 'JsonIgnoreProperties', 'JsonTypeInfo', 'JsonPropertyOrder',
+  'Inheritance', 'DiscriminatorColumn',
+]);
+
+// Java serialization callbacks (FJ-4, mirrors src/confidence.js
+// JAVA_SERIALIZATION_CALLBACKS): private methods the serialization
+// runtime invokes by reflection. The (name, arity) pair IS the
+// contract: readObject / writeObject take the stream (1),
+// readObjectNoData / readResolve / writeReplace take none (0).
+var JAVA_SERIALIZATION_CALLBACKS = {
+  readObject: 1, writeObject: 1,
+  readObjectNoData: 0, readResolve: 0, writeReplace: 0,
+};
+
+// Generated from frameworks/*.json by the batch-10 Java web
+// integration (see the pack-data test, which rebuilds these maps
+// from the packs and fails on drift). First pack in filename
+// order wins a key, matching the CLI's first-reason rule in
+// frameworkKeepSymbol (src/confidence.js).
+var JAVA_PACK_KEEP_EXPORTS_LIST = [['config', 'next.json'], ['default', 'next.json'], ['generateMetadata', 'next.json'], ['generateStaticParams', 'next.json'], ['getServerSideProps', 'next.json'], ['getStaticPaths', 'next.json'], ['getStaticProps', 'next.json'], ['middleware', 'next.json']];
+var JAVA_PACK_KEEP_NAMES_LIST = [['__call__', 'fastapi.json'], ['__init__', 'django.json'], ['__str__', 'django.json'], ['clean', 'django.json'], ['get_absolute_url', 'django.json'], ['save', 'django.json']];
+var JAVA_PACK_KEEP_DECORATORS_LIST = [['receiver', 'django.json'], ['register', 'django.json'], ['admin.register', 'django.json'], ['login_required', 'django.json'], ['permission_required', 'django.json'], ['app.get', 'fastapi.json'], ['app.post', 'fastapi.json'], ['app.put', 'fastapi.json'], ['app.delete', 'fastapi.json'], ['app.patch', 'fastapi.json'], ['app.route', 'fastapi.json'], ['router.get', 'fastapi.json'], ['router.post', 'fastapi.json'], ['router.put', 'fastapi.json'], ['router.delete', 'fastapi.json'], ['router.patch', 'fastapi.json'], ['router.route', 'fastapi.json'], ['app.on_event', 'fastapi.json'], ['app.middleware', 'fastapi.json'], ['app.errorhandler', 'flask.json'], ['app.before_request', 'flask.json'], ['app.after_request', 'flask.json'], ['blueprint.route', 'flask.json'], ['JsonProperty', 'jackson-jpa.json'], ['JsonIgnore', 'jackson-jpa.json'], ['JsonIgnoreProperties', 'jackson-jpa.json'], ['JsonCreator', 'jackson-jpa.json'], ['JsonValue', 'jackson-jpa.json'], ['JsonGetter', 'jackson-jpa.json'], ['JsonSetter', 'jackson-jpa.json'], ['JsonSerialize', 'jackson-jpa.json'], ['JsonDeserialize', 'jackson-jpa.json'], ['JsonInclude', 'jackson-jpa.json'], ['JsonFormat', 'jackson-jpa.json'], ['JsonTypeInfo', 'jackson-jpa.json'], ['JsonSubTypes', 'jackson-jpa.json'], ['JsonTypeName', 'jackson-jpa.json'], ['JsonAnyGetter', 'jackson-jpa.json'], ['JsonAnySetter', 'jackson-jpa.json'], ['JsonAlias', 'jackson-jpa.json'], ['JsonView', 'jackson-jpa.json'], ['JsonPropertyOrder', 'jackson-jpa.json'], ['JsonUnwrapped', 'jackson-jpa.json'], ['JsonRawValue', 'jackson-jpa.json'], ['JsonManagedReference', 'jackson-jpa.json'], ['JsonBackReference', 'jackson-jpa.json'], ['JsonIdentityInfo', 'jackson-jpa.json'], ['Entity', 'jackson-jpa.json'], ['Table', 'jackson-jpa.json'], ['Column', 'jackson-jpa.json'], ['Id', 'jackson-jpa.json'], ['GeneratedValue', 'jackson-jpa.json'], ['Embeddable', 'jackson-jpa.json'], ['Embedded', 'jackson-jpa.json'], ['EmbeddedId', 'jackson-jpa.json'], ['MappedSuperclass', 'jackson-jpa.json'], ['OneToMany', 'jackson-jpa.json'], ['ManyToOne', 'jackson-jpa.json'], ['OneToOne', 'jackson-jpa.json'], ['ManyToMany', 'jackson-jpa.json'], ['JoinColumn', 'jackson-jpa.json'], ['JoinTable', 'jackson-jpa.json'], ['PrePersist', 'jackson-jpa.json'], ['PreUpdate', 'jackson-jpa.json'], ['PostLoad', 'jackson-jpa.json'], ['PostPersist', 'jackson-jpa.json'], ['PostRemove', 'jackson-jpa.json'], ['PostUpdate', 'jackson-jpa.json'], ['Enumerated', 'jackson-jpa.json'], ['Temporal', 'jackson-jpa.json'], ['Transient', 'jackson-jpa.json'], ['Lob', 'jackson-jpa.json'], ['Version', 'jackson-jpa.json'], ['ElementCollection', 'jackson-jpa.json'], ['CollectionTable', 'jackson-jpa.json'], ['OrderBy', 'jackson-jpa.json'], ['DiscriminatorColumn', 'jackson-jpa.json'], ['Inheritance', 'jackson-jpa.json'], ['NamedQuery', 'jackson-jpa.json'], ['NamedQueries', 'jackson-jpa.json'], ['SequenceGenerator', 'jackson-jpa.json'], ['TableGenerator', 'jackson-jpa.json'], ['model_validator', 'pydantic.json'], ['field_validator', 'pydantic.json'], ['computed_field', 'pydantic.json'], ['root_validator', 'pydantic.json'], ['validator', 'pydantic.json'], ['pytest.fixture', 'pytest.json'], ['pytest.mark.parametrize', 'pytest.json'], ['pytest.mark.skip', 'pytest.json'], ['pytest.hookimpl', 'pytest.json'], ['hookimpl', 'pytest.json'], ['Component', 'spring.json'], ['Service', 'spring.json'], ['Repository', 'spring.json'], ['Controller', 'spring.json'], ['RestController', 'spring.json'], ['ControllerAdvice', 'spring.json'], ['RestControllerAdvice', 'spring.json'], ['Configuration', 'spring.json'], ['SpringBootApplication', 'spring.json'], ['SpringBootConfiguration', 'spring.json'], ['EnableAutoConfiguration', 'spring.json'], ['ComponentScan', 'spring.json'], ['EnableFeignClients', 'spring.json'], ['EnableWebMvc', 'spring.json'], ['EnableScheduling', 'spring.json'], ['EnableAsync', 'spring.json'], ['EnableCaching', 'spring.json'], ['EnableTransactionManagement', 'spring.json'], ['Autowired', 'spring.json'], ['Qualifier', 'spring.json'], ['Value', 'spring.json'], ['Bean', 'spring.json'], ['PostConstruct', 'spring.json'], ['PreDestroy', 'spring.json'], ['Primary', 'spring.json'], ['Lazy', 'spring.json'], ['Scope', 'spring.json'], ['Profile', 'spring.json'], ['Conditional', 'spring.json'], ['Import', 'spring.json'], ['PropertySource', 'spring.json'], ['ConfigurationProperties', 'spring.json'], ['EnableConfigurationProperties', 'spring.json'], ['RequestMapping', 'spring.json'], ['GetMapping', 'spring.json'], ['PostMapping', 'spring.json'], ['PutMapping', 'spring.json'], ['DeleteMapping', 'spring.json'], ['PatchMapping', 'spring.json'], ['RequestParam', 'spring.json'], ['PathVariable', 'spring.json'], ['RequestBody', 'spring.json'], ['ResponseBody', 'spring.json'], ['ResponseStatus', 'spring.json'], ['ExceptionHandler', 'spring.json'], ['ModelAttribute', 'spring.json'], ['CrossOrigin', 'spring.json'], ['RequestHeader', 'spring.json'], ['CookieValue', 'spring.json'], ['Scheduled', 'spring.json'], ['Async', 'spring.json'], ['EventListener', 'spring.json'], ['Transactional', 'spring.json'], ['Cacheable', 'spring.json'], ['CacheEvict', 'spring.json'], ['CachePut', 'spring.json'], ['Retryable', 'spring.json'], ['Secured', 'spring.json'], ['PreAuthorize', 'spring.json'], ['PostAuthorize', 'spring.json'], ['FeignClient', 'spring.json'], ['app.command', 'typer.json'], ['app.callback', 'typer.json'], ['app.cli.command', 'typer.json'], ['click.command', 'typer.json'], ['click.group', 'typer.json'], ['click.pass_context', 'typer.json'], ['typer.Typer', 'typer.json'], ['overload', 'typing.json']];
+
+// Null-prototype lookup maps built from the lists above: symbol names
+// come from user code, so a plain {} would return inherited members
+// for names like "constructor" or "toString".
+function javaPackMap(list) {
+  var m = Object.create(null);
+  list.forEach(function (pair) { if (!m[pair[0]]) m[pair[0]] = pair[1]; });
+  return m;
+}
+var JAVA_PACK_KEEP_EXPORTS = javaPackMap(JAVA_PACK_KEEP_EXPORTS_LIST);
+var JAVA_PACK_KEEP_NAMES = javaPackMap(JAVA_PACK_KEEP_NAMES_LIST);
+
+// Framework-pack keep for one definition (port of frameworkKeepSymbol
+// in src/confidence.js, Java scope): the CLI consults every pack for
+// every definition — keepExports / keepNames by exact name, and
+// keepDecorators by substring on the '@Name' decorator. Returns the
+// CLI-style reason, or '' when no pack keeps this definition. The
+// decorator loop iterates the pack list in sorted order (deterministic);
+// the CLI iterates readdir order and takes the first reason, so the
+// named pack can differ when two packs match — the grade is the same.
+function javaFrameworkKeepSymbol(name, decorators) {
+  if (name && JAVA_PACK_KEEP_EXPORTS[name]) return 'framework pack ' + JAVA_PACK_KEEP_EXPORTS[name] + ': export "' + name + '" is framework-resolved';
+  if (name && JAVA_PACK_KEEP_NAMES[name]) return 'framework pack ' + JAVA_PACK_KEEP_NAMES[name] + ': name "' + name + '" is framework-resolved';
+  for (var i = 0; i < (decorators || []).length; i++) {
+    var d = decorators[i];
+    for (var j = 0; j < JAVA_PACK_KEEP_DECORATORS_LIST.length; j++) {
+      var kd = JAVA_PACK_KEEP_DECORATORS_LIST[j][0];
+      if (d.indexOf(kd) >= 0) return 'framework pack ' + JAVA_PACK_KEEP_DECORATORS_LIST[j][1] + ': decorator "' + kd + '"';
+    }
+  }
+  return '';
+}
 
 /* ------------------------------------------------------------------ */
 /* Small utilities                                                     */
@@ -1068,6 +1165,24 @@ function parseJs(rel, raw) {
     JSX_PRAGMA_NAMES.forEach(function (name) {
       if (importLocals.has(name)) parsed.references.add(name);
     });
+  }
+  // JSDoc {@link X} / {@linkcode X} / {@linkplain X} is a real
+  // reference to X: TypeScript resolves the link target, so an import
+  // used only in a doc link is used, not dead (vuejs/vue
+  // types/options.d.ts imports ObjectDirective / FunctionDirective
+  // only for `@deprecated use {@link FunctionDirective} instead`).
+  // Only imported bindings get the credit (same rule as the
+  // JSX-pragma credit above): a doc mention of a local name must not
+  // resurrect a dead local definition. Scanned on the raw source: the
+  // references pass below runs on stripped code with comments
+  // blanked, so a link inside a comment never reaches it. A bare word
+  // in prose is not a link — only the {@link...} form counts, so a
+  // type merely mentioned in a comment sentence stays flaggable.
+  // Mirrors src/parse-js.js.
+  var linkRe = /\{@link(?:code|plain)?\s+([A-Za-z_$][\w$]*)/g;
+  var lm;
+  while ((lm = linkRe.exec(raw)) !== null) {
+    if (importLocals.has(lm[1])) parsed.references.add(lm[1]);
   }
   // Names bound by imports in this file: a local `export { ... }` list
   // re-exports them, so those names ARE uses (see exportListLines
@@ -2077,7 +2192,264 @@ function looksLikeEntry(rel, abs, pkgEntries, raw) {
   if (raw.slice(0, 200).indexOf('#!') === 0) return { entry: true, reason: 'has a shebang (CLI script)' };
   if (/__name__\s*==\s*['"]__main__['"]/.test(raw)) return { entry: true, reason: 'runnable script (if __name__ == "__main__")' };
   if (/require\.main\s*===\s*module/.test(raw)) return { entry: true, reason: 'runnable script (require.main === module)' };
+  // Java: a public static void main(String[]) method is the entry
+  // point (mirrors src/discover.js in the CLI).
+  if (/public\s+static\s+void\s+main\s*\(\s*String\s*\[/.test(raw)) return { entry: true, reason: 'has a main() method (Java entry point)' };
   return { entry: false, reason: '' };
+}
+
+/* ------------------------------------------------------------------ */
+/* Java liveness (port of the scopes block in src/confidence.js)       */
+/* ------------------------------------------------------------------ */
+
+// Java same-file liveness: the Java parser records, per definition, the
+// names referenced inside its body (`uses`) plus the names referenced by
+// top-level code (`topLevelUses`, which runs on import). Liveness is
+// reachability from live roots over that definition graph, plus the
+// arity channel (usesArity / topLevelUsesArity) that tells overloads
+// apart by (name, arity). Returns null when the parse predates scopes
+// (no topLevelUses) — the caller then falls back to REVIEW, never SAFE.
+// The shape mirrors the CLI block so a diff of the two stays readable:
+// liveRootDefs (top-level uses + non-private methods + classes),
+// baseKeepDef conduits, the live-class fixpoint, sameFileLiveDefs,
+// javaUsedByLive (assumed-live roots live code actually uses),
+// javaArityIsLive (the (name, arity) liveness test), and
+// javaUtilityClasses (FJ-2).
+function buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames) {
+  if (!Array.isArray(parsed.topLevelUses) || !Array.isArray(parsed.topLevelUsesArity)) return null;
+  var defsByName = Object.create(null);
+  parsed.definitions.forEach(function (d) {
+    if (!defsByName[d.name]) defsByName[d.name] = [];
+    defsByName[d.name].push(d);
+  });
+  var defUses = new Map();
+  parsed.definitions.forEach(function (d) { defUses.set(d, new Set(d.uses || [])); });
+  // Live roots: top-level code (runs on import). Java has no import
+  // resolution, so there are no cross-file callers to add; the seeding
+  // below supplies the rest.
+  var liveRootNames = new Set(parsed.topLevelUses || []);
+  var liveRootDefs = new Set();
+  liveRootNames.forEach(function (name) {
+    (defsByName[name] || []).forEach(function (d) { liveRootDefs.add(d); });
+  });
+  // Java: seed the live roots with the file's own non-private methods.
+  // A non-private method is reachable from outside this file, so its
+  // callees are live. Constructors count too: a non-private constructor
+  // really runs from outside. Seeded per DEFINITION, not per name: a
+  // private overload sharing a public method's name must not become a
+  // root — its liveness is decided by the arity check. A class's field
+  // initializers and static blocks run when the class loads, and the
+  // tool never proves a class dead, so the class definition is a live
+  // root too, and the helpers its initializers call are live through it.
+  parsed.definitions.forEach(function (d) {
+    if (d.kind === 'method' && d.visibility !== 'private') liveRootDefs.add(d);
+    if (d.kind === 'class') liveRootDefs.add(d);
+  });
+  // A kept definition is a CONDUIT, not a live root: it still gets its
+  // own KEEP / REVIEW finding, but the names it uses stay alive through
+  // it (a framework-dispatched handler really runs, and a public-API
+  // function may be called by downstream code).
+  var baseKeepDef = function (d) {
+    return keepSymbols
+      || (d.frameworkField ? true : false)
+      || (d.ambient ? true : false)
+      || overloadedNames.has(d.name)
+      || (parsed.dunder && parsed.dunder.has(d.name))
+      || (d.kind === 'method' && d.name.indexOf('__') === 0)
+      // Java: a method with any annotation (@PostConstruct, @Scheduled,
+      // ...) runs by framework dispatch, an @Override method runs when
+      // the supertype method is invoked, and a method of an anonymous
+      // class (Runnable.run, ActionListener.actionPerformed) runs by
+      // interface dispatch, never by name — all three are conduits.
+      // (The framework packs' keepDecorators are subsumed here: a
+      // pack-listed annotation IS an annotation on the member, and the
+      // packs carry no keepNames / keepExports for Java.)
+      || (d.kind === 'method' && (((d.annotations || []).length > 0) || d.anonymousClass === true))
+      // Exported public API of a published library. (The CLI also
+      // base-keeps exported defs of an 'unknown'-kind file; for Java
+      // only classes carry exported, and classes are already live
+      // roots above, so the library case is the only live one here.)
+      || (d.exported && isLibrary);
+  };
+  var baseKeepDefs = new Set();
+  parsed.definitions.forEach(function (d) { if (baseKeepDef(d)) baseKeepDefs.add(d); });
+  var bfsDefs = function (seeds) {
+    var seen = new Set();
+    var queue = [];
+    seeds.forEach(function (d) { queue.push(d); });
+    while (queue.length) {
+      var cur = queue.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      (defUses.get(cur) || new Set()).forEach(function (used) {
+        (defsByName[used] || []).forEach(function (nxt) { if (!seen.has(nxt)) queue.push(nxt); });
+      });
+    }
+    return seen;
+  };
+  var liveDefs = bfsDefs(liveRootDefs);
+  var viaBaseKeptDefs = bfsDefs(baseKeepDefs);
+  var classDefs = parsed.definitions.filter(function (d) { return d.kind === 'class'; });
+  var liveClassNames = new Set();
+  classDefs.forEach(function (d) {
+    if (liveDefs.has(d) || baseKeepDefs.has(d) || viaBaseKeptDefs.has(d)) liveClassNames.add(d.name);
+  });
+  var enclosingClassName = function (def) {
+    var best = null;
+    for (var i = 0; i < classDefs.length; i++) {
+      var c = classDefs[i];
+      if (!c.range || !def.range) continue;
+      if (c.range.startIndex <= def.range.startIndex && def.range.endIndex <= c.range.endIndex) {
+        if (!best || (c.range.endIndex - c.range.startIndex) < (best.range.endIndex - best.range.startIndex)) best = c;
+      }
+    }
+    return best ? best.name : null;
+  };
+  var keepDef = function (d) {
+    return baseKeepDef(d)
+      || (d.kind === 'method' && (enclosingClassName(d) === null || liveClassNames.has(enclosingClassName(d)))
+        // Java private methods are NOT conduits: a helper called only
+        // by a dead private method is dead too. An annotated private
+        // method is already base-kept above, so only unannotated
+        // private methods lose conduit status here.
+        && !(d.visibility === 'private' && !(d.annotations || []).length));
+  };
+  // Fixpoint: a class reached only through a kept method's callees is
+  // live too — its methods are conduits, and the names they use are
+  // reachable. The loop only grows liveClassNames, bounded by the
+  // number of classes in the file, so it always terminates; each round
+  // can only add liveness, never a new SAFE.
+  var keepDefs = new Set();
+  var viaKeptDefs = new Set();
+  for (;;) {
+    keepDefs = new Set();
+    parsed.definitions.forEach(function (d) { if (keepDef(d)) keepDefs.add(d); });
+    viaKeptDefs = bfsDefs(keepDefs);
+    var grew = false;
+    viaKeptDefs.forEach(function (d) {
+      if (d.kind === 'class' && !liveClassNames.has(d.name)) { liveClassNames.add(d.name); grew = true; }
+    });
+    if (!grew) break;
+  }
+  var sameFileLiveDefs = new Set();
+  liveDefs.forEach(function (d) { sameFileLiveDefs.add(d); });
+  viaKeptDefs.forEach(function (d) { sameFileLiveDefs.add(d); });
+  keepDefs.forEach(function (d) { if (!liveDefs.has(d)) sameFileLiveDefs.delete(d); });
+  // Java assumed-live roots (a non-private method, a class definition)
+  // are live by assumption, not by use — but a root that live code
+  // actually uses is used, not merely assumed: it keeps the old
+  // no-finding behaviour instead of gaining a REVIEW finding.
+  // javaUsedByLive is the defs some OTHER live def uses by name (a def
+  // never counts as used by itself, so a self-recursive public method
+  // still gets its REVIEW).
+  var javaUsedByLive = new Set();
+  var liveAndKept = [];
+  liveDefs.forEach(function (d) { liveAndKept.push(d); });
+  viaKeptDefs.forEach(function (d) { liveAndKept.push(d); });
+  liveAndKept.forEach(function (e) {
+    (defUses.get(e) || new Set()).forEach(function (used) {
+      // 'constructor' is one shared name for every constructor in the
+      // file: a this() chain and a `new` construction are
+      // indistinguishable by name, so it cannot tell a chained-to
+      // constructor from a constructed one — and the contract is that
+      // public constructors stay REVIEW.
+      if (used === 'constructor') return;
+      (defsByName[used] || []).forEach(function (d) { if (d !== e) javaUsedByLive.add(d); });
+    });
+  });
+  // Java: a private method is live only when live code calls it with a
+  // matching (name, arity). The name-based sameFileLive cannot tell
+  // format/1 from format/2, so private methods get their own
+  // arity-aware test over the same live-scope names: calls from a
+  // definition whose name is reachable from a live root or a kept
+  // definition, plus top-level (class-level) calls. A method reference
+  // has no visible arity and counts for every overload of the name; a
+  // varargs method matches any call with arity >= its fixed arity; a
+  // call from the candidate itself (pure recursion) never rescues it —
+  // the exclusion is by definition identity, not by (name, arity) key,
+  // so a call between two distinct overloads that share a name and an
+  // arity still counts. Constructors match by (name, arity, class):
+  // `new Foo()` and `this()` carry the class, `super()` carries none
+  // and matches nothing in this file.
+  var javaLiveScopeNames = new Set();
+  liveDefs.forEach(function (d) { javaLiveScopeNames.add(d.name); });
+  viaKeptDefs.forEach(function (d) { javaLiveScopeNames.add(d.name); });
+  var javaArityIsLive = function (def) {
+    var key = def.isConstructor
+      ? 'constructor/' + def.arity + '@' + (def.className || 'super')
+      : def.name + '/' + def.arity;
+    var calls = new Set(parsed.topLevelUsesArity || []);
+    for (var i = 0; i < parsed.definitions.length; i++) {
+      var d = parsed.definitions[i];
+      if (!javaLiveScopeNames.has(d.name)) continue;
+      if (d === def) continue;
+      (d.usesArity || []).forEach(function (u) { calls.add(u); });
+    }
+    if (def.isConstructor) {
+      return calls.has(key) || calls.has('constructor/*@' + (def.className || 'super'));
+    }
+    if (calls.has(def.name + '/*')) return true;
+    if (calls.has(def.name + '/' + def.arity)) return true;
+    if (def.varargs) {
+      var found = false;
+      calls.forEach(function (c) {
+        var m = c.match(/^(.+)\/(\d+)$/);
+        if (m && m[1] === def.name && parseInt(m[2], 10) >= (def.fixedArity || 0)) found = true;
+      });
+      if (found) return true;
+    }
+    return false;
+  };
+  // Java utility classes (FJ-2): a class whose direct members are all
+  // static — no instance fields, no instance methods. Members of nested
+  // or anonymous classes do not count, and constructors do not count
+  // (they are never static). A stale parse without the `static` /
+  // `anonymousClass` fields fails open: undefined static reads as an
+  // instance member, so the class is not treated as a utility class.
+  var hasInstanceMember = new Map();
+  parsed.definitions.forEach(function (d) {
+    if (!d.className || d.anonymousClass) return;
+    if (d.kind === 'method' && !d.isConstructor && d.static !== true) hasInstanceMember.set(d.className, true);
+    if (d.kind === 'variable' && !d.local && d.static !== true) hasInstanceMember.set(d.className, true);
+    if (!hasInstanceMember.has(d.className)) hasInstanceMember.set(d.className, false);
+  });
+  var javaUtilityClasses = new Set();
+  hasInstanceMember.forEach(function (v, k) { if (!v) javaUtilityClasses.add(k); });
+  return {
+    sameFileLiveDefs: sameFileLiveDefs,
+    javaUsedByLive: javaUsedByLive,
+    javaArityIsLive: javaArityIsLive,
+    javaUtilityClasses: javaUtilityClasses,
+  };
+}
+
+// Normalize a docs/parse-java-web.js result into the shape the
+// analyzer's grading loop expects: `calls` is a Set of names (like
+// parseJs), `dunder` is a Set (Java has no dunder methods). The raw
+// arity channel (uses / usesArity / topLevelUses / topLevelUsesArity)
+// and the grading fields (readCount, writeCount, stringMention,
+// annotations, classAnnotations, arity, varargs, fixedArity,
+// isConstructor, className, classKind, anonymousClass, initHasEffect,
+// static, native, isTestFile) pass through untouched.
+function adaptJavaParsed(p) {
+  if (!p) return null;
+  var calls = new Set();
+  (p.calls || []).forEach(function (c) { if (c && c.name) calls.add(c.name); });
+  p.calls = calls;
+  if (!p.dunder) p.dunder = new Set();
+  if (!p.constructed) p.constructed = new Set();
+  return p;
+}
+
+// Resolve the Java parser module: Node requires docs/parse-java-web.js
+// (next to this file); the browser uses window.DeadcodeJava (loaded by
+// a <script> tag in index.html). Returns null when neither is available.
+function loadJavaModule() {
+  if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
+    try { return require('./parse-java-web'); } catch (_) { return null; }
+  }
+  if (typeof self !== 'undefined' && self.DeadcodeJava) return self.DeadcodeJava;
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2085,6 +2457,72 @@ function looksLikeEntry(rel, abs, pkgEntries, raw) {
 /* ------------------------------------------------------------------ */
 
 function analyzeFiles(inputFiles, options) {
+  var report = analyzeFilesCore(inputFiles, options, undefined);
+  // Sync path: Java files are skipped entirely (back-compat with the
+  // regex-only analyzer). javaSkipped reports that honestly.
+  var hasJava = false;
+  (inputFiles || []).forEach(function (f) {
+    if (f && typeof f.path === 'string' && /\.java$/i.test(f.path)) hasJava = true;
+  });
+  report.javaSkipped = hasJava;
+  report.javaSkipReason = hasJava
+    ? 'Java files need analyzeFilesAsync (tree-sitter WASM) — files skipped, use the CLI'
+    : '';
+  return report;
+}
+
+/**
+ * Async entry point: analyzeFiles plus Java support. The wasm parser is
+ * lazy-loaded only when a .java file is present; when it cannot load
+ * (or options.javaInit === false, the test hook for "no wasm"), Java
+ * files are skipped with javaSkipped set on the report — never parsed
+ * with regex. analyzeFiles stays synchronous for JS/Python back-compat
+ * and skips Java files entirely.
+ */
+async function analyzeFilesAsync(inputFiles, options) {
+  options = options || {};
+  var hasJava = false;
+  (inputFiles || []).forEach(function (f) {
+    if (f && typeof f.path === 'string' && /\.java$/i.test(f.path)) hasJava = true;
+  });
+  if (!hasJava) {
+    var syncReport = analyzeFiles(inputFiles, options);
+    syncReport.javaSkipped = false;
+    syncReport.javaSkipReason = '';
+    return syncReport;
+  }
+  var javaModule = null;
+  var javaSkipReason = '';
+  if (options.javaInit === false) {
+    javaSkipReason = 'Java parser disabled for this run — Java files were skipped, use the CLI';
+  } else {
+    javaModule = loadJavaModule();
+    if (!javaModule) {
+      javaSkipReason = 'Java parser module not available — Java files were skipped, use the CLI';
+    } else {
+      try {
+        var initOptions = {};
+        if (options.treeSitterWasm) initOptions.treeSitterWasm = options.treeSitterWasm;
+        if (options.javaWasm) initOptions.javaWasm = options.javaWasm;
+        if (options.wasmDir) initOptions.wasmDir = options.wasmDir;
+        await javaModule.initJava(initOptions);
+      } catch (e) {
+        javaModule = null;
+        javaSkipReason = 'Java parser failed to load (' + (e && e.message ? e.message : String(e)) + ') — Java files were skipped, use the CLI';
+      }
+    }
+  }
+  // javaModule === null means "async, wasm unavailable": Java files are
+  // still listed (parsed null) so the string index raw-falls-back on
+  // them — fail-open, like the CLI does for unparseable code files —
+  // and the grading loop skips them (parseError set).
+  var report = analyzeFilesCore(inputFiles, options, javaModule);
+  report.javaSkipped = !javaModule;
+  report.javaSkipReason = javaModule ? '' : javaSkipReason;
+  return report;
+}
+
+function analyzeFilesCore(inputFiles, options, javaModule) {
   options = options || {};
   // The same file must never be scanned twice: a duplicated input (the
   // browser drag-and-drop path can hand the same file twice) used to
@@ -2117,13 +2555,30 @@ function analyzeFiles(inputFiles, options) {
       try { pkg = JSON.parse(f.content); pkgDir = dirOf(rel); } catch (_) { pkg = null; }
     }
     var ext = extOf(rel);
-    if (JS_EXTS.indexOf(ext) < 0 && PY_EXTS.indexOf(ext) < 0) return;
+    var isJava = JAVA_EXTS.indexOf(ext) >= 0;
+    if (JS_EXTS.indexOf(ext) < 0 && PY_EXTS.indexOf(ext) < 0 && !isJava) return;
+    // Sync path (javaModule === undefined): Java files are skipped
+    // entirely, exactly as before this change. Async path with the wasm
+    // parser unavailable (javaModule === null): the file is listed with
+    // parsed null, so the string index raw-falls-back on it — fail-open,
+    // like the CLI does for unparseable code files — and the grading
+    // loop skips it (parseError set below).
+    if (isJava && javaModule === undefined) return;
     existingFiles.add(rel);
     var parsed = null;
+    var parseError = null;
     try {
-      parsed = ext === '.py' ? parsePy(rel, f.content) : parseJs(rel, f.content);
+      if (ext === '.py') parsed = parsePy(rel, f.content);
+      else if (isJava) {
+        if (javaModule) {
+          parsed = adaptJavaParsed(javaModule.parseJavaWeb(rel, f.content));
+          if (parsed && parsed.hasErrors) parseError = 'Java parse errors (ERROR/MISSING nodes) — no findings for this file';
+        } else {
+          parseError = 'Java parser unavailable — file skipped, use the CLI';
+        }
+      } else parsed = parseJs(rel, f.content);
     } catch (_) { parsed = null; }
-    files[rel] = { rel: rel, language: ext === '.py' ? 'py' : 'js', parsed: parsed, raw: f.content, size: f.content.length, parseError: parsed ? null : 'parse failed' };
+    files[rel] = { rel: rel, language: isJava ? 'java' : ext === '.py' ? 'py' : 'js', parsed: parsed, raw: f.content, size: f.content.length, parseError: parsed ? parseError : (parseError || 'parse failed') };
   });
 
   var pkgEntries = packageJsonEntries(pkg, pkgDir);
@@ -2230,7 +2685,11 @@ function analyzeFiles(inputFiles, options) {
   // Prose files (.md, .txt) never execute, so they never count. Config /
   // template files (.json, .yaml, .html, ...) keep the raw-text match.
   var PROSE_EXTS = { '.md': true, '.txt': true };
-  var RAW_MATCH_EXTS = { '.json': true, '.yaml': true, '.yml': true, '.toml': true, '.html': true, '.vue': true, '.css': true };
+  // Config files that wire code by name: Spring XML, MyBatis mapper XML,
+  // application.properties — a member name in one of these is a real
+  // reference (Java string-mention downgrade), so they match raw text
+  // like .json / .yaml do (mirrors src/graph.js RAW_MATCH_EXTS).
+  var RAW_MATCH_EXTS = { '.json': true, '.yaml': true, '.yml': true, '.toml': true, '.html': true, '.vue': true, '.css': true, '.xml': true, '.properties': true };
   // Boundary-aware regex for a name that may start with a non-word char
   // (a scoped dependency: @scope/pkg). Plain \b fails before '@', so a
   // scoped name could never match at all. For names that start and end
@@ -2309,7 +2768,7 @@ function analyzeFiles(inputFiles, options) {
       var ext = extOf(f.rel);
       if (PROSE_EXTS[ext]) return; // prose never executes
       var info = files[f.rel];
-      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0)) {
+      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0 || JAVA_EXTS.indexOf(ext) >= 0)) {
         if (info.parsed) {
           (info.parsed.strings || []).forEach(function (s) { addLiteral(s, f.rel, true); });
           return;
@@ -2332,7 +2791,7 @@ function analyzeFiles(inputFiles, options) {
       var ext = extOf(f.rel);
       if (PROSE_EXTS[ext]) return; // prose never executes
       var info = files[f.rel];
-      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0)) {
+      if (info && (JS_EXTS.indexOf(ext) >= 0 || PY_EXTS.indexOf(ext) >= 0 || JAVA_EXTS.indexOf(ext) >= 0)) {
         if (info.parsed && info.parsed.strings) {
           // String literals only — comments and sentences in docstrings
           // do not count; see codeLikeStringMention.
@@ -2530,7 +2989,15 @@ function analyzeFiles(inputFiles, options) {
     seenFindings.add(f.id);
     var key = f.category === 'unreachable'
       ? 'unreachable:' + f.file + ':' + (f.blockLine || f.startLine || 0)
-      : f.category + ':' + f.file + ':' + (f.symbol || '');
+      // Java: the same symbol can legitimately carry several findings
+      // at different lines with different grades (two constructors, a
+      // serialization callback and its wrong-arity namesake) — the CLI
+      // dedupes by category:file:symbol:startLine, so the web does the
+      // same for .java files. Without this, the first constructor
+      // finding would swallow the SAFE one.
+      : /\.java$/.test(f.file)
+        ? f.category + ':' + f.file + ':' + (f.symbol || '') + ':' + (f.startLine || 0)
+        : f.category + ':' + f.file + ':' + (f.symbol || '');
     if (seenKeys.has(key)) return null;
     seenKeys.add(key);
     findings.push(f);
@@ -2539,18 +3006,22 @@ function analyzeFiles(inputFiles, options) {
 
   Object.keys(files).forEach(function (rel) {
     var info = files[rel];
-    if (!info.parsed) return; // never flag what we could not parse
+    if (!info.parsed || info.parseError) return; // never flag what we could not parse
     var parsed = info.parsed;
     var isEntry = Boolean(entries[rel]);
     var isTest = TEST_FILE.test(rel) || TEST_DIR.test(rel);
     var isConfig = CONFIG_FILE.test(rel);
+    var isManualScript = /(^|\/)(scripts|tools)\//.test(rel);
     var isRouteFile = ROUTE_DIR.test(rel);
     var keepFile = isEntry || isTest || isConfig || isRouteFile;
-    var keepSymbols = isTest || isConfig || isRouteFile;
+    var keepSymbols = isTest || isConfig || isManualScript || isRouteFile;
     var importerCount = (importers[rel] || new Set()).size;
 
-    // Dead file.
-    if (!reachable.has(rel) && importerCount === 0) {
+    // Dead file. Java files are never dead-file candidates in this
+    // landing (mirrors the CLI): there is no Java import resolution
+    // yet, so no file can be proven unimported. Symbol findings inside
+    // Java files still apply.
+    if (info.language !== 'java' && !reachable.has(rel) && importerCount === 0) {
       if (keepFile) {
         add({
           category: 'file', file: rel, symbol: null, grade: 'KEEP',
@@ -2611,6 +3082,13 @@ function analyzeFiles(inputFiles, options) {
     var categoryOf = function (kind) {
       return { 'function': 'function', 'class': 'class', type: 'type', variable: 'variable', method: 'method' }[kind] || 'function';
     };
+    // Java liveness, computed once per file (see buildJavaLiveness):
+    // the live-scope BFS over the definition graph plus the arity
+    // channel. Null when the parse predates scopes — the Java branch
+    // below then falls back to REVIEW, never SAFE.
+    var javaCtx = info.language === 'java'
+      ? buildJavaLiveness(parsed, keepSymbols, isLibrary, overloadedNames)
+      : null;
     parsed.definitions.forEach(function (def) {
       if (importLocals.has(def.name)) return;
       if (def.kind === 'method' && /^__.*__$/.test(def.name)) {
@@ -2624,30 +3102,46 @@ function analyzeFiles(inputFiles, options) {
       }
       var usage = usageMap[def.name] || { importedBy: new Set(), calledIn: new Set(), sameFile: false };
       var importedBy = Array.from(usage.importedBy);
+      // A call from another file is a real caller too: the classic-script
+      // global pass above records bare-name calls from other classic
+      // scripts against the unique repo-wide definition (Django admin
+      // JS), so a definition with any cross-file caller is live. A call
+      // from the symbol's own file is same-file use, not an external
+      // caller.
+      var calledElsewhere = [];
+      usage.calledIn.forEach(function (f) { if (f !== rel) calledElsewhere.push(f); });
       var sameFileUse = usage.sameFile || usage.calledIn.has(rel);
+      // Java: name-based same-file use cannot tell overloads apart, and
+      // assumed-live roots (non-private methods, classes) must not be
+      // rescued by their own same-file callers — the CLI computes both
+      // from the arity-aware live-scope BFS instead (buildJavaLiveness
+      // above). Private methods get sameFileUse false here; the Java
+      // branch below decides them with javaArityIsLive. Locals keep the
+      // file-level rule: a local is part of its enclosing function's
+      // implementation, so any reference in the file keeps it alive.
+      // With no liveness data (stale parse), sameFileUse is false too:
+      // the Java branch then falls back to REVIEW, never SAFE.
+      var javaPrivateMethod = info.language === 'java' && def.kind === 'method' && def.visibility === 'private';
+      var javaAssumedLive = info.language === 'java'
+        && (def.kind === 'class' || (def.kind === 'method' && def.visibility !== 'private'));
+      var sameFileUseEffective = sameFileUse;
+      if (info.language === 'java' && !def.local) {
+        if (javaCtx) {
+          sameFileUseEffective = javaCtx.sameFileLiveDefs.has(def);
+          if (javaPrivateMethod) sameFileUseEffective = false;
+          else if (javaAssumedLive) sameFileUseEffective = javaCtx.javaUsedByLive.has(def);
+        } else {
+          sameFileUseEffective = false;
+        }
+      }
       // Same-file use is real use: a symbol called or referenced in its
       // own file is alive, full stop — never a finding. (It used to be
       // flagged REVIEW as "unexport-to-local", which turned every
       // module's own helpers into noise.)
-      if (importedBy.length === 0 && sameFileUse) {
+      if (importedBy.length === 0 && calledElsewhere.length === 0 && sameFileUseEffective) {
         return;
       }
-      if (importedBy.length > 0) return;
-      // A method called anywhere in-repo is alive. Cross-file method
-      // calls do not count as imports, so they need this branch — the
-      // same-file check above only covers calls from the defining file,
-      // and without it a constructor called via `new Client()` from an
-      // importer was still REVIEW.
-      if (def.kind === 'method' && usage.calledIn.size > 0) {
-        return;
-      }
-      // A call from another file is a real caller too: the classic-script
-      // global pass above records bare-name calls from other classic
-      // scripts against the unique repo-wide definition (Django admin
-      // JS), so a definition with any cross-file caller is live. The
-      // same-file case already returned above, so reaching here with a
-      // non-empty calledIn means the caller is in another file.
-      if (usage.calledIn.size > 0) {
+      if (importedBy.length > 0 || calledElsewhere.length > 0) {
         return;
       }
 
@@ -2663,6 +3157,18 @@ function analyzeFiles(inputFiles, options) {
         },
       };
       // Framework keeps.
+      // Java: the CLI's frameworkKeepSymbol consults every framework
+      // pack for every definition (keepExports / keepNames /
+      // keepDecorators) — a Java method named `save` is KEEP via
+      // django.json, a @Service class via spring.json. The pack check
+      // runs first, exactly as in the CLI, so its reason wins.
+      if (info.language === 'java') {
+        var javaFwSym = javaFrameworkKeepSymbol(def.name, def.decorators);
+        if (javaFwSym) {
+          add(Object.assign({}, common, { grade: 'KEEP', reason: javaFwSym }));
+          return;
+        }
+      }
       if (FRAMEWORK_KEEP_EXPORTS.has(def.name)) {
         add(Object.assign({}, common, { grade: 'KEEP', reason: 'framework-resolved export "' + def.name + '"' }));
         return;
@@ -2712,11 +3218,141 @@ function analyzeFiles(inputFiles, options) {
         return;
       }
       if (keepSymbols) {
-        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : 'in a framework route file' }));
+        add(Object.assign({}, common, { grade: 'KEEP', reason: isTest ? 'in a test file' : isConfig ? 'in a config file' : isManualScript ? 'in a manually-run script (scripts/ or tools/) — invoked by the operator, not by imports' : 'in a framework route file' }));
         return;
       }
       if (parsed.dynamic) {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: '0 callers, but file uses dynamic imports/reflection (' + (parsed.dynamicReasons[0] || 'dynamic') + ') — cannot prove safe' }));
+        return;
+      }
+      // ---- Java: private-only SAFE scope (port of src/confidence.js) ----
+      // Public / protected / package-private Java members can be
+      // reached from outside this file, and whole dead classes are out
+      // of scope: REVIEW at most, never SAFE. Private members are
+      // provable in-file, and only they can be SAFE. This branch sits
+      // BEFORE the generic string-mention check below on purpose: a
+      // local or parameter cannot be invoked by name from another file,
+      // so a string that happens to contain its name must not demote
+      // it — locals grade on binding-resolved reads alone. Non-local
+      // members still get the string check, inside the branch, after
+      // the more specific annotation / framework reasons. The web IS
+      // the opted-in surface, so there is no --java-safe gate here:
+      // a Java SAFE below is a real SAFE.
+      if (info.language === 'java') {
+        var javaSize = def.range ? def.range.endIndex - def.range.startIndex : 0;
+        var javaCommon = function (grade, reason) {
+          return Object.assign({}, common, { grade: grade, reason: reason, size: javaSize });
+        };
+        // Locals and parameters grade on binding-resolved reads, not
+        // on the file-level reference set.
+        if (def.local) {
+          if ((def.readCount || 0) > 0) return; // read somewhere: live, no finding
+          if (def.isParameter) {
+            add(javaCommon('REVIEW', def.privateMethod ? 'unused parameter of a private method — removing it requires updating its call sites' : 'unused parameter of a non-private method — changing a public/protected signature is an API break, and removing it requires updating its call sites'));
+            return;
+          }
+          if ((def.writeCount || 0) > 0) {
+            add(javaCommon('REVIEW', 'local variable assigned but never read — deleting the declaration would leave the assignments behind'));
+            return;
+          }
+          // A load-bearing unused local (FJ-3): the initializer calls
+          // a method or creates an object, so the declaration does
+          // work even though the value is never read. REVIEW, never
+          // SAFE. A pure initializer stays SAFE below.
+          if (def.initHasEffect) {
+            add(javaCommon('REVIEW', 'unused local variable, but its initializer calls a method or creates an object — the call may have side effects, so deleting the declaration would remove the call'));
+            return;
+          }
+          add(javaCommon('SAFE', 'unused local variable — never read or written'));
+          return;
+        }
+        if (def.kind === 'class') {
+          add(javaCommon('REVIEW', 'Java class — whole dead classes are out of scope for this tool'));
+          return;
+        }
+        if (def.kind !== 'method' && def.kind !== 'variable') {
+          add(javaCommon('REVIEW', 'Java member — REVIEW at most, never SAFE'));
+          return;
+        }
+        if (def.visibility !== 'private') {
+          add(javaCommon('REVIEW', (def.visibility === 'package' ? 'package-private' : def.visibility) + ' Java ' + (def.isConstructor ? 'constructor' : def.kind === 'method' ? 'method' : 'field') + ' — reachable from outside this file'));
+          return;
+        }
+        // Private member from here on.
+        if ((def.annotations || []).length > 0) {
+          add(javaCommon('KEEP', 'annotated @' + def.annotations[0] + ' — framework-invoked, never auto-deleted'));
+          return;
+        }
+        if (def.native) {
+          add(javaCommon('KEEP', 'native method — implemented outside Java, never called from Java source'));
+          return;
+        }
+        if (def.name === 'serialVersionUID') {
+          add(javaCommon('KEEP', 'serialVersionUID — read by Java serialization, never auto-deleted'));
+          return;
+        }
+        // Java serialization callbacks (FJ-4): private methods the
+        // serialization runtime invokes by reflection. The (name,
+        // arity) pair is the contract.
+        if (def.kind === 'method' && !def.isConstructor && JAVA_SERIALIZATION_CALLBACKS[def.name] === def.arity) {
+          add(javaCommon('KEEP', 'private ' + def.name + ' — Java serialization callback, invoked by the serialization runtime via reflection, never called from source'));
+          return;
+        }
+        // Private enum constructor (FJ-2b): an enum's constants invoke
+        // its constructor at class-load time, and the call graph
+        // records that, so an invoked constructor is live and gets no
+        // finding — this rule only fires for a constructor no constant
+        // invokes, and even then it is KEEP, never SAFE: the
+        // constructor is the wrong deletion unit for an enum.
+        if (def.isConstructor && def.classKind === 'enum_declaration'
+          && (!javaCtx || !javaCtx.javaArityIsLive || !javaCtx.javaArityIsLive(def))) {
+          add(javaCommon('KEEP', 'private enum constructor — no enum constant invokes this constructor, but the constructor is the wrong deletion unit for an enum; delete the constant, or the enum, instead'));
+          return;
+        }
+        // Private constructor of a utility class (FJ-2): every member
+        // of the class is static, so the constructor is an
+        // instantiation guard, not dead code. A constructor actually
+        // called from live code is live and gets no finding — this rule
+        // only fires for uncalled ones.
+        if (def.isConstructor && def.className && javaCtx && javaCtx.javaUtilityClasses && javaCtx.javaUtilityClasses.has(def.className)
+          && (!javaCtx.javaArityIsLive || !javaCtx.javaArityIsLive(def))) {
+          add(javaCommon('KEEP', 'private constructor of utility class ' + def.className + ' — every member is static, so the constructor is an instantiation guard, not dead code; deleting it would expose a public default constructor'));
+          return;
+        }
+        // Enclosing-class framework stereotype: the hardcoded core set
+        // plus the Spring and Jackson/JPA pack lists (see
+        // JAVA_FRAMEWORK_CLASS_ANNOTATIONS above).
+        var fwClassAnn = null;
+        (def.classAnnotations || []).forEach(function (a) {
+          if (!fwClassAnn && JAVA_FRAMEWORK_CLASS_ANNOTATIONS.has(a)) fwClassAnn = a;
+        });
+        if (fwClassAnn) {
+          add(javaCommon('REVIEW', 'enclosing class is annotated @' + fwClassAnn + ' — the framework may invoke this member'));
+          return;
+        }
+        if (def.stringMention) {
+          add(javaCommon('REVIEW', 'referenced by name in a string literal in this file — possible reflective use'));
+          return;
+        }
+        if (stringElsewhere.length > 0) {
+          add(javaCommon('REVIEW', '0 callers, but referenced by name as a string elsewhere'));
+          return;
+        }
+        if (def.kind === 'variable') {
+          if ((def.writeCount || 0) > 0) {
+            add(javaCommon('REVIEW', 'private field written but never read — deleting the declaration would leave the assignments behind'));
+            return;
+          }
+          add(javaCommon('SAFE', 'private field, never read or written, 0 string mentions'));
+          return;
+        }
+        // Private method / constructor: arity-aware liveness.
+        if (!javaCtx || !javaCtx.javaArityIsLive) {
+          add(javaCommon('REVIEW', 'private method with 0 name-based callers, but arity data is unavailable (stale parse) — cannot prove safe'));
+          return;
+        }
+        if (javaCtx.javaArityIsLive(def)) return; // called from live code: no finding
+        add(javaCommon('SAFE', def.isConstructor ? 'private constructor, never called with this arity, 0 string mentions' : 'private method, no live callers by (name, arity), 0 string mentions'));
         return;
       }
       if (stringElsewhere.length > 0) {
@@ -2774,7 +3410,9 @@ function analyzeFiles(inputFiles, options) {
           var impGrade = isTest ? 'KEEP' : imp.inTryExcept ? 'REVIEW' : 'SAFE';
           add({
             category: 'import', file: rel, symbol: n.local, grade: impGrade,
-            startLine: 1, endLine: null, size: 0,
+            startLine: imp.range ? imp.range.startLine : 1,
+            endLine: imp.range ? imp.range.endLine : null,
+            size: imp.range ? imp.range.endIndex - imp.range.startIndex : 0,
             reason: isTest ? 'unused import in a test file (kept)' : imp.inTryExcept ? 'imported "' + n.imported + '" from "' + fromSource + '" inside try/except but never referenced — the import itself may be the availability probe' : 'imported "' + n.imported + '" from "' + fromSource + '" but never referenced in this file',
             evidence: { importers: 0, callers: 0, stringRefs: [], exported: false },
             deleteDiff: 'remove "' + n.local + '" from import of "' + fromSource + '" in ' + rel,
@@ -2850,6 +3488,6 @@ function analyzeFiles(inputFiles, options) {
   };
 }
 
-return { analyzeFiles: analyzeFiles, parseJs: parseJs, parsePy: parsePy };
+return { analyzeFiles: analyzeFiles, analyzeFilesAsync: analyzeFilesAsync, parseJs: parseJs, parsePy: parsePy, javaFrameworkClassAnnotations: JAVA_FRAMEWORK_CLASS_ANNOTATIONS, javaSerializationCallbacks: JAVA_SERIALIZATION_CALLBACKS, javaPackKeepExports: JAVA_PACK_KEEP_EXPORTS, javaPackKeepNames: JAVA_PACK_KEEP_NAMES, javaPackKeepDecoratorsList: JAVA_PACK_KEEP_DECORATORS_LIST };
 
 });

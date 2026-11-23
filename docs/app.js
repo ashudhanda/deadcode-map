@@ -19,8 +19,8 @@
   var MAX_FILE_BYTES = 200 * 1024;
   var MAX_TEXT_FILES = 100;
   var MAX_TEXT_BYTES = 1024 * 1024;
-  var CODE_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py'];
-  var TEXT_EXTS = ['.json', '.md', '.txt', '.yaml', '.yml', '.toml', '.html', '.css', '.vue'];
+  var CODE_EXTS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.java'];
+  var TEXT_EXTS = ['.json', '.md', '.txt', '.yaml', '.yml', '.toml', '.html', '.css', '.vue', '.xml', '.properties'];
   var CONCURRENCY = 10;
 
   var repoInput = document.getElementById('repo-url');
@@ -292,7 +292,8 @@
       }
 
       setStatus('Analyzing…');
-      var report = window.DeadcodeMap.analyzeFiles(files, { includeFixtures: includeFixturesInput && includeFixturesInput.checked });
+      var report = await window.DeadcodeMap.analyzeFilesAsync(files, { includeFixtures: includeFixturesInput && includeFixturesInput.checked });
+      if (report.javaSkipped) warnings.push('Java files were skipped (' + (report.javaSkipReason || 'parser unavailable') + ') — use the CLI for Java');
       setStatus('');
       renderResults(report, repo, warnings);
       setStatus('Done.');

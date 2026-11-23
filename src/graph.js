@@ -695,7 +695,17 @@ function analyze(root, discovery) {
     const importedHere = new Set();
     for (const imp of ginfo.parsed.imports || []) for (const n of imp.names || []) importedHere.add(n.local);
     for (const call of ginfo.parsed.calls || []) {
-      const name = call.name;
+      // A `new X()` in a classic script constructs the global X: the
+      // parser records it as a `constructor` call with the constructed
+      // name in `forClass` (the member-access base — `new ns.X()`
+      // builds X), so the global lookup must use forClass, not the
+      // literal call name `constructor`. Without this, vuejs/vue's
+      // `new MemoryStats()` in the classic script
+      // benchmarks/dbmon/lib/monitor.js never rescued the global
+      // MemoryStats defined in benchmarks/dbmon/lib/memory-stats.js.
+      // A plain call to a function literally named `constructor` has
+      // no forClass, so it still resolves under its own name.
+      const name = call.name === 'constructor' && call.forClass ? call.forClass : call.name;
       if (definedHere.has(name) || importedHere.has(name)) continue;
       const defFile = globalDefs.get(name);
       if (!defFile || defFile === g) continue;

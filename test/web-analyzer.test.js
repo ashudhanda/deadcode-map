@@ -1727,12 +1727,33 @@ test('web js-global-scripts: classic-script globals called from other classic sc
   assert.equal(bySymbol(f, 'core.js', 'deadGlobal').grade, 'SAFE');
   assert.equal(bySymbol(f, 'core.js', 'clash').grade, 'SAFE');
   assert.equal(bySymbol(f, 'widget.js', 'clash').grade, 'SAFE');
+  // A global constructed with `new` from another classic script is
+  // live too: `new MemoryStats()` in use-stats.js constructs the
+  // global defined in stats.js (vuejs/vue dbmon: monitor.js builds
+  // `new MemoryStats()` from memory-stats.js). A constructor nothing
+  // builds stays SAFE.
+  assert.equal(bySymbol(f, 'stats.js', 'MemoryStats'), undefined, 'MemoryStats is constructed from use-stats.js and must not be flagged');
+  assert.equal(bySymbol(f, 'stats.js', 'DeadStats').grade, 'SAFE');
   const safe = f.filter((x) => x.grade === 'SAFE');
   assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
     'function:core.js:deadGlobal',
     'function:core.js:clash',
     'function:widget.js:clash',
+    'function:stats.js:DeadStats',
   ]));
+});
+
+test('web js-jsdoc-link: an import used only in a JSDoc {@link} is live', () => {
+  const f = loadFixture('js-jsdoc-link').findings;
+  // Same rule as the CLI: a {@link} / {@linkcode} target is a real
+  // reference to the imported type (vuejs/vue types/options.d.ts).
+  for (const symbol of ['ObjectDirective', 'FunctionDirective']) {
+    assert.equal(bySymbol(f, 'src/options.ts', symbol), undefined, `${symbol} is linked from JSDoc and must not be flagged`);
+  }
+  // The genuinely dead imports are still found: one never mentioned
+  // at all, and one mentioned only in a prose comment sentence.
+  assert.equal(bySymbol(f, 'src/options.ts', 'UnusedDirective').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/options.ts', 'PlainMention').grade, 'SAFE');
 });
 
 test('web py-unittest: __unittest module attribute is KEEP, never SAFE', () => {
@@ -1761,4 +1782,246 @@ test('web py-conditional-import: an import shadowed by a same-file definition is
   assert.equal(bySymbol(f, 'shim.py', 'deepcopy').grade, 'SAFE');
   const safe = f.filter((x) => x.grade === 'SAFE');
   assert.ok(!safe.some((s) => s.category === 'import' && s.file === 'shim.py' && s.symbol === 'replace'), 'replace must never be SAFE');
+});
+
+/* ------------------------------------------------------------------ */
+/* Java support (tree-sitter WASM, docs/parse-java-web.js)             */
+/* ------------------------------------------------------------------ */
+
+const { analyzeFilesAsync, javaFrameworkClassAnnotations } = require('../docs/analyzer');
+const { parseJava } = require('../src/parse-java');
+const javaWeb = require('../docs/parse-java-web');
+
+function loadFixtureAsync(dir, options) {
+  const base = path.join(ROOT, 'fixtures', dir);
+  const files = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile()) files.push({ path: path.relative(base, full).split(path.sep).join('/'), content: fs.readFileSync(full, 'utf8') });
+    }
+  })(base);
+  return analyzeFilesAsync(files, options);
+}
+
+// The CLI's javaSafe:true findings for the Java fixtures, derived from
+// src/index scan (see the batch-10 work notes). The web checker IS the
+// opted-in surface, so it must match these exactly — same findings,
+// same grades, same SAFE sets. The counts below are the CLI's own:
+// java-basic 65 (16 SAFE / 36 REVIEW / 13 KEEP), arity 13 (2 / 11 / 0),
+// policy 35 (7 / 20 / 8).
+const JAVA_FIXTURE_EXPECTATIONS = {
+  'java-basic': { total: 65, safe: 16, review: 36, keep: 13, safeKeys: new Set([
+    'import:src/main/java/com/example/BasicService.java:Map',
+    'import:src/main/java/com/example/BasicService.java:PI',
+    'method:src/main/java/com/example/BasicService.java:constructor',
+    'method:src/main/java/com/example/BasicService.java:deadMethod',
+    'method:src/main/java/com/example/BasicService.java:documentedDead',
+    'method:src/main/java/com/example/BasicService.java:format',
+    'method:src/main/java/com/example/BasicService.java:privateStaticDead',
+    'method:src/main/java/com/example/BasicService.java:recursiveMethod',
+    'method:src/main/java/com/example/Modern.java:joinDead',
+    'unreachable:src/main/java/com/example/BasicService.java',
+    'variable:src/main/java/com/example/BasicService.java:deadCounter',
+    'variable:src/main/java/com/example/BasicService.java:mixedDead',
+    'variable:src/main/java/com/example/BasicService.java:multiA',
+    'variable:src/main/java/com/example/BasicService.java:multiB',
+    'variable:src/main/java/com/example/BasicService.java:unusedLabel',
+    'variable:src/main/java/com/example/BasicService.java:unusedLocal',
+  ]) },
+  'java-batch10-arity': { total: 13, safe: 2, review: 11, keep: 0, safeKeys: new Set([
+    'method:src/ArityComments.java:neverCalled',
+    'method:src/CommentedArgs.java:constructor',
+  ]) },
+  'java-batch10-policy': { total: 35, safe: 7, review: 20, keep: 8, safeKeys: new Set([
+    'method:src/NonUtilityCtor.java:constructor',
+    'method:src/SerializationCallbacks.java:readObject',
+    'method:src/SerializationCallbacks.java:writeReplace',
+    'method:src/SideEffectLocals.java:constructor',
+    'method:src/UtilityClass.java:helper',
+    'variable:src/SideEffectLocals.java:deferred',
+    'variable:src/SideEffectLocals.java:pure',
+  ]) },
+};
+
+for (const [dir, expected] of Object.entries(JAVA_FIXTURE_EXPECTATIONS)) {
+  test(`web ${dir}: analyzeFilesAsync matches the CLI (javaSafe:true) exactly`, async () => {
+    const r = await loadFixtureAsync(dir);
+    assert.equal(r.javaSkipped, false, 'the wasm parser must load for the fixture');
+    assert.equal(r.summary.total, expected.total, `expected ${expected.total} findings, got ${r.summary.total}`);
+    assert.equal(r.summary.safe, expected.safe, `expected ${expected.safe} SAFE, got ${r.summary.safe}`);
+    assert.equal(r.summary.review, expected.review, `expected ${expected.review} REVIEW, got ${r.summary.review}`);
+    assert.equal(r.summary.keep, expected.keep, `expected ${expected.keep} KEEP, got ${r.summary.keep}`);
+    const safe = r.findings.filter((x) => x.grade === 'SAFE');
+    assert.equal(safe.length, expected.safeKeys.size, `expected ${expected.safeKeys.size} SAFE findings, got ${safe.length}: ${JSON.stringify(safe.map((s) => `${s.category}:${s.file}:${s.symbol || ''}`))}`);
+    for (const s of safe) {
+      const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+      assert.ok(expected.safeKeys.has(key), `unexpected SAFE finding (false positive): ${key}`);
+    }
+  });
+}
+
+test('web java: the web parser matches the CLI parser on every Java fixture', async () => {
+  await javaWeb.initJava();
+  // The vendored web traversal must not drift from src/parse-java.js:
+  // this is the CI guard for checklist item 4 — a drift fails a test
+  // instead of shipping a false SAFE. Compares the full
+  // grading-relevant shape (definitions with every field the
+  // confidence engine reads, references, calls, imports, strings,
+  // unreachable, uses / usesArity, topLevelUses / topLevelUsesArity,
+  // hasErrors, readCount / writeCount, stringMention).
+  function normalise(r) {
+    const def = (d) => {
+      const o = {};
+      for (const k of Object.keys(d).sort()) o[k] = d[k];
+      if (Array.isArray(o.uses)) o.uses = [...o.uses].sort();
+      if (Array.isArray(o.usesArity)) o.usesArity = [...o.usesArity].sort();
+      if (Array.isArray(o.annotations)) o.annotations = [...o.annotations].sort();
+      if (Array.isArray(o.classAnnotations)) o.classAnnotations = [...o.classAnnotations].sort();
+      if (Array.isArray(o.decorators)) o.decorators = [...o.decorators].sort();
+      return o;
+    };
+    return {
+      language: r.language, hasErrors: r.hasErrors, imports: r.imports,
+      definitions: r.definitions.map(def), references: [...r.references].sort(),
+      calls: r.calls, strings: r.strings, unreachable: r.unreachable,
+      decorators: [...r.decorators].sort(), topLevelUses: r.topLevelUses,
+      topLevelUsesArity: r.topLevelUsesArity, dynamic: r.dynamic,
+    };
+  }
+  const files = [];
+  for (const dir of ['java-basic', 'java-batch10-arity', 'java-batch10-policy', 'java-batch9-fj7']) {
+    const base = path.join(ROOT, 'fixtures', dir);
+    (function walk(d) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (full.endsWith('.java')) files.push(full);
+      }
+    })(base);
+  }
+  assert.ok(files.length > 0, 'Java fixture files must exist');
+  let totalDefs = 0;
+  for (const f of files) {
+    const src = fs.readFileSync(f, 'utf8');
+    const cli = normalise(parseJava(f, src));
+    const web = normalise(javaWeb.parseJavaWeb(f, src));
+    totalDefs += cli.definitions.length;
+    assert.deepEqual(web, cli, `web parse must match CLI parse for ${path.relative(ROOT, f)}`);
+  }
+  assert.ok(totalDefs > 200, `expected 200+ definitions across the Java fixtures, got ${totalDefs}`);
+});
+
+test('web java: a broken Java file yields no findings', async () => {
+  const broken = 'package broken;\npublic class Broken {\n  private void dead() {\n    int x = ;\n  }\n  private int alsoDead;\n}\n';
+  const r = await analyzeFilesAsync([{ path: 'Broken.java', content: broken }]);
+  assert.equal(r.javaSkipped, false, 'the parser loaded — the file itself is broken, not the parser');
+  assert.equal(r.findings.length, 0, `a broken file must yield no findings at all, got: ${JSON.stringify(r.findings.map((x) => `${x.file}:${x.symbol || ''}`))}`);
+});
+
+test('web java: an import used only by an annotation is live, never SAFE', async () => {
+  const r = await analyzeFilesAsync([{ path: 'Ann.java', content: `package com.example;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class Ann {
+  @JsonProperty("label")
+  private String labelled() {
+    return "x";
+  }
+
+  private void deadPlain() {
+  }
+}
+` }]);
+  assert.equal(r.javaSkipped, false);
+  assert.equal(bySymbol(r.findings, 'Ann.java', 'JsonProperty'), undefined, 'an import used only by an annotation must not be flagged');
+  assert.equal(bySymbol(r.findings, 'Ann.java', 'labelled').grade, 'KEEP');
+  assert.equal(bySymbol(r.findings, 'Ann.java', 'deadPlain').grade, 'SAFE');
+});
+
+test('web java: no wasm available degrades to skipped-Java (no SAFE)', async () => {
+  const r = await loadFixtureAsync('java-basic', { javaInit: false });
+  assert.equal(r.javaSkipped, true, 'javaInit:false must report Java as skipped');
+  assert.ok(r.javaSkipReason.length > 0, 'the skip reason must be recorded for the UI');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0,
+    `degraded mode must find 0 SAFE, got: ${JSON.stringify(r.findings.filter((x) => x.grade === 'SAFE').map((x) => `${x.file}:${x.symbol || ''}`))}`);
+  assert.equal(r.findings.filter((x) => x.file.endsWith('.java')).length, 0,
+    'degraded mode must emit no findings for Java files at all');
+});
+
+test('web java: the sync analyzer still skips Java files (back-compat)', () => {
+  const r = analyzeFiles([
+    { path: 'A.java', content: 'public class A {\n  private void dead() {}\n}\n' },
+    { path: 'b.js', content: 'function deadJs() { return 1; }\n' },
+  ]);
+  assert.equal(r.javaSkipped, true, 'sync analyzeFiles must report Java as skipped');
+  assert.equal(r.findings.filter((x) => x.file.endsWith('.java')).length, 0, 'sync analyzeFiles must emit no Java findings');
+  assert.equal(bySymbol(r.findings, 'b.js', 'deadJs').grade, 'SAFE', 'JS grading is unchanged by the Java skip');
+});
+
+test('web java: framework stereotype lists match the packs', () => {
+  // docs/analyzer.js inlines the union of the hardcoded fallback in
+  // src/parse-java.js FRAMEWORK_CLASS_ANNOTATIONS plus the
+  // keepClassAnnotations of frameworks/spring.json and
+  // frameworks/jackson-jpa.json. If a pack gains a stereotype, this
+  // test fails until the inline list is regenerated.
+  const packs = ['spring.json', 'jackson-jpa.json'];
+  for (const file of packs) {
+    const pack = JSON.parse(fs.readFileSync(path.join(ROOT, 'frameworks', file), 'utf8'));
+    for (const ann of pack.keepClassAnnotations || []) {
+      assert.ok(javaFrameworkClassAnnotations.has(ann), `keepClassAnnotations entry ${ann} from ${file} must be in the web stereotype set`);
+    }
+  }
+  for (const ann of javaWeb.FRAMEWORK_CLASS_ANNOTATIONS) {
+    assert.ok(javaFrameworkClassAnnotations.has(ann), `hardcoded stereotype ${ann} from parse-java-web.js must be in the web stereotype set`);
+  }
+});
+
+test('web java: framework pack data matches frameworks/*.json', () => {
+  // The keepExports / keepNames / keepDecorators maps inlined in
+  // docs/analyzer.js must be the union of every pack, first pack in
+  // filename order winning a key — rebuild them here and compare.
+  const analyzer = require('../docs/analyzer');
+  const expectedExports = Object.create(null);
+  const expectedNames = Object.create(null);
+  const expectedDecorators = [];
+  const seenDecorators = new Set();
+  for (const file of fs.readdirSync(path.join(ROOT, 'frameworks')).sort()) {
+    if (!file.endsWith('.json')) continue;
+    const pack = JSON.parse(fs.readFileSync(path.join(ROOT, 'frameworks', file), 'utf8'));
+    for (const n of pack.keepExports || []) if (!expectedExports[n]) expectedExports[n] = file;
+    for (const n of pack.keepNames || []) if (!expectedNames[n]) expectedNames[n] = file;
+    for (const d of pack.keepDecorators || []) {
+      if (!seenDecorators.has(d)) { seenDecorators.add(d); expectedDecorators.push([d, file]); }
+    }
+  }
+  assert.deepEqual(analyzer.javaPackKeepExports, expectedExports, 'keepExports map must match the packs');
+  assert.deepEqual(analyzer.javaPackKeepNames, expectedNames, 'keepNames map must match the packs');
+  assert.deepEqual(analyzer.javaPackKeepDecoratorsList, expectedDecorators, 'keepDecorators list must match the packs in CLI iteration order');
+});
+
+test('web manual-script: symbols under scripts/ or tools/ are KEEP, never SAFE', async () => {
+  // Mirrors isManualScriptPath in src/discover.js: a file under a
+  // scripts/ or tools/ directory is a manually-run tool the operator
+  // invokes by hand, so its symbols cannot be proven dead. The
+  // junit5 bench surfaced this: the CLI KEEPs 79 symbols under
+  // documentation/src/tools/java/, while the web emitted nothing.
+  const r = await analyzeFilesAsync([
+    { path: 'tools/audit.js', content: 'function auditAll() { return 1; }\n' },
+    { path: 'scripts/seed.py', content: 'def seed_all():\n    return 1\n' },
+    { path: 'documentation/src/tools/java/Report.java', content: 'public class Report {\n  private void deadHelper() {\n  }\n}\n' },
+    // A dead file under scripts/ is an entry point, never a dead file.
+    { path: '.github/scripts/release.js', content: 'function release() { return 1; }\n' },
+  ]);
+  assert.equal(r.javaSkipped, false);
+  assert.equal(bySymbol(r.findings, 'tools/audit.js', 'auditAll').grade, 'KEEP');
+  assert.equal(bySymbol(r.findings, 'scripts/seed.py', 'seed_all').grade, 'KEEP');
+  const javaKeep = bySymbol(r.findings, 'documentation/src/tools/java/Report.java', 'deadHelper');
+  assert.equal(javaKeep.grade, 'KEEP', 'a private dead method in a tools/ Java file is KEEP, not SAFE');
+  assert.ok(javaKeep.reason.indexOf('manually-run script') >= 0, `reason must name the manual-script rule, got: ${javaKeep.reason}`);
+  assert.equal(r.findings.filter((x) => x.category === 'file' && x.file === '.github/scripts/release.js').length, 0,
+    'a script under scripts/ is an entry point, never a dead file');
+  assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0, 'no SAFE may come out of a manual-script file');
 });

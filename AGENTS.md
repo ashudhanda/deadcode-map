@@ -49,7 +49,7 @@ node bin/deadcode-map.js .
 
 It must report **0 findings**. If your change introduces a finding, fix the
 code (or the analyzer) — do not add a baseline to hide it. With
-`--include-fixtures` the planted fixture data still reports (292 findings,
+`--include-fixtures` the planted fixture data still reports (380 findings,
 0 in `src/`); that is expected.
 
 ## Rules for changes
@@ -62,6 +62,18 @@ code (or the analyzer) — do not add a baseline to hide it. With
   found at SAFE or REVIEW. `npm test` enforces this.
 - `--fix` and `fix_safe` are SAFE-only, always. Never widen them to REVIEW
   without an explicit user request, and never silently.
+- Java policy (batch 10, see README "Java scope"): a private
+  constructor of an all-static utility class is KEEP — it is an
+  instantiation guard, not dead code (deleting it exposes a public
+  default constructor). A private enum constructor no constant
+  invokes is KEEP (the constructor is the wrong deletion unit for
+  an enum); one the constants do invoke is live and gets no finding.
+  Private Java serialization callbacks (`readObject` / `writeObject`
+  arity 1, `readObjectNoData` / `readResolve` / `writeReplace` arity
+  0) are KEEP — the runtime invokes them by reflection. An unused
+  local whose initializer calls a method or creates an object is
+  REVIEW, never SAFE — the call may have side effects; a pure unused
+  local (`int x = 1;`) stays SAFE.
 - The HTML map must stay single-file and offline: no CDN, no external scripts.
 - Do not break existing CLI flags or exit codes (0 ok, 1 `--fail-on`
   triggered, 2 usage error / no such directory).

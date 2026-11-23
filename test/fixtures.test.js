@@ -351,6 +351,33 @@ test('ts-types: references in type positions count as uses', () => {
   }
 });
 
+test('js-jsdoc-link: an import used only in a JSDoc {@link} is live', () => {
+  const f = findingsFor('js-jsdoc-link');
+  // ObjectDirective / FunctionDirective are referenced only in JSDoc
+  // doc links (`@deprecated use {@link FunctionDirective} instead`,
+  // `{@linkcode ObjectDirective}`) — TypeScript resolves the link
+  // target, so the imports are used, not dead (vuejs/vue
+  // types/options.d.ts imports them exactly this way).
+  for (const symbol of ['ObjectDirective', 'FunctionDirective']) {
+    assert.equal(bySymbol(f, 'src/options.ts', symbol), undefined, `${symbol} is linked from JSDoc and must not be flagged`);
+  }
+  // The genuinely dead imports are still found: one never mentioned
+  // at all, and one mentioned only in a prose comment sentence — a
+  // bare word in prose is not a {@link}, so it stays flaggable.
+  assert.equal(bySymbol(f, 'src/options.ts', 'UnusedDirective').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/options.ts', 'UnusedDirective').category, 'import');
+  assert.equal(bySymbol(f, 'src/options.ts', 'PlainMention').grade, 'SAFE');
+  assert.equal(bySymbol(f, 'src/options.ts', 'PlainMention').category, 'import');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:src/options.ts:UnusedDirective', 'import:src/options.ts:PlainMention',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+});
+
 test('py-annotations: string annotations, TYPE_CHECKING and __all__ count as uses', () => {
   const f = findingsFor('py-annotations');
   // TYPE_CHECKING imports used only in string annotations.
@@ -1088,11 +1115,19 @@ test('js-global-scripts: globals called from other classic scripts are live (Dja
   assert.equal(bySymbol(f, 'core.js', 'deadGlobal').grade, 'SAFE');
   assert.equal(bySymbol(f, 'core.js', 'clash').grade, 'SAFE');
   assert.equal(bySymbol(f, 'widget.js', 'clash').grade, 'SAFE');
+  // A global constructed with `new` from another classic script is
+  // live too: `new MemoryStats()` in use-stats.js constructs the
+  // global defined in stats.js (vuejs/vue dbmon: monitor.js builds
+  // `new MemoryStats()` from memory-stats.js). A constructor nothing
+  // builds stays SAFE.
+  assert.equal(bySymbol(f, 'stats.js', 'MemoryStats'), undefined, 'MemoryStats is constructed from use-stats.js and must not be flagged');
+  assert.equal(bySymbol(f, 'stats.js', 'DeadStats').grade, 'SAFE');
   const safe = f.filter((x) => x.grade === 'SAFE');
   assert.deepEqual(new Set(safe.map((s) => `${s.category}:${s.file}:${s.symbol}`)), new Set([
     'function:core.js:deadGlobal',
     'function:core.js:clash',
     'function:widget.js:clash',
+    'function:stats.js:DeadStats',
   ]));
 });
 

@@ -23,6 +23,21 @@ const { coverageForSymbol, coverageForSymbolBody } = require('./coverage');
 const { isManualScriptPath } = require('./discover');
 const { FRAMEWORK_CLASS_ANNOTATIONS } = require('./parse-java');
 
+// Java serialization callbacks (FJ-4): private methods the
+// serialization runtime invokes by reflection — ObjectInputStream /
+// ObjectOutputStream call them, never in-repo code (Java Object
+// Serialization Specification, stream protocol). The (name, arity)
+// pair IS the contract: readObject / writeObject take the stream (1),
+// readObjectNoData / readResolve / writeReplace take none (0). A
+// same-named method with another arity is an ordinary method and
+// grades normally. A class need not declare `implements
+// Serializable` itself: the contract is inherited (java.lang.Number
+// is Serializable, so a Number subclass's readObject is a callback).
+const JAVA_SERIALIZATION_CALLBACKS = {
+  readObject: 1, writeObject: 1,
+  readObjectNoData: 0, readResolve: 0, writeReplace: 0,
+};
+
 function loadFrameworks(dir) {
   const packs = [];
   if (!fs.existsSync(dir)) return packs;
@@ -318,6 +333,25 @@ function gradeFindings(ctx) {
     const rel = info.rel;
     if (info.parseError) continue; // never flag what we could not parse
     const parsed = info.parsed;
+    // Java utility classes (FJ-2, batch 10): a class whose direct
+    // members are all static — no instance fields, no instance
+    // methods. Members of nested or anonymous classes do not count
+    // (their className is the nested class, or anonymousClass is
+    // set), and constructors do not count (they are never static).
+    // A stale parse without the `static` / `anonymousClass` fields
+    // fails open: undefined static reads as an instance member, so
+    // the class is not treated as a utility class.
+    let javaUtilityClasses = null;
+    if (parsed.language === 'java') {
+      const hasInstanceMember = new Map(); // className -> boolean
+      for (const d of parsed.definitions) {
+        if (!d.className || d.anonymousClass) continue;
+        if (d.kind === 'method' && !d.isConstructor && d.static !== true) hasInstanceMember.set(d.className, true);
+        if (d.kind === 'variable' && !d.local && d.static !== true) hasInstanceMember.set(d.className, true);
+        if (!hasInstanceMember.has(d.className)) hasInstanceMember.set(d.className, false);
+      }
+      javaUtilityClasses = new Set([...hasInstanceMember.entries()].filter(([, v]) => !v).map(([k]) => k));
+    }
     const gitInfo = git.info.get(file);
     const covFile = coverage ? coverage.get(path.resolve(file)) : null;
     const isEntry = discovery.entries.has(file);
@@ -1021,6 +1055,20 @@ function gradeFindings(ctx) {
             add({ ...common, grade: 'REVIEW', reason: 'local variable assigned but never read — deleting the declaration would leave the assignments behind' });
             continue;
           }
+          // A load-bearing unused local (FJ-3): the initializer calls
+          // a method or creates an object, so the declaration does
+          // work even though the value is never read — advancing a
+          // reader (JsonReader.nextName), validating input (new
+          // SimpleDateFormat(pattern) throws on a bad pattern), or
+          // running the measured work of a benchmark (gson.fromJson).
+          // Deleting the declaration would remove that call. REVIEW,
+          // never SAFE: a human decides whether the call matters.
+          // A pure initializer (a literal, a name, arithmetic) stays
+          // SAFE below.
+          if (def.initHasEffect) {
+            add({ ...common, grade: 'REVIEW', reason: 'unused local variable, but its initializer calls a method or creates an object — the call may have side effects, so deleting the declaration would remove the call' });
+            continue;
+          }
           add(withCascade({ ...common, grade: javaGrade('java', 'SAFE'), reason: javaSafeReason('unused local variable — never read or written') }));
           continue;
         }
@@ -1047,6 +1095,41 @@ function gradeFindings(ctx) {
         }
         if (def.name === 'serialVersionUID') {
           add({ ...common, grade: 'KEEP', reason: 'serialVersionUID — read by Java serialization, never auto-deleted' });
+          continue;
+        }
+        // Java serialization callbacks (FJ-4): private methods the
+        // serialization runtime invokes by reflection. The (name,
+        // arity) pair is the contract — see
+        // JAVA_SERIALIZATION_CALLBACKS above.
+        if (def.kind === 'method' && !def.isConstructor && JAVA_SERIALIZATION_CALLBACKS[def.name] === def.arity) {
+          add({ ...common, grade: 'KEEP', reason: `private ${def.name} — Java serialization callback, invoked by the serialization runtime via reflection, never called from source` });
+          continue;
+        }
+        // Private enum constructor (FJ-2b): an enum's constants
+        // invoke its constructor at class-load time, and the call
+        // graph records that (batch 10: enum_constant nodes are
+        // constructor calls), so an invoked constructor is live and
+        // gets no finding — this rule only fires for a constructor
+        // no constant invokes, and even then it is KEEP, never SAFE:
+        // the constructor is the wrong deletion unit for an enum;
+        // delete the constant, or the enum, instead.
+        if (def.isConstructor && def.classKind === 'enum_declaration'
+          && (!javaArityIsLive || !javaArityIsLive(def))) {
+          add({ ...common, grade: 'KEEP', reason: 'private enum constructor — no enum constant invokes this constructor, but the constructor is the wrong deletion unit for an enum; delete the constant, or the enum, instead' });
+          continue;
+        }
+        // Private constructor of a utility class (FJ-2): every
+        // member of the class is static, so the constructor is an
+        // instantiation guard, not dead code — its purpose is
+        // precisely to be uncallable. Deleting it would expose a
+        // public default constructor and change the class's API
+        // (and trip Error Prone's PrivateConstructorForUtilityClass
+        // check). See README "Java scope" for the policy. A
+        // constructor actually called from live code is live and
+        // gets no finding — this rule only fires for uncalled ones.
+        if (def.isConstructor && def.className && javaUtilityClasses && javaUtilityClasses.has(def.className)
+          && (!javaArityIsLive || !javaArityIsLive(def))) {
+          add({ ...common, grade: 'KEEP', reason: `private constructor of utility class ${def.className} — every member is static, so the constructor is an instantiation guard, not dead code; deleting it would expose a public default constructor` });
           continue;
         }
         // The enclosing-class stereotype check is data-driven as well as

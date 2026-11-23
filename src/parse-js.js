@@ -502,6 +502,21 @@ function parseJsTs(filePath, src, ext) {
       if (!isPropertyDefinitionSite(node)) addRef(text(node, src), node);
     } else if (node.type === 'jsx_identifier' || node.type === 'jsx_namespace_name') {
       addRef(text(node, src), node);
+    } else if (node.type === 'comment') {
+      // JSDoc {@link X} / {@linkcode X} / {@linkplain X} is a real
+      // reference to X: TypeScript resolves the link target, so an
+      // import used only in a doc link is used, not dead (vuejs/vue
+      // types/options.d.ts imports ObjectDirective / FunctionDirective
+      // only for `@deprecated use {@link FunctionDirective} instead`).
+      // Only imported bindings get the credit (same rule as the
+      // JSX-pragma credit below): a doc mention of a local name must
+      // not resurrect a dead local definition, and a {@link} to a
+      // name this file never imports changes nothing. A bare word in
+      // prose is not a link — only the {@link...} form counts, so a
+      // type merely mentioned in a comment sentence stays flaggable.
+      for (const m of text(node, src).matchAll(/\{@link(?:code|plain)?\s+([A-Za-z_$][\w$]*)/g)) {
+        if (importLocals.has(m[1])) addRef(m[1], node);
+      }
     } else if (node.type === 'shorthand_property_identifier') {
       // { graph, findings } in an object literal IS a use of those variables.
       // Except in `module.exports = { foo }`, where it is an export, not a use.

@@ -391,6 +391,60 @@ is 9/15 (the other 9 overlap CLI SAFE and are verified true). The
 batch-2 claim above that web-only SAFE is 0 is superseded by this
 measurement.
 
+### Batch 10 update (2026-11-23)
+
+Java precision is fixed. Batch 8 measured gson 0/64 SAFE true and
+junit5 1/589 — 0.3% overall — and batch 9 gated Java SAFE off by
+default and fixed the liveness bugs (FJ-7 same-file callers, FJ-9
+field reads, FJ-1 Javadoc links, FJ-8 package-info annotations).
+Batch 10 finished the job: a parser bug that counted `//` comments
+as call arguments (junit5's `validateDelimiter/3` recorded as /7),
+enum-constant constructor invocations (gson FJ-6), and the three
+judgment families — FJ-2 utility-class private constructors are
+KEEP (instantiation guards, never dead), FJ-3 load-bearing unused
+locals are REVIEW (their initializer calls a method or creates an
+object), FJ-4 serialization callbacks are KEEP by (name, arity).
+Measured with `--java-safe` on the same clones:
+
+| Repo | SAFE batch 8 | SAFE batch 9 | SAFE batch 10 | SAFE precision batch 10 |
+|---|---|---|---|---|
+| google/gson | 64 | 40 | 0 | — (zero false positives) |
+| junit-team/junit5 | 589 | 3 | 1 | 1/1 true (`SETTINGS_GRADLE`) |
+| **Combined** | **653** | **43** | **1** | **100% on remaining SAFE** |
+
+The default gate stays: Java SAFE is still off unless `--java-safe`
+is passed, so `--fix` can never delete Java code on a default scan.
+The gate is now a safety default, not a precision workaround — but
+it stays until more Java repos are measured, since two repos are not
+proof of generality.
+
+JS-side, batch 10 cut vue2 CLI SAFE 4 → 1 (JSDoc `{@link}` imports
+are live; `new X()` rescues classic-script globals) — the one
+remaining SAFE (`Data` in `types/v3-define-component.d.ts`) is
+verified true. Web-only SAFE stays 0.
+
+Java also landed in the web checker (batch 10): `docs/parse-java-web.js`
+ports `src/parse-java.js` (same traversal, diffed against the CLI
+parser in the test suite) and parses `.java` files with vendored
+tree-sitter WASM — web-tree-sitter 0.22.5 and tree-sitter-java
+0.23.5 under `docs/vendor/` (~662 KB, lazy-loaded only when a
+`.java` file is present; load failure skips Java with a warning,
+never regex-parses). The web is the opted-in surface, so it grades
+Java exactly like the CLI with `--java-safe`: gson 7,517 findings
+(0 SAFE) and junit5 23,796 findings (1 SAFE) are identical to the
+CLI output, finding-for-finding, web-only SAFE 0. Two gaps the
+integration closed along the way also fixed pre-existing web gaps
+for all languages: framework-pack keeps (`@Service` / `@Entity`
+classes) and the manual-script rule (`scripts/` / `tools/` files
+are entries).
+
+Corpus re-verified at batch 10 (`bench10-latest/`, default settings):
+gson 0, junit5 0, vue2 1, flask-sqlalchemy 0, axios 0, typer 4,
+umami 36 — 41 SAFE total, all previously hand-judged TRUE. Full
+suite: 278 tests (277 pass, 1 skipped — the javac test, javac not
+installed here). Dogfood 0 findings; `--include-fixtures` 380
+findings, 0 in `src/`.
+
 Old corpus (10 repos + 3 diagnosis repos) re-measured at batch 7:
 SAFE 45 → 42, with zero findings lost and zero new SAFE. The 3
 changes are all SAFE → REVIEW demotions of exported TypeAlias /
@@ -416,19 +470,25 @@ cannot meet the "never a SAFE the CLI would not" bar (no scopes, no
 arity channel, field read-vs-write needs binding resolution); it
 needs a real scanner, not regex.
 
-**Java SAFE is disabled by default (batch 9, known limitation).**
+**Java SAFE is disabled by default (batch 9 gate, still in place).**
 Batch 8 measured the CLI on two real Java repos and the precision
 collapsed: google/gson 0/64 SAFE true, junit-team/junit5 1/589 —
-0.3% overall. The Java call graph has no cross-file resolution and
-its same-file live roots are effectively empty, so same-file callers,
+0.3% overall. The Java call graph had no cross-file resolution and
+its same-file live roots were effectively empty, so same-file callers,
 Javadoc-only imports, package-info annotations, and same-file field
-reads are all missed. Until the call graph is repaired and precision
-is re-measured above 90%, Java findings are REVIEW at most: `--fix`
-and `--prove` can never delete Java code on a default scan. Opt in
-to the old grading only while measuring, with `--java-safe` (or
-`javaSafe: true` via the API). The per-family evidence is in
-`bench8-new/` (junit5-589-judged.md, gson-64-judged.md) and the
-repair is tracked as batch 9.
+reads were all missed. Batch 9 repaired the call graph (FJ-7/FJ-9
+live roots, FJ-1 Javadoc links, FJ-8 package-info) and gated Java
+SAFE off by default so `--fix` and `--prove` could never delete Java
+code on a default scan; batch 10 finished the repair (arity
+comment-counting bug, enum-constant constructor invocations, FJ-2
+utility-class / FJ-3 load-bearing-local / FJ-4 serialization policies)
+and re-measured gson 0 SAFE and junit5 1 SAFE, the 1 TRUE item —
+100% precision on remaining SAFE, zero false positives (see "Batch
+10 update" above). The gate stays as a safety default until more
+Java repos are measured, since two repos are not proof of generality.
+Opt in to the old grading only while measuring, with `--java-safe`
+(or `javaSafe: true` via the API). The per-family evidence is in
+`bench8-new/` (junit5-589-judged.md, gson-64-judged.md).
 
 Scan times (same machine): umami 1520 files 15.6 s (~97 files/s),
 fastapi 1237 files 12.9 s, date-fns 1776 files 8.6 s — the O(symbols ×
@@ -445,16 +505,16 @@ unless the tool version is pinned — an earlier measurement gap (flask
 mid-measurement, not nondeterminism: the current tool is byte-identical
 across 3 repeat runs on flask/requests/click.
 
-The web checker (`docs/analyzer.js`, regex-based) reproduces the same SAFE findings on every fixture above — verified by the web test suite (70 tests). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). Batch 4 fixed web multi-line `import`/`require`/re-export handling (continuation lines no longer leak into the references pass) and decided the JSX-pragma rule (see "False-positive defences" above); measured on the same clones, web SAFE is 2 vs CLI SAFE 4, at full parity on preact (1 = 1) and next-blog (0 = 0) — the only remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
+The web checker (`docs/analyzer.js`, regex-based for JS/Python) reproduces the same SAFE findings on every fixture above — verified by the web test suite (96 tests). Java is tree-sitter-parsed, not regex-based (see "Java scope" below). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). Batch 4 fixed web multi-line `import`/`require`/re-export handling (continuation lines no longer leak into the references pass) and decided the JSX-pragma rule (see "False-positive defences" above); measured on the same clones, web SAFE is 2 vs CLI SAFE 4, at full parity on preact (1 = 1) and next-blog (0 = 0) — the only remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
 
-Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (316 findings, 0 in `src/`), which is the point of the fixtures.
+Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (380 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 
 Known limitations, stated honestly:
 
-- **Java scope (private-only, SAFE off by default — batch 9)**: Java SAFE is disabled by default (see above: 0.3% precision on gson/junit5); use `--java-safe` only while measuring. When opted in, SAFE applies only to private methods (including `private static`), private fields, private constructors, unused imports (never on-demand `import foo.*`), and unused locals of private methods. Unused parameters are REVIEW, never SAFE: deleting one changes the method's arity, so every call site would break, and `--fix` only deletes the declaration. Everything else in Java — public, protected, and package-private members, whole classes — is REVIEW at most, never SAFE, and Java files are never dead-file candidates (there is no Java import resolution yet, so a file cannot be proven unimported). Overloads are told apart by (name, arity) only: same-name, same-arity overloads (`process(int)` vs `process(String)`) are one unit — a call to one keeps both alive. A varargs method matches any call with arity >= its fixed arity. Any annotation on a private member keeps it (`@PostConstruct`, `@JsonProperty`, `@Autowired`, ...), as does a framework stereotype on its enclosing class (Spring, JPA, Lombok), `native`, and `serialVersionUID`. The Spring and Jackson/JPA annotation lists live as data in `frameworks/spring.json` and `frameworks/jackson-jpa.json` (a pack-only stereotype such as `@ControllerAdvice` or `@JsonIgnoreProperties` keeps members at REVIEW too). An import used only by an annotation (`@JsonProperty`) is live — deleting it would break compilation. A name mentioned in any string — Java source, Spring/MyBatis XML, `application.properties`, YAML — downgrades to REVIEW; names built by string concatenation (`"by" + "NameOnly"`) are undetectable and remain a documented caveat. Test sources (`src/test/java`, `*Test.java`) are KEEP at most, never SAFE. `--prove` runs `mvn -q test` / `./gradlew test` (15-minute timeout) when Maven/Gradle is installed. The web checker does not support Java (CLI only). Fixtures are validated with tree-sitter (0 ERROR nodes), not `javac`.
-- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 2 vs CLI SAFE 4, web-only SAFE 0 — every web SAFE is also a CLI SAFE. The remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
+- **Java scope (private-only, SAFE off by default — batch 9)**: Java SAFE is disabled by default (batch 10 re-measured gson 0 SAFE and junit5 1 SAFE, the 1 TRUE item — 100% precision on remaining SAFE; see "Batch 10 update" above); use `--java-safe` only while measuring. When opted in, SAFE applies only to private methods (including `private static`), private fields, private constructors, unused imports (never on-demand `import foo.*`), and unused locals of private methods. Unused parameters are REVIEW, never SAFE: deleting one changes the method's arity, so every call site would break, and `--fix` only deletes the declaration. Everything else in Java — public, protected, and package-private members, whole classes — is REVIEW at most, never SAFE, and Java files are never dead-file candidates (there is no Java import resolution yet, so a file cannot be proven unimported). Overloads are told apart by (name, arity) only: same-name, same-arity overloads (`process(int)` vs `process(String)`) are one unit — a call to one keeps both alive. A varargs method matches any call with arity >= its fixed arity. Any annotation on a private member keeps it (`@PostConstruct`, `@JsonProperty`, `@Autowired`, ...), as does a framework stereotype on its enclosing class (Spring, JPA, Lombok), `native`, and `serialVersionUID`. **Utility-class constructors (FJ-2, batch 10) are KEEP, never SAFE**: a private constructor of a class whose direct members are all static (a utility class — `GsonTypes`, `Primitives`, `Streams`, ...) is an instantiation guard, not dead code. Its purpose is precisely to be uncallable: it prevents instantiation and subclassing, and deleting it would expose a public default constructor and change the class's API (and trip Error Prone's `PrivateConstructorForUtilityClass` check, which treats the constructor as required). Members of nested or anonymous classes do not count toward the check — a utility class full of anonymous `TypeAdapter` implementations is still a utility class. A private constructor of a class with instance members stays SAFE when uncalled: the guard reasoning does not apply there. **Private enum constructors are KEEP when no constant invokes them**: an enum's constants invoke the constructor at class-load time and the call graph records that (batch 10), so an invoked constructor is live and gets no finding; a constructor no constant invokes is still KEEP, never SAFE — the constructor is the wrong deletion unit for an enum; delete the constant, or the enum, instead. **Java serialization callbacks (FJ-4, batch 10) are KEEP**: private `readObject` / `writeObject` (arity 1), `readObjectNoData` / `readResolve` / `writeReplace` (arity 0) are invoked by the serialization runtime via reflection, never by in-repo code — the (name, arity) pair is the contract, and a same-named method with another arity grades normally. The list is hardcoded in `src/confidence.js` next to `serialVersionUID` (not a framework pack: packs are not language-gated, and a `keepNames` entry would also keep a same-named JS/Python function). **Load-bearing unused locals (FJ-3, batch 10) are REVIEW, never SAFE**: a local that is never read is still not dead when its initializer calls a method or creates an object — the call may advance a reader (`JsonToken unused = reader.peek()`), validate input (`new SimpleDateFormat(pattern)` throws on a bad pattern), or run the measured work of a benchmark (`gson.fromJson(...)`). Deleting the declaration would remove that call. A truly dead pure local (`int x = 1;`, never read) stays SAFE. The Spring and Jackson/JPA annotation lists live as data in `frameworks/spring.json` and `frameworks/jackson-jpa.json` (a pack-only stereotype such as `@ControllerAdvice` or `@JsonIgnoreProperties` keeps members at REVIEW too). An import used only by an annotation (`@JsonProperty`) is live — deleting it would break compilation. A name mentioned in any string — Java source, Spring/MyBatis XML, `application.properties`, YAML — downgrades to REVIEW; names built by string concatenation (`"by" + "NameOnly"`) are undetectable and remain a documented caveat. Test sources (`src/test/java`, `*Test.java`) are KEEP at most, never SAFE. `--prove` runs `mvn -q test` / `./gradlew test` (15-minute timeout) when Maven/Gradle is installed. The web checker supports Java too (batch 10): `docs/parse-java-web.js` ports `src/parse-java.js` (same traversal, diffed against the CLI parser in the test suite so the two cannot drift silently) and parses `.java` files with tree-sitter WASM — web-tree-sitter 0.22.5 (`docs/vendor/tree-sitter.js` + `tree-sitter.wasm`) and tree-sitter-java 0.23.5 (`docs/vendor/tree-sitter-java.wasm`), vendored under `docs/vendor/` and lazy-loaded only when a `.java` file is present; if the WASM fails to load, Java files are skipped with a warning, never regex-parsed. The web IS the opted-in surface, so it grades Java exactly like the CLI with `--java-safe`: on the fixtures it matches the CLI finding-for-finding (java-basic 65: 16 SAFE / 36 REVIEW / 13 KEEP; java-batch10-arity 13: 2 / 11 / 0; java-batch10-policy 35: 7 / 20 / 8), and on the real repos gson (7,517 findings, 0 SAFE) and junit5 (23,796 findings, 1 SAFE `SETTINGS_GRADLE`) it reproduces the CLI's `--java-safe` output exactly — web-only SAFE 0. Fixtures are validated with tree-sitter (0 ERROR nodes), not `javac`.
+- **Web/CLI parity**: the web checker is regex-based, so it misses some things the CLI catches. Measured on the same 10-repo corpus with config files included (`node ~/workspace/bench-repos/web-bench-full.js`): web SAFE 2 vs CLI SAFE 4, web-only SAFE 0 — every web SAFE is also a CLI SAFE. The remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. Java (batch 10) is at full parity, not regex-based: the web parses Java with the same tree-sitter traversal as the CLI (see "Java scope" above) — measured on the same clones with `node ~/workspace/bench-repos/b10-java-web/web-bench.js`, gson 7,517 findings (0 SAFE) and junit5 23,796 findings (1 SAFE) are identical to the CLI's `--java-safe` output, finding-for-finding, web-only SAFE 0. Same-id duplicate findings: 0 on every repo (verified) — the remaining "max per key" counts are repeated definitions of one name in a test file, mostly KEEP. The CLI is the reference; the web checker is a convenience.
 - **A name that appears as a whole string or a code-delimited string** still counts as a reference, even when the string is not a real dynamic lookup — for example a test file asserting on the symbol by name (`bySymbol(f, 'src/index.js', 'render')`). Those findings land in REVIEW, never SAFE, so the cost is noise, not a false deletion. The same shape applies to the dead-dependency check: a dependency named in a config value (e.g. `"theme": "chalk"`) counts as used, and a dependency name that is a prefix of a longer hyphenated name (`left-pad` inside `left-pad-x`) can also count — both are REVIEW noise, never a false deletion.
 
 ## How it works
