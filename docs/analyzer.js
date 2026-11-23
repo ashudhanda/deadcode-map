@@ -740,6 +740,82 @@ function parseJs(rel, raw) {
   var classStack = []; // {name, depth}
   var ambientStack = []; // {depth} — declare module/global blocks
   var declaredOnLine = {}; // lineNo (1-based) -> Set of declared names
+  // Top of the bracket stack at the start of each line, counted on
+  // the stripped code (strings, comments and regex literals are
+  // already blanked, so a bracket inside them cannot corrupt the
+  // count; `${...}` template expressions are kept as code and their
+  // brackets balance). The innermost unclosed bracket decides
+  // whether a `function name(` line is a declaration or an
+  // expression: inside `(` or `[` it is an argument, an array
+  // element, or a grouped expression — never a declaration. Inside
+  // `{` (or at the top level) it is a statement — a declaration,
+  // even when the brace belongs to a callback body whose call paren
+  // is still open (`describe('...', () => {\n function install()
+  // {}`, vue2 types/test/v3/define-component-test.tsx). A plain
+  // paren-depth count misread every declaration inside a callback
+  // body as an expression, because the call's paren never closes
+  // until the body ends; only the stack top separates the two. A
+  // closer that does not match the stack top is ignored (broken
+  // code); if brackets never balance, later lines keep the stuck
+  // top — a false negative, never a false positive (same trade as
+  // parsePy's depthAtLineStart).
+  var bracketTopAtLineStart = [];
+  (function () {
+    var stack = [];
+    var pairs = { ')': '(', ']': '[', '}': '{' };
+    for (var i = 0; i < lines.length; i++) {
+      bracketTopAtLineStart.push(stack.length ? stack[stack.length - 1] : null);
+      for (var j = 0; j < lines[i].length; j++) {
+        var ch = lines[i][j];
+        if (ch === '(' || ch === '[' || ch === '{') stack.push(ch);
+        else if (pairs[ch] && stack.length && stack[stack.length - 1] === pairs[ch]) stack.pop();
+      }
+    }
+  })();
+  // Raw lines, parallel to the stripped `lines` (stripJs preserves
+  // newlines, so the two arrays line up 1:1). The previous-line
+  // check below reads the RAW line: blanking a string or regex
+  // literal leaves a dangling operator in the stripped line (`const
+  // whitespaceRE = /\s+/` strips to `const whitespaceRE =`, and a
+  // semicolonless `const x = 'foo'` strips to `const x =`), which
+  // misread a complete assignment as a continuation and hid the
+  // declaration after it (vue2 class-util.ts `export function
+  // addClass`). The raw line ends with the literal itself, never
+  // with a dangling operator.
+  var rawLines = raw.split('\n');
+  // True when the previous non-empty line ends with a token that
+  // continues an expression onto this line: an open bracket, comma,
+  // `=`, `:` (an object value, a ternary else-branch — a case label
+  // or a block label ends with `:` too, and a declaration after one
+  // is skipped by this rule: fail-open, a missed finding, never a
+  // false positive), `?`, `=>`, a binary/unary operator, a unary
+  // keyword (`return` / `typeof` / `delete` / `await` / `yield` —
+  // `return` and `yield` would end the statement by ASI, so skipping
+  // a definition after them is fail-open, never a false positive),
+  // or `={` opening a JSX expression container. `void` is NOT in
+  // the keyword set: a unary `void` spanning lines is negligible,
+  // while a TypeScript return type (`): void`) ends lines all over
+  // .d.ts files. Neither is `/` in the operator set (a regex
+  // literal ends with one) nor `!` (a TypeScript non-null assertion
+  // ends with one: `foo!`), nor a doubled `++` / `--` (a complete
+  // increment statement). A bare `{`-ending line is NOT a signal: a
+  // declaration is the common first statement of a block (`if (x)
+  // {\n function foo() {}`). A bare `>` is not one either: a JSX
+  // element close (`/>`) can precede a real declaration.
+  function prevLineContinuesExpr(ln) {
+    for (var pi = ln - 1; pi >= 0; pi--) {
+      var pt = rawLines[pi].trim();
+      if (pt === '') continue;
+      if (/[(\[,=?:]$/.test(pt)) return true;
+      if (/=>\s*$/.test(pt)) return true;
+      if (/(\+\+|--)$/.test(pt)) return false;
+      if (/[+\-*%&|^~<]$/.test(pt)) return true;
+      if (/\b(return|typeof|delete|await|yield)$/.test(pt)) return true;
+      if (/=\s*\{$/.test(pt)) return true;
+      return false;
+    }
+    return false;
+  }
   // Function/class scopes, for the `local` flag on definitions (port
   // of the ancestor walk in src/parse-js.js): a definition nested
   // inside a function body is a local of that function. Each entry
@@ -877,14 +953,35 @@ function parseJs(rel, raw) {
       }
     }
 
-    // Function declaration.
+    // Function declaration — but only a declaration. A named
+    // function EXPRESSION on its own line (`settle(\n function
+    // _resolve(value) {`, axios lib/adapters/xhr.js) matches the same
+    // regex, and the CLI's tree-sitter parser never records one: it
+    // records function_declaration nodes only, never
+    // function_expression (src/parse-js.js). The name of a named
+    // function expression is visible only inside itself, so it can
+    // never be referenced from outside — recording it as a definition
+    // that needs external references graded all four axios callbacks
+    // SAFE. The two grammar signals above separate them: the
+    // innermost unclosed bracket at the line start is `(` or `[`
+    // (an argument list, an array element, a grouped expression),
+    // or the previous non-empty line ends with a token that
+    // continues an expression. Either signal only ever SKIPS a
+    // definition — a missed declaration is a false negative, never a
+    // false positive. The name is still marked declared on its line,
+    // so the references pass does not read the `name(` signature as
+    // a call; the body scope is still pushed below, so locals inside
+    // the callback keep their `local` flag.
     m = line.match(/^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/);
     if (m) {
-      parsed.definitions.push({
-        name: m[1], kind: 'function', exported: /^\s*export\b/.test(line),
-        startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
-        local: isLocalHere(),
-      });
+      var bracketTop = bracketTopAtLineStart[ln];
+      if (bracketTop !== '(' && bracketTop !== '[' && !prevLineContinuesExpr(ln)) {
+        parsed.definitions.push({
+          name: m[1], kind: 'function', exported: /^\s*export\b/.test(line),
+          startLine: lineNo, endLine: lineNo, decorators: [], ambient: inAmbient,
+          local: isLocalHere(),
+        });
+      }
       markDeclared(lineNo, m[1]);
       fnBodyHere = bodyOpensOnLine(line, m.index + m[0].length - 1);
     }
@@ -1103,6 +1200,23 @@ function parseJs(rel, raw) {
   // statement (no `from` clause within the bound) records nothing
   // and its lines are scanned like ordinary code (fail open).
   var importStmtLines = new Set();
+  // Range of an import statement in the CLI's shape
+  // { startIndex, endIndex, startLine, endLine }: the web parsers never
+  // recorded one, so every import finding fell back to startLine 1 and
+  // web/CLI ids disagreed for the same import (vue2
+  // types/v3-define-component.d.ts: Data reported at line 1 by the web,
+  // line 19 by the CLI). startLine is the line the statement starts on —
+  // a multi-line import reports its first line, matching the CLI's
+  // tree-sitter node range. Offsets come from lineOffsets, which the
+  // stripper keeps aligned with the raw source.
+  function importRange(firstLine0, lastLine0) {
+    return {
+      startIndex: lineOffsets[firstLine0] || 0,
+      endIndex: (lineOffsets[lastLine0] || 0) + (rawLines[lastLine0] || '').length,
+      startLine: firstLine0 + 1,
+      endLine: lastLine0 + 1,
+    };
+  }
   // Lines of a local `export { ... }` list (no `from` clause), recorded
   // while the statement is accumulated below: the names in the list are
   // exports, not uses — except when a name is an imported binding being
@@ -1156,6 +1270,7 @@ function parseJs(rel, raw) {
       }
       var imp = parseImportStatement(stmt);
       if (imp) {
+        imp.range = importRange(stmtStart, il2);
         parsed.imports.push(imp);
         for (var sl = stmtStart; sl <= il2; sl++) importStmtLines.add(sl + 1);
       }
@@ -1209,7 +1324,7 @@ function parseJs(rel, raw) {
           // alias binds the namespace, or `*` marks every export.
           reNames.push({ imported: '*', local: reM[1] || '*', kind: 'namespace' });
         }
-        parsed.imports.push({ source: reM[3], names: reNames, sideEffect: false, reExport: true });
+        parsed.imports.push({ source: reM[3], names: reNames, sideEffect: false, reExport: true, range: importRange(reStmtStart, il2) });
         for (var rl = reStmtStart; rl <= il2; rl++) importStmtLines.add(rl + 1);
         continue;
       }
@@ -1306,7 +1421,8 @@ function parseJs(rel, raw) {
       } else if (reqM[2]) {
         names2.push({ imported: reqM[2], local: reqM[2], kind: 'value' });
       }
-      parsed.imports.push({ source: reqM[3], names: names2, sideEffect: false, reExport: isCompatShimJs });
+      var reqImp = { source: reqM[3], names: names2, sideEffect: false, reExport: isCompatShimJs };
+      parsed.imports.push(reqImp);
       if (reqStmtStart >= 0) {
         // Record the binding names only on the lines the require
         // binding itself spans, so the references pass skips them
@@ -1328,6 +1444,10 @@ function parseJs(rel, raw) {
         var matchStartLine = reqStmtStart + reqStmt.slice(0, reqM.index).split('\n').length - 1;
         var matchEndLine = reqStmtStart + reqStmt.slice(0, reqM.index + reqM[0].length).split('\n').length - 1;
         for (var rbl = matchStartLine; rbl <= matchEndLine; rbl++) requireLineBindings[rbl + 1] = reqLocals;
+        reqImp.range = importRange(matchStartLine, matchEndLine);
+      } else {
+        // Single-line require: the statement is the current line.
+        reqImp.range = importRange(il2, il2);
       }
     }
     // Inline / bare require('...') — require('./x').fn() or a bare
@@ -1344,7 +1464,7 @@ function parseJs(rel, raw) {
       // the same index in the stripped line; one inside a string or
       // comment is blanked there and must not create a phantom import.
       if (strippedLine.substr(bareM.index, 8) !== 'require(') continue;
-      parsed.imports.push({ source: bareM[1], names: [], sideEffect: true, reExport: false });
+      parsed.imports.push({ source: bareM[1], names: [], sideEffect: true, reExport: false, range: importRange(il2, il2) });
     }
   }
   // NOTE: strings are blanked in `code`, so literal-argument checks run on
@@ -1689,7 +1809,19 @@ function parseJs(rel, raw) {
       // too (the author knows it never runs); the marker sits on the
       // terminating statement or the line above it.
       var prevTrimmed = ui > 0 ? lines[ui - 1].trim() : '';
-      var isContinuation = /^[?:,)\].&|+]/.test(trimmed) || /[({[,&|?:+\-*/%=<>!]$/.test(prevTrimmed);
+      var isContinuation = /^[?:,)\].&|+]/.test(trimmed) || /[({[,&|?:+\-*/%=<>!]$/.test(prevTrimmed)
+        // A `[` continuation line is a computed member access on the
+        // expression above (`return colord(x)` followed by
+        // `[theme ...](...)` — umami WorldMap.tsx: the `[` line is
+        // part of the return value, not a new statement). Unlike `.`,
+        // a `[` can also start a fresh array-literal statement, but
+        // only after a `;` ends the previous one — without it, ASI
+        // does not fire and the `[` binds to the expression above. So
+        // `[` counts as a continuation only when the previous line
+        // does not end with `;`. (A `[` line after a block-closing
+        // `}` is still read as a continuation: fail-open, the same
+        // trade the `.` rule already makes.)
+        || (trimmed.charAt(0) === '[' && !/;$/.test(prevTrimmed));
       var checkIgnoredU = function (row) {
         var a = rawLinesU[row] || '';
         var b = row > 0 ? (rawLinesU[row - 1] || '') : '';
@@ -1758,7 +1890,13 @@ function parseJs(rel, raw) {
       for (var ni = ui + 1; ni < lines.length; ni++) {
         if (lines[ni].trim() !== '') { nextTrimmed = lines[ni].trim(); break; }
       }
-      var continuesNextLine = /^[?:,)\].&|+]/.test(nextTrimmed);
+      // A next line starting with `[` continues the return value as a
+      // computed member access (`return colord(x)` / `[theme
+      // ...](...)`, umami WorldMap.tsx) — unless the return line ends
+      // with `;`, which ends the statement and makes the `[` a fresh
+      // array literal (genuinely unreachable after the return).
+      var continuesNextLine = /^[?:,)\].&|+]/.test(nextTrimmed)
+        || (nextTrimmed.charAt(0) === '[' && !/;$/.test(trimmed));
       if (opens <= closes && bt % 2 === 0 && !braceless && !endsWithOperator && !continuesNextLine) { terminatedAt = dBefore; terminatedLineU = ui; }
     }
   }
@@ -1778,6 +1916,27 @@ function parsePy(rel, raw) {
   var strings = [];
   var code = stripPy(raw, strings);
   var lines = code.split('\n');
+  // Absolute offset of each stripped line: the stripper blanks strings
+  // and comments in place, so offsets match the raw source.
+  var lineOffsetsPy = [];
+  (function () {
+    var off = 0;
+    for (var loi = 0; loi < lines.length; loi++) { lineOffsetsPy.push(off); off += lines[loi].length + 1; }
+  })();
+  // Range of an import statement in the CLI's shape (see parseJs
+  // importRange): the web Python parser never recorded one, so every
+  // import finding fell back to startLine 1. firstLine/lastLine are
+  // 1-based; startLine is the line the statement starts on — a
+  // multi-line import reports its first line, matching the CLI's
+  // tree-sitter node range.
+  function importRangePy(firstLine1, lastLine1) {
+    return {
+      startIndex: lineOffsetsPy[firstLine1 - 1] || 0,
+      endIndex: (lineOffsetsPy[lastLine1 - 1] || 0) + (lines[lastLine1 - 1] || '').length,
+      startLine: firstLine1,
+      endLine: lastLine1,
+    };
+  }
   var parsed = {
     language: 'py', definitions: [], imports: [], references: new Set(),
     calls: new Set(), dynamic: false, dynamicReasons: [], dynamicImports: [],
@@ -1978,11 +2137,22 @@ function parsePy(rel, raw) {
       }
     }
     if (am && lineDepth === 0 && ((!inFunction && !inClassBody) || enclosingModel || inFunctionScope)) {
+      // A TypeVar definition (`GrpType = TypeVar("GrpType", bound=...)`,
+      // or `typing.TypeVar(...)`): a generic type variable is part of
+      // the module's typing surface — it is declared to be named in
+      // annotations elsewhere, and its own name string inside the
+      // TypeVar(...) call is not a use of it. The grading rule below
+      // holds TypeVars at REVIEW, never SAFE (batch 13: typer's
+      // _click/decorators.py GrpType was flagged SAFE by the web
+      // checker while the CLI grades it REVIEW).
+      var rhsPy = line.slice(line.indexOf('=') + 1).trim();
+      var isTypeVarPy = /^(?:typing\.)?TypeVar\s*\(/.test(rhsPy);
       parsed.definitions.push({
         name: am[2], kind: 'variable', exported: false,
         startLine: lineNo, endLine: lineNo, decorators: [],
         frameworkField: Boolean(enclosingModel),
         local: inFunctionScope,
+        typeVar: isTypeVarPy,
       });
       if (/^__.*__$/.test(am[2])) parsed.dunder.add(am[2]);
       markDeclared(lineNo, am[2]);
@@ -2018,10 +2188,11 @@ function parsePy(rel, raw) {
   // tree-sitter parser handles the same shapes).
   var allMatch = raw.match(/__all__\s*\+?=\s*[\[(]([\s\S]*?)[\])]/);
   if (allMatch) {
+    var allLine = raw.slice(0, allMatch.index).split('\n').length;
     var am;
     var allRe = /['"]([^'"]+)['"]/g;
     while ((am = allRe.exec(allMatch[1])) !== null) {
-      parsed.imports.push({ source: '__all__', names: [{ imported: am[1], local: am[1], kind: 'named' }], sideEffect: false, reExport: false, allExport: true });
+      parsed.imports.push({ source: '__all__', names: [{ imported: am[1], local: am[1], kind: 'named' }], sideEffect: false, reExport: false, allExport: true, range: importRangePy(allLine, allLine) });
       parsed.references.add(am[1]);
     }
   }
@@ -2181,6 +2352,7 @@ function parsePy(rel, raw) {
       pushImportSplit({
         source: fm[2] || '', sideEffect: false, inTryExcept: inTryFrom,
         fromImport: true, relative: Boolean(fm[1]), level: fm[1] ? fm[1].length : 0,
+        range: importRangePy(acc.firstLine, acc.next + 1),
       }, fn.names, keptFrom, reExportPy(acc.stmt, fn.redundantAlias, acc.rawStmt));
       continue;
     }
@@ -2204,7 +2376,289 @@ function parsePy(rel, raw) {
       pushImportSplit({
         source: names3.length ? (names3[0].full || names3[0].imported) : '',
         sideEffect: false, inTryExcept: inTryPlain, fromImport: false, relative: false, level: 0,
+        range: importRangePy(acc2.firstLine, acc2.next + 1),
       }, names3, keptPlain, reExportPy(acc2.stmt, redundantAlias2, acc2.rawStmt));
+    }
+  }
+
+  // --- string annotations in nested / multi-line positions (batch 13) ---
+  // The per-line annRe in the references loop below only sees a string
+  // directly after `:` or `->` (`x: "Context"`). Real code nests the
+  // string inside a generic (`ctx: Union["Context", None]`,
+  // `cls: type["TyperCommand"] | None`) or spreads a def signature over
+  // several lines, so the string sits on a continuation line with no
+  // `:` before it at all — typer's _click/parser.py, models.py and
+  // params.py all had imports flagged SAFE that way. This pass recovers
+  // those: it walks def signatures (joined across lines) and annotated
+  // assignments, and counts only the string literals inside an
+  // annotation span — the text after the annotation `:` up to the
+  // default-value `=` at bracket depth 0. A string in a default value
+  // (`def f(mode="Dead")`), a docstring, or an error message is never
+  // in an annotation span, so it never counts. Strings inside a call
+  // inside the annotation (`Annotated[str, Doc("...")]`,
+  // `Option(envvar="ME")`) are skipped too: that text is prose or a
+  // keyword value, not a type — the CLI's tree-sitter walk stops at a
+  // `call` node unless it is `cast`, and `cast("T", x)` is already
+  // handled by annRe. Structure (parens, colons, `=`) is read from
+  // the stripped lines, where strings and comments are blanked but
+  // positions are preserved, so the same offsets read the string
+  // contents from the raw lines; raw lines are comment-blanked
+  // (length-preserving) first, so a `#` note never leaks a quoted
+  // word into the pass.
+  function annBlankComment(rawLine) {
+    var out = '';
+    var i = 0;
+    while (i < rawLine.length) {
+      var ch = rawLine[i];
+      if (ch === '#') { out += ' '.repeat(rawLine.length - i); break; }
+      if (ch === "'" || ch === '"') {
+        var q = ch;
+        if (rawLine.slice(i, i + 3) === q + q + q) {
+          var tripleEnd = rawLine.indexOf(q + q + q, i + 3);
+          if (tripleEnd === -1) { out += rawLine.slice(i); break; }
+          out += rawLine.slice(i, tripleEnd + 3); i = tripleEnd + 3; continue;
+        }
+        out += ch; i++;
+        while (i < rawLine.length && rawLine[i] !== q) {
+          if (rawLine[i] === '\\' && i + 1 < rawLine.length) { out += rawLine.slice(i, i + 2); i += 2; continue; }
+          out += rawLine[i]; i++;
+        }
+        if (i < rawLine.length) { out += rawLine[i]; i++; }
+        continue;
+      }
+      out += ch; i++;
+    }
+    return out;
+  }
+  function annAddIds(inner) {
+    // The type-like filter mirrors annRe below: a string with no
+    // capitalised identifier (`"b"`, `"hello"`) is a plain value,
+    // not a type name.
+    if (!/[A-Z]/.test(inner)) return;
+    var ids = inner.match(/[A-Za-z_]\w*/g) || [];
+    ids.forEach(function (id) {
+      if (PY_KEYWORDS.has(id)) return;
+      parsed.references.add(id);
+      bareReferences.add(id);
+    });
+  }
+  // The identifiers inside the string literals of one annotation span
+  // (raw text, comments blanked). A string counts unless it sits
+  // inside a call's argument list — the call frame is tracked from
+  // the code characters around it. Brackets that are not calls
+  // (`list["T"]`, `Union["T"]`) impose no frame, so their strings
+  // count; `cast("T", x)` counts its first argument only.
+  function annExtractStrings(rawSpan) {
+    var i = 0;
+    var n = rawSpan.length;
+    var frames = []; // { callee, depth, commas }
+    var depth = 0;
+    while (i < n) {
+      var ch = rawSpan[i];
+      if (ch === "'" || ch === '"') {
+        var q = ch;
+        var inner;
+        if (rawSpan.slice(i, i + 3) === q + q + q) {
+          var close = rawSpan.indexOf(q + q + q, i + 3);
+          if (close === -1) { inner = rawSpan.slice(i + 3); i = n; }
+          else { inner = rawSpan.slice(i + 3, close); i = close + 3; }
+        } else {
+          i++;
+          var buf = '';
+          while (i < n && rawSpan[i] !== q) {
+            if (rawSpan[i] === '\\' && i + 1 < n) { buf += rawSpan[i + 1]; i += 2; continue; }
+            buf += rawSpan[i]; i++;
+          }
+          inner = buf;
+          if (i < n) i++; // closing quote
+        }
+        var frame = frames.length ? frames[frames.length - 1] : null;
+        var countIt = !frame || (frame.callee === 'cast' && frame.commas === 0);
+        if (countIt) annAddIds(inner);
+        continue;
+      }
+      if (/[A-Za-z_]/.test(ch)) {
+        var word = /^[A-Za-z_]\w*/.exec(rawSpan.slice(i))[0];
+        var k = i + word.length;
+        while (k < n && (rawSpan[k] === ' ' || rawSpan[k] === '\t' || rawSpan[k] === '\n')) k++;
+        if (k < n && rawSpan[k] === '(') {
+          frames.push({ callee: word, depth: depth, commas: 0 });
+          depth++;
+          i = k + 1;
+          continue;
+        }
+        i += word.length;
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') { depth++; i++; continue; }
+      if (ch === ')' || ch === ']' || ch === '}') {
+        depth = Math.max(0, depth - 1);
+        while (frames.length && frames[frames.length - 1].depth >= depth) frames.pop();
+        i++; continue;
+      }
+      if (ch === ',' && frames.length && depth === frames[frames.length - 1].depth + 1) {
+        frames[frames.length - 1].commas++;
+      }
+      i++;
+    }
+  }
+  function annNetDepth(s) {
+    var d = 0;
+    for (var i = 0; i < s.length; i++) {
+      if (s[i] === '(' || s[i] === '[' || s[i] === '{') d++;
+      else if (s[i] === ')' || s[i] === ']' || s[i] === '}') d = Math.max(0, d - 1);
+    }
+    return d;
+  }
+  // First `=` at bracket depth 0 in stripped text, or -1. A `==`
+  // comparison is not an assignment boundary.
+  function annEqAtDepth0(s) {
+    var d = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s[i];
+      if (c === '(' || c === '[' || c === '{') d++;
+      else if (c === ')' || c === ']' || c === '}') d = Math.max(0, d - 1);
+      else if (c === '=' && d === 0 && s[i + 1] !== '=') return i;
+    }
+    return -1;
+  }
+  // First `:` at bracket depth 0 in stripped text, or -1. A `::`
+  // slice or `:=` walrus is not an annotation colon.
+  function annColonAtDepth0(s) {
+    var d = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s[i];
+      if (c === '(' || c === '[' || c === '{') d++;
+      else if (c === ')' || c === ']' || c === '}') d = Math.max(0, d - 1);
+      else if (c === ':' && d === 0 && s[i + 1] !== ':' && s[i + 1] !== '=') return i;
+    }
+    return -1;
+  }
+  function annMatchingParen(s, openIdx) {
+    var d = 0;
+    for (var i = openIdx; i < s.length; i++) {
+      if (s[i] === '(') d++;
+      else if (s[i] === ')') { d--; if (d === 0) return i; }
+    }
+    return -1;
+  }
+  // One def signature (stripped and raw text joined across lines, same
+  // length): the annotation span of every parameter, plus the return
+  // annotation after `->`.
+  function annProcessDefSignature(stripped, raw) {
+    var openIdx = stripped.indexOf('(');
+    if (openIdx === -1) return;
+    var closeIdx = annMatchingParen(stripped, openIdx);
+    if (closeIdx === -1) return;
+    var paramsS = stripped.slice(openIdx + 1, closeIdx);
+    var paramsR = raw.slice(openIdx + 1, closeIdx);
+    var parts = [];
+    var d = 0;
+    var start = 0;
+    for (var i = 0; i <= paramsS.length; i++) {
+      var c = paramsS[i];
+      if (c === '(' || c === '[' || c === '{') d++;
+      else if (c === ')' || c === ']' || c === '}') d = Math.max(0, d - 1);
+      else if ((c === ',' && d === 0) || i === paramsS.length) {
+        parts.push({ s: paramsS.slice(start, i), r: paramsR.slice(start, i) });
+        start = i + 1;
+      }
+    }
+    parts.forEach(function (part) {
+      var colon = annColonAtDepth0(part.s);
+      if (colon === -1) return;
+      var restS = part.s.slice(colon + 1);
+      var eq = annEqAtDepth0(restS);
+      var annR = eq === -1 ? part.r.slice(colon + 1) : part.r.slice(colon + 1, colon + 1 + eq);
+      annExtractStrings(annR);
+    });
+    var afterS = stripped.slice(closeIdx + 1);
+    var afterR = raw.slice(closeIdx + 1);
+    var arrow = afterS.indexOf('->');
+    if (arrow !== -1) {
+      var retS = afterS.slice(arrow + 2);
+      var retR = afterR.slice(arrow + 2);
+      var rd = 0;
+      var end = retS.length;
+      for (var ri2 = 0; ri2 < retS.length; ri2++) {
+        var rc = retS[ri2];
+        if (rc === '(' || rc === '[' || rc === '{') rd++;
+        else if (rc === ')' || rc === ']' || rc === '}') rd = Math.max(0, rd - 1);
+        else if (rc === ':' && rd === 0) { end = ri2; break; }
+      }
+      annExtractStrings(retR.slice(0, end));
+    }
+  }
+  // Lines covered by a def signature (the signature's own line and its
+  // continuation lines): the annotated-assignment pass below skips
+  // them, since the signature pass already read their annotations.
+  var annDefSigLines = {};
+  for (var annLi = 0; annLi < lines.length; annLi++) {
+    if (!/^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/.test(lines[annLi])) continue;
+    var accS = lines[annLi];
+    var accR = annBlankComment(rawLinesPy[annLi] || '');
+    var annJ = annLi;
+    var annDone = false;
+    // A def signature can be very long: typer's Option() / Argument()
+    // signatures run to ~1,000 lines (every parameter carries an
+    // Annotated[..., Doc("""...""")] block), and the string annotation
+    // that keeps an import alive can sit hundreds of lines in — a
+    // small cap would stop before it. 2,000 lines still bounds a
+    // malformed header.
+    while (!annDone && annJ - annLi < 2000) {
+      var oi = accS.indexOf('(');
+      var ci = oi === -1 ? -1 : annMatchingParen(accS, oi);
+      if (ci !== -1) {
+        var tail = accS.slice(ci + 1);
+        var td = 0;
+        var foundColon = false;
+        for (var tk = 0; tk < tail.length; tk++) {
+          var tc = tail[tk];
+          if (tc === '(' || tc === '[' || tc === '{') td++;
+          else if (tc === ')' || tc === ']' || tc === '}') td = Math.max(0, td - 1);
+          else if (tc === ':' && td === 0) { foundColon = true; break; }
+        }
+        if (foundColon) annDone = true;
+      }
+      if (!annDone) {
+        annJ++;
+        if (annJ >= lines.length) break;
+        accS += '\n' + lines[annJ];
+        accR += '\n' + annBlankComment(rawLinesPy[annJ] || '');
+        annDefSigLines[annJ] = true;
+      }
+    }
+    annDefSigLines[annLi] = true;
+    annProcessDefSignature(accS, accR);
+    annLi = annJ;
+  }
+  // Annotated assignments outside def signatures (`x: list["T"]`,
+  // `x: Optional["T"] = None`, in a class body or a function body).
+  // A line inside open brackets is a dict key or a continuation, never
+  // a standalone annotation. The annotation span runs to the default
+  // `=` at depth 0, or to the end of the (possibly multi-line) span
+  // when the brackets never close on this line.
+  for (var annVi = 0; annVi < lines.length; annVi++) {
+    if (annDefSigLines[annVi]) continue;
+    if (depthAtLineStart[annVi] !== 0) continue;
+    var annLine = lines[annVi];
+    var annM = /^(\s*)([A-Za-z_]\w*)\s*:/.exec(annLine);
+    if (!annM) continue;
+    if (PY_KEYWORDS.has(annM[2]) || annM[2] === 'case') continue;
+    var annColon = annM[0].length - 1;
+    var annAfter = annLine.slice(annColon + 1).trim();
+    if (annAfter === '' || annAfter[0] === '=' || annAfter[0] === ':') continue;
+    var spanS = annLine.slice(annColon + 1);
+    var spanR = annBlankComment(rawLinesPy[annVi] || '').slice(annColon + 1);
+    var annVj = annVi;
+    while (true) {
+      var annEq = annEqAtDepth0(spanS);
+      if (annEq !== -1) { annExtractStrings(spanR.slice(0, annEq)); break; }
+      if (annNetDepth(spanS) === 0) { annExtractStrings(spanR); break; }
+      if (annVj - annVi >= 30 || annVj + 1 >= lines.length) { annExtractStrings(spanR); break; }
+      annVj++;
+      spanS += '\n' + lines[annVj];
+      spanR += '\n' + annBlankComment(rawLinesPy[annVj] || '');
     }
   }
 
@@ -3901,6 +4355,15 @@ function analyzeFilesCore(inputFiles, options, javaModule) {
       }
       if (def.kind === 'method') {
         add(Object.assign({}, common, { grade: 'REVIEW', reason: 'method with 0 in-repo callers — could be called via an object or framework' }));
+        return;
+      }
+      // A TypeVar definition is REVIEW, never SAFE (see the parsePy
+      // note above): a generic type variable is typing surface, and
+      // deleting it would break every annotation that names it — in
+      // another file, under a string annotation, or through a
+      // re-export the web checker cannot see.
+      if (def.kind === 'variable' && def.typeVar) {
+        add(Object.assign({}, common, { grade: 'REVIEW', reason: 'TypeVar definition — a generic type variable, part of the module\'s typing surface; never auto-deleted' }));
         return;
       }
       add(Object.assign({}, common, { grade: 'SAFE', reason: 'unexported, 0 callers, 0 references, 0 string mentions' }));

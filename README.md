@@ -570,6 +570,55 @@ is django's `__getattribute__` test-helper method, which the CLI never
 reported. Full suite: 340 tests (339 pass, 1 skipped — the javac test).
 Dogfood 0 findings; `--include-fixtures` 420 findings, 0 in `src/`.
 
+### Batch 13 update (2026-11-23)
+
+Batch 12 ended with 12 named web-only SAFE false positives on the live
+surface — the web checker flagged live code SAFE on three real repos.
+Batch 13 fixes all 12, and web-only SAFE is now 0 on every repo in the
+13-repo set. Axios: the web regex recorded any line starting with
+`function name(` as a declaration, including named function expressions
+passed as callbacks (`settle(function _resolve…`, `.then(function
+onAdapterResolution…)`). A named expression's name is visible only
+inside itself, so it can never be referenced — the CLI's tree-sitter
+parser records `function_declaration` nodes only, never
+`function_expression`, and the web now gates the definition push the
+same way (bracket-stack top `(` / `[`, or a previous raw line ending
+in an expression-continuing token). Umami: a `[` line after a `return`
+is a chained-call continuation, not a new statement, so the
+`unreachable` flag on `WorldMap.tsx:50` is part of the return
+expression. Typer: the web now runs an annotation-span pass in
+`parsePy` that joins multi-line def signatures and reads annotated
+assignments, counting string literals only inside the annotation span —
+so `ctx: Union["Context", None]`, `cls: type["TyperCommand"]` and
+`list["CompletionItem"]` count as uses, while default string values,
+docstrings, error messages, and `Doc(...)` prose do not. `GrpType`
+is held at REVIEW as a TypeVar, mirroring the CLI's treatment.
+Finally, web import findings now carry their real line: import records
+carry a `range` (the finding code already read it, but no web import
+ever set one), so vue2's `Data` reports line 19 like the CLI instead
+of line 1 — the last line-artifact id is gone. Fixtures
+`js-batch13-named-callback`, `js-batch13-chain-call`,
+`py-batch13-string-annotation`, `py-batch13-typevar`,
+`js/py-import-lines` + 27 tests; the web matches the CLI on every new
+fixture finding-for-finding.
+
+Corpus re-verified at batch 13 (`bench13-latest/`): the CLI is
+finding-for-finding identical to batch 12 on all 15 scans (0 lost, 0
+gained, 0 grade changes — expected, batch 13 changed only
+`docs/analyzer.js`): 41 SAFE total, `--java-safe` gson 0, junit5 0,
+petclinic 0. Web/CLI parity (`web-bench13.js`): Java exact — gson
+8,328, junit5 24,947, petclinic 396, identical finding-for-finding.
+Web SAFE 27 → 15 (the 12 false positives are gone; every remaining
+web SAFE is also a CLI SAFE), web findings 79,496 → 79,472, missed CLI
+SAFE 53 → 52 (vue2 `Data` now matches by id), grade diffs 319 → 318
+(typer `GrpType` now agrees). The remaining web gap is recall, in the
+conservative direction: the web still misses 52 CLI SAFE (umami 33
+dead files/functions, nestjs 16 dead files, typer 2, django 1) because
+it has no dead-file detection for JS/TS. Full suite: 367 tests (366
+pass, 1 skipped — the javac test). Dogfood 0 findings;
+`--include-fixtures` 443 findings (31 SAFE / 346 REVIEW / 66 KEEP),
+0 in `src/`.
+
 Old corpus (10 repos + 3 diagnosis repos) re-measured at batch 7:
 SAFE 45 → 42, with zero findings lost and zero new SAFE. The 3
 changes are all SAFE → REVIEW demotions of exported TypeAlias /
@@ -632,7 +681,7 @@ across 3 repeat runs on flask/requests/click.
 
 The web checker (`docs/analyzer.js`, regex-based for JS/Python) reproduces the same SAFE findings on every fixture above — verified by the web test suite (96 tests). Java is tree-sitter-parsed, not regex-based (see "Java scope" below). On the 10-repo corpus it no longer crashes on any repo, emits no duplicate finding IDs, and every web SAFE is also a CLI SAFE (web-only SAFE: 0). Batch 4 fixed web multi-line `import`/`require`/re-export handling (continuation lines no longer leak into the references pass) and decided the JSX-pragma rule (see "False-positive defences" above); measured on the same clones, web SAFE is 2 vs CLI SAFE 4, at full parity on preact (1 = 1) and next-blog (0 = 0) — the only remaining gap is requests, where the web checker misses 2 CLI SAFE variables in `src/requests/_types.py`. It is also now faster than the CLI on large repos — the inverted string index was ported to it (fastapi 0.8 s web vs 12.6 s CLI; whole 10-repo corpus ~3 s web). The CLI is still the reference for the few shapes the web misses (see limitations).
 
-Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (420 findings, 0 in `src/`), which is the point of the fixtures.
+Dogfood — deadcode-map run on itself: **0 findings**. The repo scans clean: fixture/test-data directories are excluded by default, same-file use counts as alive, and the one genuinely dead helper (`named` in `src/parse-js.js`) was deleted. With `--include-fixtures` the planted fixture data still reports (443 findings, 0 in `src/`), which is the point of the fixtures.
 
 A real-repo check on a Python project (a Raspberry Pi / Arduino gateway script) first flagged the runnable `__main__` script as a dead file — that false positive is now a regression test (`run.py` in `py-basic`), and the same repo now reports 0 SAFE.
 

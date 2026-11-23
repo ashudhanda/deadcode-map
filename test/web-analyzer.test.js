@@ -192,6 +192,73 @@ test('web py-multiline: SAFE false-positive rate is 0%', () => {
   }
 });
 
+test('web import-lines: unused JS imports report their real line, not line 1', () => {
+  const f = loadFixture('js-import-lines').findings;
+  // Before the fix every import finding carried startLine 1, so the web
+  // id (import:file:symbol:1) never matched the CLI id for the same
+  // import (vue2 types/v3-define-component.d.ts: Data at line 19).
+  const unused = bySymbol(f, 'src/main.js', 'unusedImport');
+  assert.equal(unused.grade, 'SAFE');
+  assert.equal(unused.startLine, 4, 'the import sits on line 4, not line 1');
+  assert.equal(unused.id, 'import:src/main.js:unusedImport:4');
+  // A multi-line import reports the line the import starts on.
+  const multi = bySymbol(f, 'src/main.js', 'unusedMulti');
+  assert.equal(multi.grade, 'SAFE');
+  assert.equal(multi.startLine, 7, 'a multi-line import starts on its import line');
+  assert.equal(multi.endLine, 11, 'the multi-line import ends on its from line');
+  assert.equal(bySymbol(f, 'src/main.js', 'alsoUnused').startLine, 7);
+  // A destructured require below line 1 reports its own line too.
+  assert.equal(bySymbol(f, 'src/main.js', 'unusedReq').startLine, 12);
+  // Live imports are never flagged.
+  assert.equal(bySymbol(f, 'src/main.js', 'usedHelper'), undefined);
+  assert.equal(bySymbol(f, 'src/main.js', 'usedOther'), undefined);
+});
+
+test('web import-lines: JS SAFE false-positive rate is 0%', () => {
+  const f = loadFixture('js-import-lines').findings;
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:src/main.js:unusedImport', 'import:src/main.js:unusedMulti',
+    'import:src/main.js:alsoUnused', 'import:src/main.js:unusedReq',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.equal(safe.length, expectedSafe.size, 'every planted dead import is found');
+});
+
+test('web import-lines: unused Python imports report their real line, not line 1', () => {
+  const f = loadFixture('py-import-lines').findings;
+  const unused = bySymbol(f, 'imports.py', 'unusedmod');
+  assert.equal(unused.grade, 'SAFE');
+  assert.equal(unused.startLine, 4, 'the import sits on line 4, not line 1');
+  assert.equal(unused.id, 'import:imports.py:unusedmod:4');
+  // A multi-line from-import reports the line the import starts on.
+  const multi = bySymbol(f, 'imports.py', 'UnusedA');
+  assert.equal(multi.grade, 'SAFE');
+  assert.equal(multi.startLine, 6, 'a multi-line import starts on its from line');
+  assert.equal(multi.endLine, 10, 'the multi-line import ends on its closing paren line');
+  assert.equal(bySymbol(f, 'imports.py', 'UnusedB').startLine, 6);
+  // Live imports are never flagged.
+  assert.equal(bySymbol(f, 'imports.py', 'json'), undefined);
+  assert.equal(bySymbol(f, 'imports.py', 'Counter'), undefined);
+});
+
+test('web import-lines: Python SAFE false-positive rate is 0%', () => {
+  const f = loadFixture('py-import-lines').findings;
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:imports.py:unusedmod', 'import:imports.py:UnusedA',
+    'import:imports.py:UnusedB',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.equal(safe.length, expectedSafe.size, 'every planted dead import is found');
+});
+
 test('web py-multiline: star imports are not flagged as dead imports', () => {
   const r = analyzeFiles([{ path: 'main.py', content: 'from pkg import *\n\nprint(1)\n' }]);
   assert.equal(r.findings.filter((x) => x.category === 'import').length, 0, 'a star import is a wildcard, not a dead import');
@@ -2028,4 +2095,170 @@ test('web manual-script: symbols under scripts/ or tools/ are KEEP, never SAFE',
   assert.equal(r.findings.filter((x) => x.category === 'file' && x.file === '.github/scripts/release.js').length, 0,
     'a script under scripts/ is an entry point, never a dead file');
   assert.equal(r.findings.filter((x) => x.grade === 'SAFE').length, 0, 'no SAFE may come out of a manual-script file');
+});
+
+const { parsePy } = require('../docs/analyzer');
+
+// --- batch 13: string annotations in nested / multi-line positions ---
+
+test('web batch13 (py): a string nested in a generic is a use of the type', () => {
+  // The typer shapes: `ctx: Union["Context", None]` (single-line def)
+  // and `cls: type["TyperCommand"]` (multi-line def). The old per-line
+  // regex only saw a string directly after `:` or `->`, so these
+  // imports looked dead.
+  const single = parsePy('gate.py', [
+    'from typing import Union',
+    'from ._types import Context',
+    'def f(ctx: Union["Context", None]) -> str:',
+    '    return ""',
+    '',
+    'f(None)',
+  ].join('\n'));
+  assert.ok(single.references.has('Context'), 'Union["Context", None] names a real type');
+  assert.ok(single.bareReferences.includes('Context'), 'the annotation string is a bare reference too');
+
+  const multi = parsePy('gate.py', [
+    'from ._types import TyperCommand',
+    'class C:',
+    '    def __init__(self, *, cls: type["TyperCommand"] | None = None):',
+    '        self.cls = cls',
+    '',
+    'C()',
+  ].join('\n'));
+  assert.ok(multi.references.has('TyperCommand'), 'type["TyperCommand"] on a def continuation line names a real type');
+  assert.ok(multi.bareReferences.includes('TyperCommand'), 'the annotation string is a bare reference too');
+});
+
+test('web batch13 (py): a string annotation spread over lines is a use', () => {
+  // A Callable annotation whose list["CompletionItem"] sits on its own
+  // line, and a return annotation that spans lines — both are
+  // annotation position, even though no `:` precedes the string.
+  const callable = parsePy('gate.py', [
+    'from typing import Callable',
+    'from ._types import CompletionItem',
+    'def register(',
+    '    shell_complete: Callable[',
+    '        [str],',
+    '        list["CompletionItem"] | list[str],',
+    '    ]',
+    '    | None = None,',
+    ') -> None:',
+    '    return None',
+    '',
+    'register()',
+  ].join('\n'));
+  assert.ok(callable.references.has('CompletionItem'), 'list["CompletionItem"] inside a multi-line Callable names a real type');
+
+  const ret = parsePy('gate.py', [
+    'from ._types import Typer',
+    'def make() -> list[',
+    '    "Typer"',
+    ']:',
+    '    return []',
+    '',
+    'make()',
+  ].join('\n'));
+  assert.ok(ret.references.has('Typer'), 'a return annotation that spans lines names a real type');
+
+  const varAnn = parsePy('gate.py', [
+    'from typing import Optional',
+    'from ._types import Typer',
+    'handler: Optional["Typer"] = None',
+    '',
+    'print(handler)',
+  ].join('\n'));
+  assert.ok(varAnn.references.has('Typer'), 'Optional["Typer"] in a variable annotation names a real type');
+});
+
+test('web batch13 (py): a string outside annotation position is not a use', () => {
+  // The narrowness controls: a default string value, a docstring, an
+  // error message, and prose inside Doc("...") in an annotation must
+  // never keep a dead import alive — only the annotation span counts.
+  const parsed = parsePy('gate.py', [
+    'from typing import Annotated',
+    'from ._types import DeadAsDefault, DeadInDocstring, DeadInMessage, Widget',
+    'def Doc(text):',
+    '    return text',
+    '',
+    'def pick(mode="DeadAsDefault"):',
+    '    return mode',
+    '',
+    'def describe():',
+    '    """DeadInDocstring is mentioned here, and nowhere else."""',
+    '    return 1',
+    '',
+    'def fail():',
+    '    raise ValueError("DeadInMessage failed")',
+    '',
+    'def show(item: Annotated[str, Doc("Widget is only prose")]) -> str:',
+    '    return item',
+    '',
+    'pick()',
+    'describe()',
+    'show("x")',
+  ].join('\n'));
+  for (const name of ['DeadAsDefault', 'DeadInDocstring', 'DeadInMessage', 'Widget']) {
+    assert.ok(!parsed.references.has(name), `${name} must not count as a reference`);
+    assert.ok(!parsed.bareReferences.includes(name), `${name} must not count as a bare reference`);
+  }
+});
+
+test('web batch13 (py): a TypeVar definition is flagged on the definition, not by name', () => {
+  const parsed = parsePy('gate.py', [
+    'from typing import TypeVar',
+    'import typing',
+    '',
+    'if TYPE_CHECKING:',
+    '    GrpType = TypeVar("GrpType", bound=int)',
+    '    OtherType = typing.TypeVar("OtherType")',
+    '',
+    '_HiddenType = TypeVar("_HiddenType")',
+    '_dead_count = 0',
+    '',
+    'def main():',
+    '    return 1',
+    '',
+    'main()',
+  ].join('\n'));
+  const def = (name) => parsed.definitions.find((d) => d.name === name);
+  assert.equal(def('GrpType').typeVar, true, 'TypeVar(...) marks the definition');
+  assert.equal(def('OtherType').typeVar, true, 'typing.TypeVar(...) marks the definition');
+  assert.equal(def('_HiddenType').typeVar, true, 'a top-level TypeVar marks the definition');
+  assert.equal(def('_dead_count').typeVar, false, 'a plain value is not a TypeVar');
+});
+
+test('web batch13 py-string-annotation: live imports are never flagged, dead controls are SAFE', () => {
+  const f = loadFixture('py-batch13-string-annotation').findings;
+  for (const symbol of ['Context', 'CompletionItem', 'Typer', 'TyperCommand', 'TyperGroup']) {
+    assert.equal(bySymbol(f, 'main.py', symbol), undefined, `${symbol} is used only in a string annotation and must not be flagged`);
+  }
+  for (const symbol of ['DeadAsDefault', 'DeadInDocstring', 'DeadInMessage', 'Widget']) {
+    assert.equal(bySymbol(f, 'main.py', symbol).grade, 'SAFE', `${symbol} appears only outside annotation position and must still be found SAFE`);
+  }
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set([
+    'import:main.py:DeadAsDefault', 'import:main.py:DeadInDocstring',
+    'import:main.py:DeadInMessage', 'import:main.py:Widget',
+  ]);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.equal(safe.length, expectedSafe.size, `expected ${expectedSafe.size} SAFE findings, got ${safe.length}`);
+});
+
+test('web batch13 py-typevar: TypeVars are REVIEW, plain dead values stay SAFE', () => {
+  const f = loadFixture('py-batch13-typevar').findings;
+  assert.equal(bySymbol(f, 'main.py', 'GrpType'), undefined, 'GrpType is used in a string annotation and must not be flagged');
+  assert.equal(bySymbol(f, 'main.py', 'OtherType').grade, 'REVIEW', 'an unreferenced typing.TypeVar is REVIEW, never SAFE');
+  assert.equal(bySymbol(f, 'main.py', '_HiddenType').grade, 'REVIEW', 'an unreferenced top-level TypeVar is REVIEW, never SAFE');
+  assert.equal(bySymbol(f, 'main.py', '_dead_count').grade, 'SAFE', 'a plain dead value stays SAFE');
+  assert.equal(bySymbol(f, 'main.py', '_dead_factory').grade, 'SAFE', 'a dead value with an ordinary call initializer stays SAFE — the rule is specific to TypeVar');
+  const safe = f.filter((x) => x.grade === 'SAFE');
+  const expectedSafe = new Set(['variable:main.py:_dead_count', 'variable:main.py:_dead_factory']);
+  for (const s of safe) {
+    const key = `${s.category}:${s.file}${s.symbol ? ':' + s.symbol : ''}`;
+    assert.ok(expectedSafe.has(key), `unexpected SAFE finding (false positive): ${key}`);
+  }
+  assert.equal(safe.length, expectedSafe.size, `expected ${expectedSafe.size} SAFE findings, got ${safe.length}`);
 });
